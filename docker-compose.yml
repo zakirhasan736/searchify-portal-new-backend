@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: searchify
+      POSTGRES_PASSWORD: searchify
+      POSTGRES_DB: searchify
+    ports:
+      - "55432:5432"
+    volumes:
+      - searchify_pg:/var/lib/postgresql/data
+
+volumes:
+  searchify_pg:
