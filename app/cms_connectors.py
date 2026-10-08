@@ -46,8 +46,39 @@ def _wp_base(creds: dict, site_url: str) -> str:
 
 def _wp_auth(creds: dict) -> tuple[str, str]:
     user = (creds.get("username") or "").strip()
-    password = (creds.get("applicationPassword") or creds.get("password") or "").strip()
+    password = (creds.get("applicationPassword") or creds.get("password") or "").replace(" ", "").strip()
     return user, password
+
+
+def probe_wordpress(creds: dict, site_url: str) -> dict[str, Any]:
+    """Confirm the application password can read the signed-in WordPress user."""
+    user, password = _wp_auth(creds)
+    base = _wp_base(creds, site_url)
+    if not user or not password:
+        return {"ok": False, "detail": "Username and application password are required."}
+    if not base.startswith("http"):
+        return {"ok": False, "detail": "Use a full website address, including https://."}
+    try:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            response = client.get(
+                urljoin(base, "wp-json/wp/v2/users/me"),
+                auth=(user, password),
+                params={"context": "edit"},
+            )
+    except httpx.HTTPError as exc:
+        text = str(exc).lower()
+        if "getaddrinfo" in text or "name or service not known" in text or "nodename nor servname" in text:
+            return {"ok": False, "detail": "Could not reach that website. Check the address and try again."}
+        return {"ok": False, "detail": "Could not reach that WordPress site. Check the address and try again."}
+    if response.status_code == 200:
+        try:
+            name = response.json().get("name") or user
+        except Exception:
+            name = user
+        return {"ok": True, "detail": f"Signed in as {name}."}
+    if response.status_code in (401, 403):
+        return {"ok": False, "detail": "WordPress rejected that username or application password."}
+    return {"ok": False, "detail": f"WordPress did not confirm the connection (HTTP {response.status_code})."}
 
 
 def _wp_resolve_id(client: httpx.Client, base: str, auth: tuple[str, str], change: dict) -> tuple[str | None, str]:

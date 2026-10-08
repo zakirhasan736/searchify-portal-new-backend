@@ -54,7 +54,7 @@ def ads_scope_granted(scopes: list | None) -> bool:
     return any("adwords" in str(item) for item in (scopes or []))
 
 
-def auth_url(state: str, services: str = "", force_consent: bool = True) -> str:
+def auth_url(state: str, services: str = "", force_consent: bool = True, prompt: str = "") -> str:
     params = {
         "client_id": config.GOOGLE_OAUTH_CLIENT_ID,
         "redirect_uri": config.GOOGLE_OAUTH_REDIRECT_URI,
@@ -64,7 +64,9 @@ def auth_url(state: str, services: str = "", force_consent: bool = True) -> str:
         "include_granted_scopes": "true",
         "state": state,
     }
-    if force_consent:
+    if prompt:
+        params["prompt"] = prompt
+    elif force_consent:
         params["prompt"] = "consent"
     return f"{AUTH_URL}?{urlencode(params)}"
 

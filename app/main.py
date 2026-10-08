@@ -8,7 +8,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from app.auto_sync import auto_sync_loop
 from app.config import CORS_ORIGINS, PUBLIC_SITE_URL
 from app.database import Base, SessionLocal, engine, ensure_indexes
-from app.routers import auth, catalog, crawl, features, google_connect, operator, product, projects, social_auth, workflow
+from app.routers import auth, catalog, crawl, features, google_connect, operator, product, projects, research, social_auth, workflow
 from app.seed import seed
 
 
@@ -54,6 +54,7 @@ app.include_router(features.router)
 app.include_router(google_connect.router)
 app.include_router(operator.router)
 app.include_router(product.router)
+app.include_router(research.router)
 
 
 @app.get("/api/v1/health")

@@ -9,9 +9,11 @@ from app import config
 # First model is always tried first. Astra leads for serious roles.
 FALLBACKS = {
     "astra": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.2", "gpt-4.1"],
-    "writer": ["gpt-6-astra", "gpt-5.6-terra", "gpt-5.2", "gpt-4.1"],
+    "writer": ["gpt-5.6-sol", "gpt-6-astra", "gpt-5.6-terra", "gpt-5.2", "gpt-4.1"],
+    "seo": ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-4o"],
     "analyst": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.2", "gpt-4.1"],
     "fast": ["gpt-5.6-luna", "gpt-4o-mini", "gpt-4o"],
+    "assistant": ["gpt-5.6-terra"],
     "vision": ["gpt-4o", "gpt-4.1"],
 }
 
@@ -103,6 +105,10 @@ def chat_text(
                     json=payload,
                 )
             if response.status_code >= 400:
+                denied = "does not have access to model" in response.text or "model_not_found" in response.text
+                if denied:
+                    last_error = f"{model}: {response.status_code} {response.text[:240]}"
+                    continue
                 alt = {
                     "model": model,
                     "messages": payload["messages"],

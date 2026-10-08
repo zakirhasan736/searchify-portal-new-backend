@@ -30,6 +30,10 @@ class SyncBody(BaseModel):
     cms_connection_id: int | None = None
 
 
+class GoogleAccountBody(BaseModel):
+    email: str = ""
+
+
 class AdsSelectBody(BaseModel):
     customer_id: str
     customer_name: str = ""
@@ -97,7 +101,65 @@ def _connection_payload(row: GoogleConnection | None) -> dict:
         "scopes": row.scopes or [],
         "lastSyncAt": row.last_sync_at.isoformat() if row.last_sync_at else None,
         "lastError": row.last_error or "",
+        "accounts": _public_accounts(row),
     }
+
+
+def _public_accounts(row: GoogleConnection) -> list[dict]:
+    saved = (row.meta or {}).get("accounts") or {}
+    active = (row.google_email or "").lower()
+    found = []
+    seen = set()
+    for key, item in saved.items():
+        if not isinstance(item, dict):
+            continue
+        email = str(item.get("email") or key or "").strip()
+        if not email or email.lower() in seen:
+            continue
+        seen.add(email.lower())
+        found.append({"email": email, "active": email.lower() == active and bool(row.access_token or row.refresh_token)})
+    if row.google_email and row.google_email.lower() not in seen and (row.access_token or row.refresh_token):
+        found.append({"email": row.google_email, "active": True})
+    return found
+
+
+def _remember_account(row: GoogleConnection) -> None:
+    email = (row.google_email or "").strip()
+    if not email or not (row.refresh_token or row.access_token):
+        return
+    meta = dict(row.meta or {})
+    accounts = dict(meta.get("accounts") or {})
+    accounts[email.lower()] = {
+        "email": email,
+        "accessToken": row.access_token or "",
+        "refreshToken": row.refresh_token or "",
+        "tokenExpiry": row.token_expiry.isoformat() if row.token_expiry else "",
+        "scopes": list(row.scopes or []),
+        "gscSiteUrl": row.gsc_site_url or "",
+        "ga4PropertyId": row.ga4_property_id or "",
+        "ga4PropertyName": row.ga4_property_name or "",
+    }
+    meta["accounts"] = accounts
+    row.meta = meta
+    flag_modified(row, "meta")
+
+
+def _apply_saved_account(row: GoogleConnection, saved: dict) -> None:
+    row.access_token = saved.get("accessToken") or ""
+    row.refresh_token = saved.get("refreshToken") or ""
+    raw_expiry = saved.get("tokenExpiry") or ""
+    try:
+        row.token_expiry = datetime.fromisoformat(raw_expiry) if raw_expiry else None
+    except ValueError:
+        row.token_expiry = None
+    row.scopes = list(saved.get("scopes") or [])
+    row.google_email = saved.get("email") or row.google_email
+    row.gsc_site_url = saved.get("gscSiteUrl") or ""
+    row.ga4_property_id = saved.get("ga4PropertyId") or ""
+    row.ga4_property_name = saved.get("ga4PropertyName") or ""
+    row.status = "connected"
+    row.last_error = ""
+    row.updated_at = datetime.utcnow()
 
 
 def _valid_access_token(db: Session, row: GoogleConnection) -> str:
@@ -141,6 +203,7 @@ def google_status(db: Session = Depends(get_db), user: User = Depends(get_curren
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     return {
         "configured": goauth.google_configured(),
+        "redirectUri": config.GOOGLE_OAUTH_REDIRECT_URI,
         "connection": _connection_payload(row),
     }
 
@@ -148,13 +211,15 @@ def google_status(db: Session = Depends(get_db), user: User = Depends(get_curren
 @router.get("/oauth/google/start")
 def google_start(
     services: str = Query(default="gsc,ga4,ads"),
+    add: str = Query(default=""),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     _ensure_google_config()
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     already = bool(row and (row.refresh_token or row.access_token))
-    if already and goauth.ads_scope_granted(row.scopes) and "ads" in (services or ""):
+    adding = add == "1"
+    if already and not adding and goauth.ads_scope_granted(row.scopes) and "ads" in (services or ""):
         return {
             "authUrl": "",
             "alreadyConnected": True,
@@ -162,11 +227,13 @@ def google_start(
             "services": services,
         }
     state = goauth.make_oauth_state(user.id, services=services)
+    prompt = "select_account consent" if adding else ""
     return {
-        "authUrl": goauth.auth_url(state, services=services, force_consent=not already),
+        "authUrl": goauth.auth_url(state, services=services, force_consent=not already or adding, prompt=prompt),
         "alreadyConnected": already,
         "adsScope": goauth.ads_scope_granted(row.scopes) if row else False,
         "services": services,
+        "redirectUri": config.GOOGLE_OAUTH_REDIRECT_URI,
     }
 
 
@@ -203,17 +270,28 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
             row = GoogleConnection(customer_id=user.id)
             db.add(row)
 
+        new_email = (info.get("email") or "").strip()
+        switching = bool(row.google_email and new_email and row.google_email.lower() != new_email.lower())
+        saved_new = ((row.meta or {}).get("accounts") or {}).get(new_email.lower()) if switching else {}
+        if switching:
+            _remember_account(row)
+
         row.access_token = access
         if refresh:
             row.refresh_token = refresh
         row.token_expiry = now + timedelta(seconds=expires_in)
         new_scopes = [s for s in (tokens.get("scope") or "").split() if s]
-        prev_scopes = [s for s in (row.scopes or []) if s]
+        prev_scopes = [] if switching else [s for s in (row.scopes or []) if s]
         row.scopes = list(dict.fromkeys(prev_scopes + new_scopes))
-        row.google_email = info.get("email") or row.google_email or ""
+        row.google_email = new_email or row.google_email or ""
+        if switching:
+            row.gsc_site_url = (saved_new or {}).get("gscSiteUrl") or ""
+            row.ga4_property_id = (saved_new or {}).get("ga4PropertyId") or ""
+            row.ga4_property_name = (saved_new or {}).get("ga4PropertyName") or ""
         row.status = "connected"
         row.last_error = ""
         row.updated_at = now
+        _remember_account(row)
         db.commit()
 
         db.add(
@@ -452,6 +530,7 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
         row.ga4_property_name = body.ga4_property_name.strip()
     row.updated_at = datetime.utcnow()
     row.status = "connected"
+    _remember_account(row)
     if body.cms_connection_id:
         cms = db.get(CmsConnection, body.cms_connection_id)
         if cms is None or cms.customer_id != user.id:
@@ -1508,6 +1587,56 @@ def google_auto_sync_now(user: User = Depends(get_current_user)):
 
     _ = user
     return {"ok": True, **run_due_syncs()}
+
+
+@router.post("/oauth/google/accounts/use")
+def use_google_account(body: GoogleAccountBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    email = body.email.strip().lower()
+    if row is None or not email:
+        raise HTTPException(status_code=404, detail="Connect a Google account first")
+    if (row.google_email or "").lower() == email and (row.access_token or row.refresh_token):
+        return {"ok": True, "connection": _connection_payload(row)}
+    saved = ((row.meta or {}).get("accounts") or {}).get(email)
+    if not isinstance(saved, dict) or not (saved.get("refreshToken") or saved.get("accessToken")):
+        raise HTTPException(status_code=404, detail="That Google account is not saved yet. Add it from Manage workspace.")
+    _remember_account(row)
+    _apply_saved_account(row, saved)
+    _remember_account(row)
+    db.commit()
+    return {"ok": True, "connection": _connection_payload(row)}
+
+
+@router.post("/oauth/google/accounts/remove")
+def remove_google_account(body: GoogleAccountBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Drop one saved Google sign-in. Other websites can keep a different account. Cached reports stay."""
+    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    email = body.email.strip().lower()
+    if row is None or not email:
+        raise HTTPException(status_code=404, detail="No Google account to remove")
+    meta = dict(row.meta or {})
+    accounts = dict(meta.get("accounts") or {})
+    accounts.pop(email, None)
+    meta["accounts"] = accounts
+    row.meta = meta
+    flag_modified(row, "meta")
+    if (row.google_email or "").lower() == email:
+        replacement = next((item for item in accounts.values() if isinstance(item, dict) and (item.get("refreshToken") or item.get("accessToken"))), None)
+        if replacement:
+            _apply_saved_account(row, replacement)
+            _remember_account(row)
+        else:
+            row.access_token = ""
+            row.refresh_token = ""
+            row.token_expiry = None
+            row.google_email = ""
+            row.gsc_site_url = ""
+            row.ga4_property_id = ""
+            row.ga4_property_name = ""
+            row.status = "disconnected"
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True, "connection": _connection_payload(row)}
 
 
 @router.post("/oauth/google/disconnect")

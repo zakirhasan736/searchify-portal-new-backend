@@ -53,6 +53,10 @@ GITHUB_OAUTH_REDIRECT_URI = (
     or "http://127.0.0.1:8000/api/v1/auth/oauth/github/callback"
 ).strip()
 
+# Optional — competitor SERP titles for work-queue meta. Leave blank to skip.
+DATAFORSEO_LOGIN = (os.getenv("DATAFORSEO_LOGIN") or "").strip()
+DATAFORSEO_PASSWORD = (os.getenv("DATAFORSEO_PASSWORD") or "").strip()
+
 # Auto-sync connected Google data (hours between runs per account)
 GOOGLE_AUTO_SYNC_ENABLED = (os.getenv("GOOGLE_AUTO_SYNC_ENABLED") or "true").strip().lower() in {
     "1",
@@ -90,6 +94,8 @@ OPENAI_KIND_ROLES = {
     "meta": "fast",
     "grammar": "fast",
     "prompt-research": "fast",
+    "ai-visibility": "writer",
+    "assistant": "assistant",
 }
 
 # Kinds that must always use Astra (expensive — keep narrow for v1)
@@ -116,6 +122,12 @@ def resolve_openai_role(
     - astra: long articles or force_astra only
     """
     kind_key = (kind or "").strip().lower()
+    if kind_key == "assistant":
+        return "assistant"
+    # Title and description: gpt-6-sol, then gpt-5.6-terra, gpt-5.6-sol, and gpt-4o.
+    # A long page brief must not escalate this job onto the general writer chain.
+    if kind_key == "meta-seo":
+        return "seo"
     type_key = (writing_type or "").strip().lower()
     brief_text = (brief or "").strip()
     token_n = int(tokens or 0)
@@ -138,6 +150,10 @@ def resolve_openai_role(
 
 def openai_model_for(kind: str | None = None, role: str | None = None, **kwargs) -> str:
     resolved = (role or resolve_openai_role(kind, **kwargs)).lower()
+    if resolved == "assistant":
+        return "gpt-4o"
+    if resolved == "seo":
+        return OPENAI_MODEL_WRITER or "gpt-6-sol"
     if resolved == "fast":
         return OPENAI_MODEL_FAST
     if resolved == "vision":

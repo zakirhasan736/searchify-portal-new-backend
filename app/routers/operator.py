@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -12,7 +12,8 @@ from app import cms_connectors
 from app.database import get_db
 from app.models import CmsConnection, Draft, FeatureRecord, GoogleConnection, Job, SiteChange, User
 from app.routers.google_connect import _connection_payload
-from app.openai_client import generate_draft_body, openai_configured
+from app import ai_visibility
+from app.openai_client import chat_text, generate_draft_body, openai_configured
 from app.security import get_current_user
 
 router = APIRouter(prefix="/api/v1/operator", tags=["operator"])
@@ -130,6 +131,15 @@ class PatchChangeBody(BaseModel):
 
 class GenerateMetaBody(BaseModel):
     tone: str = "Clear & direct"
+    breadth: str = "balanced"
+
+
+class FromGscBody(BaseModel):
+    breadth: str = "balanced"
+    site: str = ""
+    brief: dict = Field(default_factory=dict)
+    limit: int = 8
+    rescan: bool = False
 
 
 class BusinessProfileBody(BaseModel):
@@ -141,6 +151,26 @@ class BusinessProfileBody(BaseModel):
     voice: str = ""
     restrictions: str = ""
     rules: str = ""
+
+
+class AssistantTurn(BaseModel):
+    role: str = "user"
+    text: str = ""
+
+
+class AssistantBody(BaseModel):
+    messages: list[AssistantTurn] = Field(default_factory=list)
+    queue: list[dict] = Field(default_factory=list)
+    breadth: str = ""
+    mode: str = ""
+
+
+class VisibilityQueueBody(BaseModel):
+    checkId: str = ""
+    targetUrl: str = ""
+    title: str = ""
+    description: str = ""
+    opportunity: str = ""
 
 
 def _mask_creds(creds: dict) -> dict:
@@ -455,6 +485,14 @@ def upsert_connection(body: CmsConnectBody, db: Session = Depends(get_db), user:
         if v is None or v == "" or str(v).startswith("••••"):
             continue
         merged[k] = v
+    if body.provider == "wordpress":
+        password = str(merged.get("applicationPassword") or merged.get("password") or "").replace(" ", "")
+        if password:
+            merged["applicationPassword"] = password
+        probe = cms_connectors.probe_wordpress(merged, row.site_url)
+        if not probe.get("ok"):
+            db.rollback()
+            raise HTTPException(status_code=400, detail=probe.get("detail") or "WordPress could not be verified.")
     row.credentials = merged
     row.status = "connected"
     row.updated_at = datetime.utcnow()
@@ -478,13 +516,19 @@ def _clear_user_queue(db: Session, user_id: int) -> int:
 
 
 def _purge_queue_without_google(db: Session, user: User) -> int:
-    """Work-queue items come from Search Console. If Google is gone, leftover reviews must go."""
+    """Search Console drafts go when Google is gone. Drafts written from the site scan stay."""
     if _google_is_connected(db, user.id):
         return 0
-    cleared = _clear_user_queue(db, user.id)
-    if cleared:
+    rows = (
+        db.query(SiteChange)
+        .filter(SiteChange.customer_id == user.id, SiteChange.source == "gsc")
+        .all()
+    )
+    for row in rows:
+        db.delete(row)
+    if rows:
         db.commit()
-    return cleared
+    return len(rows)
 
 
 @router.delete("/connections/{connection_id}")
@@ -691,245 +735,674 @@ def put_business_profile(body: BusinessProfileBody, db: Session = Depends(get_db
     return {"ok": True, "profile": profile}
 
 
-@router.post("/changes/from-gsc")
-def propose_from_gsc(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    """Pull top GSC pages and open metadata SiteChange opportunities (v1: titles & descriptions)."""
-    from app.models import GoogleConnection
+def _clip(value, limit: int = 280) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
 
+
+def _assistant_status(db: Session, user: User) -> list[str]:
     google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
-    if google is None or not (google.gsc_site_url or "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Connect Google Search Console first (Settings → Connections), then Sync. WordPress alone does not fill the work queue.",
-        )
-
-    pages = (
-        db.query(FeatureRecord)
-        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "top-pages")
-        .order_by(FeatureRecord.id.desc())
-        .first()
-    )
-    organic = (
-        db.query(FeatureRecord)
-        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "organic-search")
-        .order_by(FeatureRecord.id.desc())
-        .first()
-    )
-
-    def _is_live(rec: FeatureRecord | None) -> bool:
-        if rec is None:
-            return False
-        payload = rec.payload or {}
-        return payload.get("seedVersion") == LIVE or str(payload.get("source") or "").startswith("google")
-
-    cms_rows = (
+    sites = (
         db.query(CmsConnection)
         .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
         .all()
     )
-    homepage = _homepage_url(
-        google.gsc_site_url,
-        (pages.payload or {}).get("siteUrl") if pages else "",
-        *(c.site_url for c in cms_rows),
+    open_count = (
+        db.query(SiteChange)
+        .filter(
+            SiteChange.customer_id == user.id,
+            SiteChange.status.in_(["proposed", "awaiting_approval"]),
+        )
+        .count()
+    )
+    wordpress = ", ".join(_clip(row.site_url, 80) for row in sites if row.site_url) or "not connected"
+    gsc = _clip(getattr(google, "gsc_site_url", "") or "", 120) or "not selected"
+    analytics = _clip(getattr(google, "ga4_property_name", "") or getattr(google, "ga4_property_id", "") or "", 80) or "not selected"
+    return [
+        f"WordPress: {wordpress}",
+        f"Search Console: {gsc}",
+        f"Analytics: {analytics}",
+        f"Open suggestions stored: {open_count}",
+    ]
+
+
+def _assistant_fallback(question: str, profile: dict, queue: list[dict], status: list[str] | None = None) -> str:
+    business = _clip(profile.get("business") or profile.get("services") or "the business in your setup", 120)
+    first = queue[0] if queue else {}
+    pending = [item for item in queue if str(item.get("decision") or "pending") == "pending"]
+    target = pending[0] if pending else first
+    lower = question.lower()
+    joined = " ".join(status or [])
+    if any(word in lower for word in ("cost", "price", "how much", "cheap")):
+        return (
+            "Writing the title and description is the small part. One page is under a cent. "
+            "Five pages is about 3 cents, and ten pages is about 6 cents. "
+            "If a draft has to be rewritten, that page costs about twice. "
+            "That figure is the writing step only. Nothing is published from this chat. "
+            "If you want, I can walk you through the next card."
+        )
+    if any(word in lower for word in ("next", "how do", "how does", "start", "help", "what should", "where")):
+        if "not selected" in joined and "Search Console: not selected" in joined:
+            return (
+                f"For {business}, the useful next step is Connections: choose the Search Console property and sync. "
+                "Then press Write title suggestions. Each card shows the current title and the suggested one. "
+                "Approve the ones you want. This chat cannot publish them."
+            )
+        if pending:
+            return (
+                f"You already have {len(pending)} suggestion{'s' if len(pending) != 1 else ''} to review for {business}. "
+                f"I’d open “{_clip(target.get('title') or 'the first card', 80)}” first. "
+                "Dismiss it if it is weak, or approve it on the card. Writing another batch skips pages that are already in the queue."
+            )
+        return (
+            f"The queue for {business} is clear. Press Write title suggestions to read the connected pages and draft a title and description for each. "
+            "A 5 to 10 page site is a small writing job. You still approve every card before anything goes live."
+        )
+    if target and any(word in lower for word in ("why", "first", "this", "card", "suggest", "title", "description")):
+        live = "It comes from the connected page data." if target.get("live") else "It comes from the setup brief, not a live Search Console page yet."
+        return (
+            f"The one I’d look at first is {_clip(target.get('title') or 'the open suggestion', 90)} "
+            f"on {_clip(target.get('url') or 'that page', 80)}. "
+            f"The current title is “{_clip(target.get('before') or 'not stored', 70)}” and the suggestion is "
+            f"“{_clip(target.get('after') or 'not written yet', 70)}”. {live} "
+            "If it does not sound like the page, dismiss it and write again."
+        )
+    if any(word in lower for word in ("approve", "publish", "live")):
+        return (
+            "Approving a card does not publish it from this chat. "
+            "Use Approve draft on the card. A live recommendation still waits for the publishing step. "
+            "Cards that only come from the setup brief stay here until Search Console is connected."
+        )
+    if any(word in lower for word in ("contact", "admin", "support", "person")):
+        return (
+            "I can point you to the contact page so you can write to the Searchify team. "
+            "Mention the website and what you were trying to do. I don’t send the message myself."
+        )
+    if "wordpress" in lower:
+        return (
+            "WordPress is how an approved title and description can be published. "
+            "Open Connections and connect that site. Connecting does not publish the page, and I can’t enter the password for you."
+        )
+    if any(word in lower for word in ("google", "analytics", "search console")):
+        return (
+            "Search Console shows queries people already use, and Analytics shows which pages they open. "
+            "Open Connections, continue with Google, then choose this website’s property. "
+            "If the site uses a different Google login, add that login in Manage workspace first. I can’t sign in for you."
+        )
+    if "keyword" in lower:
+        return (
+            "Keywords start from what you sell and where you serve. "
+            "After Search Console is connected, the Keywords page can list queries Google already recorded. "
+            "Searchify does not invent a rank or a search volume."
+        )
+    if "backlink" in lower or "referring" in lower:
+        return (
+            "Backlinks are referring domains stored for the selected website. "
+            "An empty list means none are stored yet. A lost link is a cue to review it, not an automatic disavow."
+        )
+    if "visibility" in lower:
+        return (
+            "AI visibility is a short list of questions a customer might ask about the business. "
+            "Run live checks to ask ChatGPT, Gemini, and Perplexity and see whether the business is named or the site is cited, "
+            "with the full answer and its sources."
+        )
+    if any(word in lower for word in ("plan", "subscription", "billing", "usage", "package")):
+        return (
+            "Subscription shows the plan: websites, keywords, prompts, and audits. "
+            "The usage line is what this workspace has already used. Change the plan there when you need another site."
+        )
+    count = len(pending) or len(queue)
+    if count:
+        return (
+            f"There are {count} open item{'s' if count != 1 else ''} for {business}. "
+            "Want me to start with the first one, or talk through what approve actually does?"
+        )
+    return (
+        f"I have the brief for {business}, and this queue is still empty. "
+        "Connect Search Console, sync, then press Write title suggestions. I’ll stay with you while you review them."
     )
 
-    if not _is_live(pages) and not _is_live(organic):
-        try:
-            from app.routers.google_connect import _valid_access_token
-            from app import google_oauth as goauth
 
-            token = _valid_access_token(db, google)
-            live_pages = goauth.fetch_gsc_top_pages(token, google.gsc_site_url, days=28, row_limit=25)
-            live_queries = goauth.fetch_gsc_top_queries(token, google.gsc_site_url, days=28, row_limit=25)
-            pages = FeatureRecord(
-                customer_id=user.id,
-                kind="top-pages",
-                title="Top Pages",
-                payload={"rows": live_pages, "source": "google_search_console", "seedVersion": LIVE},
-                status="stored",
-            )
-            organic = FeatureRecord(
-                customer_id=user.id,
-                kind="organic-search",
-                title="Organic Search",
-                payload={"rows": live_queries, "source": "google_search_console", "seedVersion": LIVE},
-                status="stored",
-            )
-            db.add(pages)
-            db.add(organic)
-            db.flush()
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=400,
-                detail=f"No live Search Console data yet. Sync Google first. {str(exc)[:160]}",
-            ) from exc
-
-    page_rows = list((pages.payload or {}).get("rows") or []) if _is_live(pages) else []
-    queries = list((organic.payload or {}).get("rows") or []) if _is_live(organic) else []
-    normalized = []
-    for row in page_rows:
-        url = _page_url(_row_key(row), homepage)
-        if not url:
-            continue
-        if isinstance(row, list):
-            normalized.append([url, *row[1:]])
-        elif isinstance(row, tuple):
-            normalized.append([url, *list(row[1:])])
-        else:
-            normalized.append([url, "0", "0", "0%", "0"])
-    page_rows = normalized
-    if not page_rows and google.gsc_site_url:
-        try:
-            from app.routers.google_connect import _valid_access_token
-            from app import google_oauth as goauth
-
-            token = _valid_access_token(db, google)
-            for row in goauth.fetch_gsc_top_pages(token, google.gsc_site_url, days=28, row_limit=25):
-                url = _page_url(_row_key(row), homepage)
-                if url:
-                    page_rows.append([url, *(list(row[1:]) if isinstance(row, (list, tuple)) else [])])
-        except Exception:  # noqa: BLE001
-            pass
-    if not page_rows and homepage:
-        page_rows = [[homepage, "0", "0", "0%", "0"]]
-    if not page_rows:
-        raise HTTPException(
-            status_code=400,
-            detail="Sync Google Search Console first — no live pages or site URL found yet.",
-        )
-
+@router.post("/assistant")
+def ask_assistant(body: AssistantBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Conversational help for the review queue. Does not approve or publish."""
     profile = _profile_for(db, user.id)
-    biz = profile.get("business") or "your business"
-    areas = profile.get("locations") or profile.get("areas") or ""
-    services = profile.get("services") or ""
-    claims = profile.get("claims") or ""
-    voice = profile.get("voice") or ""
-    restrictions = profile.get("restrictions") or profile.get("rules") or "No invented claims."
+    turns = [turn for turn in body.messages if _clip(turn.text, 800)][-8:]
+    if not turns:
+        raise HTTPException(status_code=400, detail="Ask a question about this queue.")
+    question = _clip(turns[-1].text, 800)
+    queue = []
+    for item in (body.queue or [])[:8]:
+        if not isinstance(item, dict):
+            continue
+        queue.append(
+            {
+                "title": _clip(item.get("title"), 140),
+                "url": _clip(item.get("url"), 180),
+                "before": _clip(item.get("before"), 140),
+                "after": _clip(item.get("after"), 140),
+                "description": _clip(item.get("afterDescription") or item.get("description"), 220),
+                "kind": _clip(item.get("kind"), 40),
+                "decision": _clip(item.get("decision") or "pending", 20),
+                "live": bool(item.get("live")),
+                "reason": _clip(item.get("reason"), 180),
+                "sources": [_clip(source, 60) for source in (item.get("sources") or [])[:4]],
+            }
+        )
+    status = _assistant_status(db, user)
+    if not openai_configured():
+        return {"reply": _assistant_fallback(question, profile, queue, status), "model": "", "source": "brief"}
 
-    # Avoid duplicating open queue items for the same URL
-    open_urls = {
+    lines = [
+        f"Business: {_clip(profile.get('business'), 200) or 'not set'}",
+        f"Services: {_clip(profile.get('services'), 200) or 'not set'}",
+        f"Market: {_clip(profile.get('areas') or profile.get('locations'), 200) or 'not set'}",
+        f"Voice: {_clip(profile.get('voice'), 160) or 'not set'}",
+        f"Do not claim: {_clip(profile.get('restrictions') or profile.get('rules'), 200) or 'none'}",
+        f"Working style: {_clip(body.breadth, 80) or 'not set'}",
+        f"Approval policy: {_clip(body.mode, 40) or 'review'}",
+        "Workspace:",
+        *status,
+        "Queue on screen:",
+    ]
+    if queue:
+        for index, item in enumerate(queue, start=1):
+            origin = "live page data" if item["live"] else "setup brief only"
+            lines.append(
+                f"{index}. [{item['decision']}] {item['title']} — {item['url']} ({origin}). "
+                f"Current: {item['before']}. Suggested: {item['after']}. "
+                f"Description: {item['description'] or 'none'}. Why: {item.get('reason') or 'not stored'}. "
+                f"Sources: {', '.join(item['sources']) or 'brief'}."
+            )
+    else:
+        lines.append("No cards are on screen.")
+    lines.append("Conversation so far:")
+    for turn in turns:
+        role = "Searchify" if turn.role == "assistant" else "Operator"
+        lines.append(f"{role}: {_clip(turn.text, 500)}")
+    system = (
+        "You are Searchify assistance, in a real conversation with the person using this workspace. "
+        "Sound friendly, calm, and easy to talk to. Use plain words. Keep the reply smooth, like a colleague sitting beside them. "
+        "If asked who you are, say you are Searchify assistance. "
+        "Never name a model, GPT, OpenAI, Luna, Terra, Sol, or 4o. "
+        "Answer the question they asked first. Then offer one helpful suggestion tied to that question: a next step in the product, or a follow-up they might want to ask. One suggestion is enough. "
+        "Usually three to six sentences. Use a short numbered list only when they ask what to do next. No headings. "
+        "The working style in the message changes the wording, not publishing. Exact-match stays on the phrase already on the page. Balanced uses the closest honest query. Broader discovery may use one nearby angle the page already supports. "
+        "Review every change means they press Generate, then approve or dismiss each card. Prepare drafts automatically fills empty cards when they open the overview. Neither choice publishes. "
+        "Help them use the system: connect WordPress, choose Search Console and Analytics, sync, press Generate, then dismiss or approve each card. "
+        "Notice what they are trying to finish, name why that step helps in one plain sentence, then say how to do it. "
+        "You cannot sign in to Google or WordPress for them, and you cannot publish. Offer the page: Connections for Google and WordPress, Manage workspace to add a website or another Google login, Keywords for live Google positions, volume, and ideas, Backlinks for the live link index, AI visibility for live checks of whether ChatGPT, Gemini, and Perplexity name or cite the business, Subscription for the plan and usage, and the contact page if they want a person on the team. "
+        "A lost backlink is a review cue, not a disavow. Do not invent ranks, volumes, scores, or link counts. "
+        "Each website can use its own Google account. Overview and Settings follow the selected website. Keywords, Backlinks, AI visibility, and the completion log can stay on one website for that page only. "
+        "A title suggestion reads the live page, competitor listings, Search Console, and Analytics. The output is one title and one description. It does not publish. "
+        "If they ask cost, say this and do not invent another price: one page is under a cent, five pages about 3 cents, ten pages about 6 cents. "
+        "A rewritten page costs about twice. That is the writing step only. "
+        "Use the workspace status and the queue in the message. Name the page when you refer to a card. "
+        "If a fact is not there, say so in a friendly way and suggest what would unlock it. Do not invent rankings, clicks, traffic, or backlinks. "
+        "Do not say you approved or published anything. Approval happens on the card, not in this chat. "
+        "If a card is marked setup brief only, say that it is not from Search Console yet. "
+        "When the queue already has those pages, suggest dismissing a card before writing that page again."
+    )
+    try:
+        text, model, _role = chat_text(
+            system=system,
+            user="\n".join(lines),
+            kind="assistant",
+            brief=question,
+            max_tokens=700,
+        )
+    except RuntimeError:
+        return {"reply": _assistant_fallback(question, profile, queue, status), "model": "", "source": "brief"}
+    return {"reply": text.strip(), "model": model, "source": "model"}
+
+
+def _analytics_for_page(db: Session, user_id: int, url: str) -> dict:
+    """Compact GA4 evidence for one page. Empty when Analytics was never synced."""
+    from urllib.parse import urlparse
+
+    def latest(kind: str) -> dict:
+        rec = (
+            db.query(FeatureRecord)
+            .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind)
+            .order_by(FeatureRecord.id.desc())
+            .first()
+        )
+        if rec is None:
+            return {}
+        payload = rec.payload or {}
+        source = str(payload.get("source") or "")
+        if payload.get("seedVersion") != LIVE and not source.startswith("google"):
+            return {}
+        return payload
+
+    traffic = latest("traffic-analytics")
+    channels = latest("traffic-distribution")
+    landings = latest("ga4-landing-pages")
+    path = (urlparse(url).path or "/").rstrip("/") or "/"
+    matched = None
+    for row in landings.get("rows") or []:
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        landing = str(row[0] or "").rstrip("/") or "/"
+        if path == "/" and landing in {"/", ""}:
+            matched = row
+            break
+        if path != "/" and path in landing:
+            matched = row
+            break
+    connected = bool(traffic.get("kpis") or channels.get("rows") or landings.get("rows"))
+    return {
+        "connected": connected,
+        "kpis": list(traffic.get("kpis") or [])[:4],
+        "channels": list(channels.get("rows") or [])[:6],
+        "landing": list(matched) if matched else None,
+    }
+
+
+SCAN_MAX_AGE_HOURS = 72
+ROLE_ORDER = {"home": 0, "service": 1, "product": 1, "category": 2, "location": 2, "other": 3, "about": 4, "contact": 5, "blog": 6}
+
+
+def _brief_profile(profile: dict, brief: dict | None) -> dict:
+    data = dict(profile or {})
+    b = brief or {}
+    if not data.get("services") and b.get("businessType"):
+        data["services"] = b["businessType"]
+    if not (data.get("areas") or data.get("locations")) and b.get("market"):
+        data["areas"] = data["locations"] = b["market"]
+    if b.get("goal"):
+        data["goal"] = b["goal"]
+    if b.get("avoid"):
+        rules = data.get("restrictions") or data.get("rules") or ""
+        data["restrictions"] = f"{rules} Never suggest: {b['avoid']}".strip()
+    if b.get("sensitive"):
+        data["restrictions"] = f"{data.get('restrictions') or ''} Sensitive category: {b['sensitive']}, keep claims careful.".strip()
+    return data
+
+
+def _scan_title(host: str) -> str:
+    return f"Site scan {host}"
+
+
+def _latest_scan(db: Session, user_id: int, host: str) -> dict:
+    if not host:
+        return {}
+    row = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "site-scan", FeatureRecord.title == _scan_title(host))
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    return dict((row.payload if row else {}) or {})
+
+
+def _scan_fresh(scan: dict) -> bool:
+    stamp = scan.get("scannedAt")
+    if not stamp or not scan.get("pages"):
+        return False
+    try:
+        age = datetime.utcnow() - datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    return age.total_seconds() < SCAN_MAX_AGE_HOURS * 3600
+
+
+def _places_rows(db: Session, user_id: int) -> list:
+    rec = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "local-competitors")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    return list(((rec.payload if rec else {}) or {}).get("rows") or [])
+
+
+def _ensure_scan(db: Session, user: User, home: str, brief: dict | None, force: bool = False) -> tuple[dict, bool]:
+    from app import site_scan
+
+    host = site_scan.host_of(home)
+    scan = _latest_scan(db, user.id, host)
+    if scan and _scan_fresh(scan) and not force:
+        return scan, False
+    profile = _brief_profile(_profile_for(db, user.id), brief)
+    scan = site_scan.scan_site(home, brief=brief or {}, profile=profile, places_rows=_places_rows(db, user.id))
+    if scan.get("pages"):
+        _upsert_feature(db, user.id, "site-scan", _scan_title(host), scan)
+    return scan, True
+
+
+def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
+    pages = scan.get("pages") or []
+    business = scan.get("business") or {}
+    rivals = scan.get("competitors") or {}
+    sources = sorted({r.get("source") or "competitor" for rows in rivals.values() for r in rows})
+    page_map = scan.get("pageMap") or {}
+    draftable = [p for p in pages if (page_map.get(p["url"]) or {}).get("role") != "legal" and not p.get("noindex")]
+    covered = len([p for p in draftable if p["url"].rstrip("/") in (open_urls or set())])
+    return {
+        "host": scan.get("host") or "",
+        "scannedAt": scan.get("scannedAt") or "",
+        "pagesRead": len(pages),
+        "draftable": len(draftable),
+        "covered": covered,
+        "business": business.get("business") or "",
+        "brand": business.get("brand") or "",
+        "offers": (business.get("offers") or [])[:8],
+        "places": (business.get("places") or [])[:6],
+        "proof": (business.get("proof") or [])[:6],
+        "competitorSearches": len(rivals),
+        "competitorPages": sum(len(rows) for rows in rivals.values()),
+        "competitorSources": sources,
+        "error": scan.get("error") or "",
+    }
+
+
+def _open_urls(db: Session, user_id: int) -> set[str]:
+    return {
         (c.target_url or "").rstrip("/")
         for c in db.query(SiteChange)
         .filter(
-            SiteChange.customer_id == user.id,
+            SiteChange.customer_id == user_id,
             SiteChange.status.in_(["proposed", "awaiting_approval", "approved", "dismissed"]),
         )
         .all()
     }
 
-    created = []
-    sources = page_rows[:8]
-    cms_for_site = None
-    gsc_url = (google.gsc_site_url or "").strip()
+
+class SiteScanBody(BaseModel):
+    site: str = ""
+    brief: dict = Field(default_factory=dict)
+    force: bool = False
+
+
+def _home_for(db: Session, user: User, site: str = "") -> str:
+    google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     cms_rows = (
         db.query(CmsConnection)
         .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
         .all()
     )
-    for cand in cms_rows:
-        meta = cand.meta or {}
-        if gsc_url and meta.get("gscSiteUrl") == gsc_url:
-            cms_for_site = cand
+    return _homepage_url(site, *(c.site_url for c in cms_rows), google.gsc_site_url if google else "")
+
+
+@router.post("/site-scan")
+def run_site_scan(body: SiteScanBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    home = _home_for(db, user, body.site)
+    if not home:
+        raise HTTPException(status_code=400, detail="Add the website address in setup or connect WordPress first.")
+    scan, ran = _ensure_scan(db, user, home, body.brief, force=body.force)
+    if not scan.get("pages"):
+        raise HTTPException(status_code=422, detail=scan.get("error") or "No readable pages were found on this website.")
+    return {"ok": True, "ran": ran, "scan": _scan_summary(scan, _open_urls(db, user.id))}
+
+
+@router.get("/site-scan")
+def get_site_scan(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    from app import site_scan
+
+    home = _home_for(db, user, site)
+    scan = _latest_scan(db, user.id, site_scan.host_of(home)) if home else {}
+    if not scan:
+        return {"ok": True, "scan": None}
+    return {"ok": True, "scan": _scan_summary(scan, _open_urls(db, user.id))}
+
+
+def _site_context(scan: dict, url: str) -> tuple[dict | None, dict, list[dict]]:
+    """(scanned page, site context for the writer, competitor pages for this page's search)."""
+    from app.site_scan import normalize
+
+    if not scan:
+        return None, {}, []
+    key = normalize(url)
+    pages = {p["url"]: p for p in scan.get("pages") or []}
+    page_map = scan.get("pageMap") or {}
+    info = page_map.get(key) or page_map.get(key.rstrip("/")) or {}
+    siblings = [
+        {"url": p["url"], "title": p.get("title") or "", "target": (page_map.get(p["url"]) or {}).get("target") or ""}
+        for p in (scan.get("pages") or [])
+        if p["url"] != key and (page_map.get(p["url"]) or {}).get("role") != "legal"
+    ]
+    rivals = (scan.get("competitors") or {}).get(info.get("target") or "") or []
+    if not rivals:
+        for rows in (scan.get("competitors") or {}).values():
+            rivals = rows
             break
+    return pages.get(key), {"business": scan.get("business") or {}, "page": info, "siblings": siblings}, rivals
+
+
+@router.post("/changes/from-gsc")
+def propose_from_gsc(
+    body: FromGscBody | None = Body(default=None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Read the whole site, understand the business and competitors, then draft a title and description per page."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.meta_writer import _overlap, write_title_description
+    from app.site_scan import normalize
+
+    body = body or FromGscBody()
+    google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    has_gsc = bool(google and (google.gsc_site_url or "").strip())
+    cms_rows = (
+        db.query(CmsConnection)
+        .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
+        .all()
+    )
+
+    def latest(kind: str) -> FeatureRecord | None:
+        return (
+            db.query(FeatureRecord)
+            .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == kind)
+            .order_by(FeatureRecord.id.desc())
+            .first()
+        )
+
+    def is_live(rec: FeatureRecord | None) -> bool:
+        if rec is None:
+            return False
+        payload = rec.payload or {}
+        return payload.get("seedVersion") == LIVE or str(payload.get("source") or "").startswith("google")
+
+    pages_rec, organic_rec = latest("top-pages"), latest("organic-search")
+    homepage = _homepage_url(
+        body.site,
+        *(c.site_url for c in cms_rows),
+        google.gsc_site_url if google else "",
+        (pages_rec.payload or {}).get("siteUrl") if pages_rec else "",
+    )
+    if not homepage:
+        raise HTTPException(
+            status_code=400,
+            detail="Add the website address in setup, or connect WordPress or Search Console, then try again.",
+        )
+
+    page_rows: list = list((pages_rec.payload or {}).get("rows") or []) if is_live(pages_rec) else []
+    queries: list = list((organic_rec.payload or {}).get("rows") or []) if is_live(organic_rec) else []
+    if has_gsc and not page_rows:
+        try:
+            from app import google_oauth as goauth
+            from app.routers.google_connect import _valid_access_token
+
+            token = _valid_access_token(db, google)
+            page_rows = goauth.fetch_gsc_top_pages(token, google.gsc_site_url, days=28, row_limit=25)
+            queries = queries or goauth.fetch_gsc_top_queries(token, google.gsc_site_url, days=28, row_limit=25)
+            db.add(FeatureRecord(customer_id=user.id, kind="top-pages", title="Top Pages", status="stored",
+                                 payload={"rows": page_rows, "source": "google_search_console", "seedVersion": LIVE}))
+            db.add(FeatureRecord(customer_id=user.id, kind="organic-search", title="Organic Search", status="stored",
+                                 payload={"rows": queries, "source": "google_search_console", "seedVersion": LIVE}))
+            db.flush()
+        except Exception:  # noqa: BLE001
+            page_rows = []
+
+    evidence: dict[str, dict] = {}
+    for row in page_rows:
+        url = _page_url(_row_key(row), homepage)
+        if not url:
+            continue
+        cells = list(row) if isinstance(row, (list, tuple)) else []
+        evidence[normalize(url)] = {
+            "clicks": cells[1] if len(cells) > 1 else "—",
+            "impressions": cells[2] if len(cells) > 2 else "—",
+            "position": cells[4] if len(cells) > 4 else "—",
+        }
+
+    scan, scanned_now = _ensure_scan(db, user, homepage, body.brief, force=body.rescan)
+    profile = _brief_profile(_profile_for(db, user.id), body.brief)
+    page_map = scan.get("pageMap") or {}
+
+    query_terms = [str(q[0]).strip() for q in queries if isinstance(q, (list, tuple)) and q and str(q[0]).strip()][:8]
+    services, areas = profile.get("services") or "", profile.get("areas") or profile.get("locations") or ""
+    if not query_terms and (services or areas):
+        query_terms = [" ".join(part for part in (services.split(",")[0].strip(), areas.split(",")[0].strip()) if part)]
+
+    fallback_rivals: list[dict] = []
+    if not scan.get("competitors"):
+        try:
+            from app import dataforseo
+
+            seed = query_terms[0] if query_terms else f"{services.split(',')[0]} {areas}".strip()
+            fallback_rivals = dataforseo.competitor_serp(seed)
+        except Exception:  # noqa: BLE001
+            fallback_rivals = []
+
+    def rank(url: str) -> tuple:
+        info = page_map.get(url) or {}
+        ev = evidence.get(url) or {}
+        try:
+            impressions = -float(str(ev.get("impressions") or 0).replace(",", ""))
+        except ValueError:
+            impressions = 0.0
+        return (0 if url in evidence else 1, impressions, ROLE_ORDER.get(info.get("role") or "other", 3), len(url))
+
+    scanned_urls = [
+        p["url"] for p in scan.get("pages") or []
+        if not p.get("noindex") and (page_map.get(p["url"]) or {}).get("role") != "legal"
+    ]
+    candidates = sorted(dict.fromkeys([*evidence.keys(), *scanned_urls]), key=rank)
+    if not candidates:
+        candidates = [normalize(homepage)]
+
+    open_urls = _open_urls(db, user.id)
+    pending = [url for url in candidates if url.rstrip("/") not in open_urls]
+    limit = max(1, min(int(body.limit or 8), 12))
+    if scanned_now:
+        limit = min(limit, 5)
+    batch, remaining = pending[:limit], max(0, len(pending) - limit)
+
+    gsc_url = (google.gsc_site_url or "").strip() if google else ""
+    cms_for_site = next((c for c in cms_rows if gsc_url and (c.meta or {}).get("gscSiteUrl") == gsc_url), None)
+    if cms_for_site is None:
+        from app.site_scan import host_of
+
+        cms_for_site = next((c for c in cms_rows if host_of(c.site_url or "") == host_of(homepage)), None)
     if cms_for_site is None and len(cms_rows) == 1:
         cms_for_site = cms_rows[0]
 
-    for page in sources:
-        url = str(page[0] if page else "")
-        target = url if url.startswith("http") else ""
-        if not target:
-            continue
-        if target.rstrip("/") in open_urls:
-            continue
-        clicks = page[1] if len(page) > 1 else "—"
-        impr = page[2] if len(page) > 2 else "—"
-        pos = page[4] if len(page) > 4 else "—"
-        opp = f"Make the search listing for {target} more specific"
+    jobs = []
+    for url in batch:
+        page, site_ctx, rivals = _site_context(scan, url)
+        jobs.append({
+            "url": url,
+            "page": page,
+            "site": site_ctx,
+            "rivals": rivals or fallback_rivals,
+            "gsc": evidence.get(url) or {"clicks": "—", "impressions": "—", "position": "—"},
+            "analytics": _analytics_for_page(db, user.id, url),
+        })
 
+    def draft(job: dict, taken: list[str] | None = None) -> dict:
+        try:
+            return write_title_description(
+                url=job["url"],
+                profile=profile,
+                gsc=job["gsc"],
+                queries=query_terms,
+                competitors=job["rivals"],
+                analytics=job["analytics"],
+                specificity=body.breadth or "balanced",
+                page=job["page"],
+                site=job["site"],
+                taken=taken,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return {"aiError": str(exc)[:200]}
+
+    results: list[dict] = []
+    if openai_configured() and jobs:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(draft, jobs))
+        rewrites = 0
+        for index, result in enumerate(results):
+            title = result.get("title") or ""
+            earlier = [r.get("title") or "" for r in results[:index]]
+            if title and rewrites < 2 and any(_overlap(title, other) >= 0.6 for other in earlier if other):
+                results[index] = draft(jobs[index], taken=[t for t in earlier if t])
+                rewrites += 1
+    else:
+        results = [{} for _ in jobs]
+
+    created = []
+    for job, drafted in zip(jobs, results):
+        url = job["url"]
+        scraped = drafted.get("scraped") or job["page"] or {}
+        info = job["site"].get("page") or {}
         change = SiteChange(
             customer_id=user.id,
             cms_connection_id=cms_for_site.id if cms_for_site else None,
-            source="gsc",
-            opportunity=opp,
-            target_url=target,
+            source="gsc" if url in evidence else "site_scan",
+            opportunity=f"Stronger Google title and description for {url}",
+            target_url=url,
             change_type="meta",
             proposed={
-                "title": "",
-                "metaDescription": "",
-                "beforeTitle": "",
-                "beforeDescription": "",
-                "evidence": {"clicks": clicks, "impressions": impr, "position": pos},
+                "title": drafted.get("title") or "",
+                "metaDescription": drafted.get("metaDescription") or "",
+                "reason": drafted.get("reason") or "",
+                "target": drafted.get("target") or info.get("target") or "",
+                "pageRole": info.get("role") or "",
+                "beforeTitle": scraped.get("title") or "",
+                "beforeDescription": scraped.get("description") or "",
+                "pageH1": scraped.get("h1") or "",
+                "evidence": job["gsc"],
                 "changeType": "meta",
-                "targetUrl": target,
-                "profileHints": {
-                    "business": biz,
-                    "areas": areas,
-                    "locations": areas,
-                    "services": services,
-                    "claims": claims,
-                    "voice": voice,
-                    "restrictions": restrictions,
-                },
+                "targetUrl": url,
+                "draftBody": drafted.get("draftBody") or "",
+                "model": drafted.get("model") or "",
+                "role": drafted.get("role") or "",
+                "competitors": [
+                    {k: r.get(k) for k in ("title", "url", "description", "source")} for r in (job["rivals"] or [])[:6]
+                ],
+                "analytics": bool((job["analytics"] or {}).get("connected")),
+                "specificity": drafted.get("specificity") or body.breadth or "balanced",
+                "writer": "site-scan+brief+competitors+gsc+analytics",
+                "profileHints": {k: profile.get(k) or "" for k in ("business", "services", "areas", "goal", "restrictions")},
+                **({"aiError": drafted["aiError"]} if drafted.get("aiError") else {}),
+                **({"scrapeError": scraped["error"]} if scraped.get("error") else {}),
             },
             status="awaiting_approval",
         )
-        # AI draft titles/descriptions when OpenAI is configured
-        if openai_configured():
-            brief = (
-                f"Business: {biz}\nServices: {services}\nLocations: {areas}\n"
-                f"Approved claims: {claims or 'none'}\nBrand voice: {voice or 'clear and practical'}\n"
-                f"Restrictions: {restrictions}\n"
-                f"Page URL: {target or '(unknown)'}\nOpportunity: {opp}\n"
-                f"GSC: impressions={impr}, clicks={clicks}, position={pos}\n\n"
-                "Return exactly two lines:\nTITLE: <≤60 chars>\nDESCRIPTION: <≤155 chars>\n"
-                "Factual only. Name the service and location when known. Never invent claims."
-            )
-            try:
-                text, model, role = generate_draft_body(
-                    "content-optimizer", brief, writing_type="Meta title & description", tokens=400
-                )
-                title, desc = "", ""
-                for line in text.splitlines():
-                    low = line.strip()
-                    if low.upper().startswith("TITLE:"):
-                        title = low.split(":", 1)[-1].strip()[:70]
-                    elif low.upper().startswith("DESCRIPTION:"):
-                        desc = low.split(":", 1)[-1].strip()[:170]
-                if not title:
-                    for line in text.splitlines():
-                        line = line.strip().lstrip("#").strip()
-                        if line and len(line) < 90:
-                            title = line[:70]
-                            break
-                change.proposed = {
-                    **(change.proposed or {}),
-                    "title": title,
-                    "metaDescription": desc,
-                    "draftBody": text,
-                    "model": model,
-                    "role": role,
-                }
-            except Exception as exc:  # noqa: BLE001
-                change.proposed = {**(change.proposed or {}), "aiError": str(exc)[:200]}
-
         db.add(change)
         db.flush()
         created.append(_change_row(change))
-        if target:
-            open_urls.add(target.rstrip("/"))
+        open_urls.add(url.rstrip("/"))
 
+    db.commit()
+    if created:
+        _sync_operator_features(db, user)
+    summary = _scan_summary(scan, open_urls) if scan else None
     if not created:
-        db.commit()
         return {
             "ok": True,
             "created": 0,
             "changes": [],
-            "reason": "Queue already covers these Search Console pages. Review existing items or dismiss them to refresh.",
+            "remaining": 0,
+            "scan": summary,
+            "reason": "Every page that was read already has a draft. Review or dismiss them to write new ones.",
         }
-
-    db.commit()
-    _sync_operator_features(db, user)
-    return {"ok": True, "created": len(created), "changes": created}
+    return {"ok": True, "created": len(created), "changes": created, "remaining": remaining, "scan": summary}
 
 
 @router.post("/changes/from-draft")
@@ -1199,51 +1672,75 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
 
     profile = _profile_for(db, user.id)
     proposed = dict(row.proposed or {})
-    brief = (
-        f"Business: {profile.get('business') or 'business'}\n"
-        f"Services: {profile.get('services') or ''}\n"
-        f"Locations: {profile.get('locations') or profile.get('areas') or ''}\n"
-        f"Approved claims: {profile.get('claims') or 'none'}\n"
-        f"Brand voice: {profile.get('voice') or 'clear and practical'}\n"
-        f"Restrictions: {profile.get('restrictions') or profile.get('rules') or 'No invented claims.'}\n"
-        f"Tone: {body.tone}\n"
-        f"Page URL: {row.target_url}\n"
-        f"Opportunity: {row.opportunity}\n"
-        f"Current draft title: {proposed.get('title') or ''}\n"
-        f"Current draft description: {proposed.get('metaDescription') or ''}\n\n"
-        "Produce TWO alternative metadata options.\n"
-        "Format exactly:\n"
-        "OPTION 1\nTITLE: ...\nDESCRIPTION: ...\n"
-        "OPTION 2\nTITLE: ...\nDESCRIPTION: ...\n"
+    organic = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "organic-search")
+        .order_by(FeatureRecord.id.desc())
+        .first()
     )
+    query_terms = []
+    if organic and (organic.payload or {}).get("rows"):
+        query_terms = [str(q[0]).strip() for q in (organic.payload or {}).get("rows") if isinstance(q, (list, tuple)) and q][:8]
+    from app.site_scan import host_of
+
+    scan = _latest_scan(db, user.id, host_of(row.target_url or ""))
+    page, site_ctx, scan_rivals = _site_context(scan, row.target_url or "")
+    competitors = scan_rivals or proposed.get("competitors") or []
+    if not competitors:
+        try:
+            from app import dataforseo
+
+            seed = query_terms[0] if query_terms else ""
+            competitors = dataforseo.competitor_serp(seed)
+        except Exception:  # noqa: BLE001
+            competitors = []
+    taken = [
+        (c.proposed or {}).get("title") or ""
+        for c in db.query(SiteChange)
+        .filter(SiteChange.customer_id == user.id, SiteChange.id != row.id, SiteChange.status.in_(["awaiting_approval", "approved", "applied", "monitoring"]))
+        .all()
+        if host_of(c.target_url or "") == host_of(row.target_url or "")
+    ]
     try:
-        text, model, role = generate_draft_body(
-            "content-optimizer", brief, writing_type="Meta alternatives", tokens=500
+        from app.meta_writer import write_title_description
+
+        page_analytics = _analytics_for_page(db, user.id, row.target_url or "")
+        drafted = write_title_description(
+            url=row.target_url,
+            profile={**_brief_profile(profile, (scan or {}).get("brief")), "voice": body.tone or profile.get("voice") or ""},
+            gsc=(proposed.get("evidence") or {}),
+            queries=query_terms,
+            competitors=competitors,
+            analytics=page_analytics,
+            specificity=body.breadth or "balanced",
+            page=page,
+            site=site_ctx,
+            taken=[t for t in taken if t][:20],
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)[:200]) from exc
 
-    options: list[dict] = []
-    current: dict = {}
-    for line in text.splitlines():
-        low = line.strip()
-        up = low.upper()
-        if up.startswith("OPTION"):
-            if current.get("title") or current.get("description"):
-                options.append(current)
-            current = {}
-        elif up.startswith("TITLE:"):
-            current["title"] = low.split(":", 1)[-1].strip()[:70]
-        elif up.startswith("DESCRIPTION:"):
-            current["description"] = low.split(":", 1)[-1].strip()[:170]
-    if current.get("title") or current.get("description"):
-        options.append(current)
-    if not options:
-        options = [{"title": proposed.get("title") or "", "description": proposed.get("metaDescription") or ""}]
-
+    options = [
+        {"title": drafted.get("title") or "", "description": drafted.get("metaDescription") or "", "reason": drafted.get("reason") or ""},
+    ]
+    proposed["title"] = drafted.get("title") or proposed.get("title") or ""
+    proposed["metaDescription"] = drafted.get("metaDescription") or proposed.get("metaDescription") or ""
+    proposed["reason"] = drafted.get("reason") or proposed.get("reason") or ""
     proposed["aiAlternatives"] = options
-    proposed["model"] = model
-    proposed["role"] = role
+    proposed["model"] = drafted.get("model")
+    proposed["role"] = drafted.get("role")
+    proposed["draftBody"] = drafted.get("draftBody")
+    proposed["competitors"] = [
+        {k: r.get(k) for k in ("title", "url", "description", "source")} for r in (drafted.get("competitors") or competitors)[:6]
+    ]
+    proposed["target"] = drafted.get("target") or proposed.get("target") or ""
+    proposed["analytics"] = bool((drafted.get("analytics") or {}).get("connected"))
+    proposed["specificity"] = drafted.get("specificity") or body.breadth or "balanced"
+    scraped = drafted.get("scraped") or {}
+    if scraped.get("title"):
+        proposed["beforeTitle"] = proposed.get("beforeTitle") or scraped.get("title")
+    if scraped.get("description"):
+        proposed["beforeDescription"] = proposed.get("beforeDescription") or scraped.get("description")
     row.proposed = proposed
     row.updated_at = datetime.utcnow()
     try:
@@ -1253,7 +1750,7 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     except Exception:  # noqa: BLE001
         pass
     db.commit()
-    return {"ok": True, "options": options, "model": model, "change": _change_row(row)}
+    return {"ok": True, "options": options, "model": drafted.get("model"), "change": _change_row(row)}
 
 
 @router.post("/changes/{change_id}/undo")
@@ -1321,6 +1818,80 @@ def undo_change(change_id: int, db: Session = Depends(get_db), user: User = Depe
     db.refresh(row)
     _sync_operator_features(db, user)
     return {"ok": True, "change": _change_row(row), "execution": result}
+
+
+@router.get("/ai-visibility")
+def get_ai_visibility(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    payload = ai_visibility.latest_report(db, user.id)
+    return {"ok": True, "report": payload or None, "engines": ai_visibility.ENGINES}
+
+
+@router.post("/ai-visibility")
+def run_ai_visibility(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    profile = _profile_for(db, user.id)
+    if not (profile.get("business") or "").strip() or not (profile.get("services") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Add your business name and services first (Profile), then run the AI visibility report.",
+        )
+    report = ai_visibility.run_visibility_report(db, user, profile)
+    return {"ok": True, "report": report, "engines": ai_visibility.ENGINES}
+
+
+@router.post("/ai-visibility/queue")
+def queue_ai_visibility(body: VisibilityQueueBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    report = ai_visibility.latest_report(db, user.id) or {}
+    check = next((c for c in (report.get("checks") or []) if str(c.get("id")) == body.checkId), None) if body.checkId else None
+    solution = (check or {}).get("solution") or {}
+    target = (body.targetUrl or solution.get("targetUrl") or "").strip()
+    if not target:
+        cms = (
+            db.query(CmsConnection)
+            .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
+            .order_by(CmsConnection.id.desc())
+            .first()
+        )
+        target = (cms.site_url if cms else "") or ""
+    if not target:
+        raise HTTPException(status_code=400, detail="Connect WordPress or pick a page URL before sending this fix to the work queue.")
+    title = (body.title or solution.get("titleDraft") or "").strip()[:70]
+    desc = (body.description or solution.get("descriptionDraft") or "").strip()[:170]
+    opportunity = (
+        body.opportunity
+        or (check.get("error") if check else "")
+        or solution.get("why")
+        or "Improve AI answer visibility"
+    )
+    cms = (
+        db.query(CmsConnection)
+        .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
+        .order_by(CmsConnection.id.desc())
+        .first()
+    )
+    change = SiteChange(
+        customer_id=user.id,
+        cms_connection_id=cms.id if cms else None,
+        source="ai",
+        opportunity=str(opportunity)[:500],
+        target_url=target,
+        change_type="meta",
+        proposed={
+            "title": title,
+            "metaDescription": desc,
+            "beforeTitle": "",
+            "beforeDescription": "",
+            "evidence": {"engine": (check or {}).get("engine"), "prompt": (check or {}).get("prompt")},
+            "changeType": "meta",
+            "targetUrl": target,
+            "solutionSteps": (solution.get("steps") if isinstance(solution.get("steps"), list) else []),
+        },
+        status="awaiting_approval",
+    )
+    db.add(change)
+    db.commit()
+    db.refresh(change)
+    _sync_operator_features(db, user)
+    return {"ok": True, "change": _change_row(change)}
 
 
 @router.post("/sync-features")

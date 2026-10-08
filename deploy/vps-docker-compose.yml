@@ -1,0 +1,48 @@
+# Copy this file to /var/www/searchify/docker-compose.yml
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: searchify
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-searchify}
+      POSTGRES_DB: searchify
+    volumes:
+      - searchify_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U searchify"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://searchify:${POSTGRES_PASSWORD:-searchify}@postgres:5432/searchify
+      PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-https://searchify.nextcreavo.com}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://searchify.nextcreavo.com}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-https://searchify.nextcreavo.com}
+    restart: unless-stopped
+    environment:
+      SEARCHIFY_API_URL: http://backend:8000
+      NEXT_PUBLIC_SITE_URL: ${PUBLIC_SITE_URL:-https://searchify.nextcreavo.com}
+    depends_on:
+      - backend
+    ports:
+      - "127.0.0.1:3000:3000"
+
+volumes:
+  searchify_pg:
