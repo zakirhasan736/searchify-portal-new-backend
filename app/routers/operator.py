@@ -370,15 +370,21 @@ def set_workspace_plan(body: PlanBody, db: Session = Depends(get_db), user: User
     target = db.get(User, body.user_id) if body.user_id else user
     if target is None:
         raise HTTPException(status_code=404, detail="User not found")
+    changing_plan = body.plan is not None
+    changing_limit = body.site_limit is not None
+    if not changing_plan and not changing_limit:
+        raise HTTPException(status_code=400, detail="Provide a plan and/or site_limit")
     plan = (body.plan or target.plan or "starter").strip().lower()
-    if plan not in PLAN_LIMITS and body.site_limit is None:
-        raise HTTPException(status_code=400, detail="Use starter (5), agency (10), scale (15), or a custom site_limit")
-    if plan in PLAN_LIMITS:
-        target.plan = plan
-        target.site_limit = body.site_limit or PLAN_LIMITS[plan]
-    else:
-        target.plan = "custom"
-        target.site_limit = max(1, min(int(body.site_limit or target.site_limit or 5), 100))
+    if changing_plan and plan not in PLAN_LIMITS and plan != "custom":
+        raise HTTPException(status_code=400, detail="Use starter, agency, scale, or custom")
+    # Package label and website limit are independent — changing the package
+    # must not overwrite a custom (or already-set) site_limit.
+    if changing_plan:
+        target.plan = plan if plan in PLAN_LIMITS else "custom"
+    if changing_limit:
+        target.site_limit = max(1, min(int(body.site_limit), 100))
+    elif not int(getattr(target, "site_limit", 0) or 0):
+        target.site_limit = PLAN_LIMITS.get(target.plan if target.plan in PLAN_LIMITS else "starter", 5)
     db.add(target)
     db.commit()
     db.refresh(target)

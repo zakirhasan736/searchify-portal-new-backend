@@ -13,13 +13,27 @@ from app.models import User
 TABLES = ("site_changes", "jobs", "feature_records", "cms_connections", "google_connections", "drafts")
 
 
-def make_user(prefix: str = "pytest") -> SimpleNamespace:
+def make_user(prefix: str = "pytest", *, role: str = "ROLE_CLIENT", plan: str = "starter", site_limit: int = 5) -> SimpleNamespace:
     tag = uuid.uuid4().hex[:10]
     with SessionLocal() as db:
-        row = User(username=f"{prefix}_{tag}", email=f"{prefix}_{tag}@example.test", password_hash="x", role="ROLE_CLIENT", plan="starter")
+        row = User(
+            username=f"{prefix}_{tag}",
+            email=f"{prefix}_{tag}@example.test",
+            password_hash="x",
+            role=role,
+            plan=plan,
+            site_limit=site_limit,
+        )
         db.add(row)
         db.commit()
-        return SimpleNamespace(id=row.id, username=row.username, email=row.email, role=row.role, plan=row.plan, site_limit=5)
+        return SimpleNamespace(
+            id=row.id,
+            username=row.username,
+            email=row.email,
+            role=row.role,
+            plan=row.plan,
+            site_limit=row.site_limit,
+        )
 
 
 def drop_user(user_id: int) -> None:
