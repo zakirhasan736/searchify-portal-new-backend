@@ -1,4 +1,4 @@
-"""DataForSEO research for Keywords, Backlinks, and AI visibility.
+"""Searchify SEO research for Keywords, Backlinks, and AI visibility.
 
 Every result is stored per website so the same lookup is not paid for twice inside its window.
 A daily call budget per customer keeps a large site from running up the bill.
@@ -27,20 +27,34 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 PROVIDER_ERRORS = {
-    40104: "The DataForSEO account is not verified yet. Finish verification in the DataForSEO panel.",
-    40200: "The DataForSEO balance is empty. Add funds in the DataForSEO panel.",
-    40210: "The DataForSEO balance is too low for this request. Add funds in the DataForSEO panel.",
-    40100: "DataForSEO rejected the login. Check the API login and password in the backend settings.",
-    40204: "This DataForSEO API is not active on the account. Turn it on in the DataForSEO panel.",
+    40104: "Searchify SEO is not fully set up yet. Ask an admin to finish Searchify SEO setup.",
+    40200: "Searchify SEO research credit is empty. Top up Searchify SEO to run live research again.",
+    40210: "Searchify SEO research credit is too low for this request. Top up Searchify SEO and try again.",
+    40100: "Searchify SEO could not authenticate. Ask an admin to check the Searchify SEO connection.",
+    40204: "This Searchify SEO research feature is not active. Ask an admin to enable it.",
 }
 
 
 class ResearchError(Exception):
-    pass
+    def __init__(self, message: str, *, code: str = "research_error"):
+        super().__init__(message)
+        self.code = code
 
 
 def configured() -> bool:
     return bool(config.DATAFORSEO_LOGIN and config.DATAFORSEO_PASSWORD)
+
+
+def _provider_error(code: int, fallback: str) -> ResearchError:
+    message = PROVIDER_ERRORS.get(code) or fallback
+    if code in (40200, 40210):
+        _STATUS.clear()
+        return ResearchError(message, code="provider_balance")
+    if code in (40100, 40104):
+        return ResearchError(message, code="provider_auth")
+    if code == 40204:
+        return ResearchError(message, code="provider_api_disabled")
+    return ResearchError(message, code="provider_error")
 
 
 def host_of(value: str) -> str:
@@ -50,7 +64,7 @@ def host_of(value: str) -> str:
 
 
 def location_for(text: str = "", reach: str = "") -> tuple[str, str]:
-    """(DataForSEO location_name, ISO). Raises locations.LocationError instead of defaulting."""
+    """(Searchify SEO location_name, ISO). Raises locations.LocationError instead of defaulting."""
     place = locations.resolve(text, reach=reach)
     return place.country, place.iso
 
@@ -96,7 +110,10 @@ def _budget(db: Session, user: User, calls: int) -> None:
     plan = (getattr(user, "plan", None) or "starter").lower()
     limit = DAILY_CALLS["scale"] if user.role == "ROLE_ADMIN" else DAILY_CALLS.get(plan, DAILY_CALLS["starter"])
     if usage["calls"] + calls > limit:
-        raise ResearchError(f"Today's research limit for this plan is used ({limit} lookups). It resets tomorrow.")
+        raise ResearchError(
+            f"Today's research limit for this plan is used ({limit} lookups). It resets tomorrow.",
+            code="daily_limit",
+        )
 
 
 def _spend(db: Session, user: User, calls: int, cost: float) -> None:
@@ -118,7 +135,10 @@ def _call(method: str, path: str, payload: list | None = None, timeout: float = 
 
 def _task(method: str, path: str, payload: list | None = None, timeout: float = 60.0, ok: tuple[int, ...] = (20000,)) -> tuple[dict, float]:
     if not configured():
-        raise ResearchError("DataForSEO is not connected. Add the API login and password to the backend settings.")
+        raise ResearchError(
+            "Searchify SEO is not connected. Ask an admin to connect Searchify SEO in the backend settings.",
+            code="provider_not_configured",
+        )
     try:
         with httpx.Client(timeout=timeout) as client:
             response = client.request(
@@ -129,14 +149,14 @@ def _task(method: str, path: str, payload: list | None = None, timeout: float = 
             )
         data = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise ResearchError(f"DataForSEO could not be reached. {str(exc)[:120]}") from exc
+        raise ResearchError(f"Searchify SEO could not be reached. {str(exc)[:120]}", code="provider_unreachable") from exc
     code = int(data.get("status_code") or 0)
     if code != 20000:
-        raise ResearchError(PROVIDER_ERRORS.get(code) or f"DataForSEO: {data.get('status_message') or 'request failed'}")
+        raise _provider_error(code, f"Searchify SEO: {data.get('status_message') or 'request failed'}")
     task = (data.get("tasks") or [{}])[0] or {}
     task_code = int(task.get("status_code") or 0)
     if task_code and task_code not in ok:
-        raise ResearchError(PROVIDER_ERRORS.get(task_code) or f"DataForSEO: {task.get('status_message') or 'task failed'}")
+        raise _provider_error(task_code, f"Searchify SEO: {task.get('status_message') or 'task failed'}")
     return task, float(data.get("cost") or 0)
 
 
@@ -147,7 +167,7 @@ STATUS_TTL = timedelta(minutes=10)
 def status() -> dict:
     """Account check through the free user_data endpoint, reused for ten minutes."""
     if not configured():
-        return {"connected": False, "ready": False, "message": "Add the DataForSEO API login and password to the backend settings."}
+        return {"connected": False, "ready": False, "message": "Ask an admin to connect Searchify SEO in the backend settings."}
     if _STATUS.get("at") and datetime.utcnow() - _STATUS["at"] < STATUS_TTL:
         return {**_STATUS["value"], "cached": True}
     try:
@@ -156,7 +176,28 @@ def status() -> dict:
         return {"connected": True, "ready": False, "message": str(exc)}
     info = (result or [{}])[0] or {}
     balance = (info.get("money") or {}).get("balance")
-    value = {"connected": True, "ready": True, "balance": balance, "message": "DataForSEO is connected."}
+    try:
+        funds = float(balance) if balance is not None else None
+    except (TypeError, ValueError):
+        funds = None
+    if funds is not None and funds <= 0:
+        value = {
+            "connected": True,
+            "ready": False,
+            "balance": funds,
+            "code": "provider_balance",
+            "message": "Searchify SEO research credit is empty. Top up Searchify SEO before live keywords, backlinks, or AI visibility can run.",
+        }
+    elif funds is not None and funds < 1:
+        value = {
+            "connected": True,
+            "ready": True,
+            "balance": funds,
+            "code": "provider_balance_low",
+            "message": f"Searchify SEO is connected, but research credit is low (${funds:.2f}). Top up soon so live research does not stop mid-check.",
+        }
+    else:
+        value = {"connected": True, "ready": True, "balance": balance, "message": "Searchify SEO is connected."}
     _STATUS.update(at=datetime.utcnow(), value=value)
     return value
 
@@ -221,7 +262,7 @@ def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3) -> list[st
 def keywords(db: Session, user: User, *, site: str, terms: list[str], country: str = "", reach: str = "", force: bool = False) -> dict:
     host = host_of(site)
     if not host:
-        raise ResearchError("Add the website address in setup first.")
+        raise ResearchError("Add the website address in setup first.", code="site_required")
     place, market = _place_for(db, user, site=site, country=country, reach=reach, tool="keywords")
     location, language = place.country, place.language or market.get("language") or "en"
     clean = [t.strip()[:80] for t in dict.fromkeys(t.strip().lower() for t in terms or [] if t and t.strip())][:50]
@@ -289,7 +330,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 held.setdefault("otherUrls", []).append(row["url"])
     ranked = sorted(best.values(), key=_rank_key)
     for row in ranked:
-        row["source"] = "DataForSEO Labs ranked keywords (estimated Google organic position)"
+        row["source"] = "Searchify SEO ranked keywords (estimated Google organic position)"
     by_term = {row["keyword"].lower(): row for row in ranked}
 
     tracked = []
@@ -317,7 +358,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 "previous": rank.get("previous"),
                 "page": rank.get("page") or "",
                 "url": rank.get("url") or "",
-                "source": "DataForSEO keyword overview + ranked keywords" if term.lower() in found or rank else "Not in DataForSEO keyword data",
+                "source": "Searchify SEO keyword overview + ranked keywords" if term.lower() in found or rank else "Not in Searchify SEO keyword data",
             })
 
     ideas = []
@@ -340,7 +381,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 continue
             # Prefer ideas with real demand; keep null-volume ideas only as filler.
             known.add(key)
-            ideas.append({**row, "source": f"DataForSEO keyword suggestions · seed “{seed}”", "seed": seed})
+            ideas.append({**row, "source": f"Searchify SEO keyword suggestions · seed “{seed}”", "seed": seed})
     ideas.sort(key=lambda r: (-(r["volume"] if isinstance(r.get("volume"), (int, float)) else -1), r.get("keyword") or ""))
     paid_calls = 1 + bool(clean) + idea_calls
     _spend(db, user, paid_calls, cost)
@@ -365,7 +406,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "seeds": seeds,
         "termLimit": term_limit,
         "qualityVersion": 2,
-        "source": "DataForSEO Labs",
+        "source": "Searchify SEO",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
     _save(db, user.id, "dfs-keywords", title, payload)
@@ -437,7 +478,7 @@ def _collect_backlinks(items: list, *, prefer: dict[str, dict] | None = None) ->
 def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored_only: bool = False) -> dict:
     host = host_of(site)
     if not host:
-        raise ResearchError("Add the website address in setup first.")
+        raise ResearchError("Add the website address in setup first.", code="site_required")
     title = f"Backlinks {host}"
     if stored_only:
         row = _record(db, user.id, "dfs-backlinks", title)
@@ -509,8 +550,8 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
             "nofollowDomains": s.get("referring_domains_nofollow"),
             "brokenBacklinks": s.get("broken_backlinks"),
             "rank": s.get("rank"),
-            "rankScale": "DataForSEO domain rank, 0 to 1000",
-            "counts": "Live referring domains from DataForSEO backlinks summary",
+            "rankScale": "Searchify SEO domain rank, 0 to 1000",
+            "counts": "Live referring domains from Searchify SEO backlinks summary",
         },
         "links": links,
         "linksNote": (
@@ -522,7 +563,7 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
         "lostDomainsListed": lost_page.get("total_count"),
         "qualityVersion": 2,
         "market": {"scope": "domain", "countryFilter": False, "note": "Backlink counts are domain-wide, not filtered by the SEO target country."},
-        "source": "DataForSEO Backlinks",
+        "source": "Searchify SEO Backlinks",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
     _save(db, user.id, "dfs-backlinks", title, payload)
@@ -533,7 +574,7 @@ MODEL_CACHE_VERSION = 4
 
 
 def _model_for(db: Session, user: User, engine: str) -> dict:
-    """{name, reasoning, webSearch} for the cheapest web-searching model DataForSEO lists for this engine."""
+    """{name, reasoning, webSearch} for the cheapest web-searching model Searchify SEO lists for this engine."""
     title = f"Models {engine}"
     saved = cached(db, user.id, "dfs-models", title, WINDOWS["models"])
     if saved and saved.get("version") == MODEL_CACHE_VERSION and (saved.get("model") or {}).get("name"):
@@ -593,7 +634,7 @@ def visibility(
 ) -> dict:
     host = host_of(site)
     if not host:
-        raise ResearchError("Add the website address in setup first.")
+        raise ResearchError("Add the website address in setup first.", code="site_required")
     if (country or "").strip() or db is None:
         place = locations.resolve(country, reach=reach, allow_worldwide=True)
         market = {"source": "request", "countryIso": place.iso, "version": 0}
@@ -709,7 +750,7 @@ def visibility(
         "location": place.to_dict(),
         "market": {"countryIso": place.iso, "language": place.language, "source": market.get("source"), "version": market.get("version")},
         "results": results,
-        "source": "DataForSEO AI Optimization",
+        "source": "Searchify SEO AI",
     }
 
 
@@ -786,7 +827,7 @@ def _pages_with_check(items: list[dict], key: str) -> list[dict]:
 
 
 def _fetch_checked_pages(task_id: str, key: str, limit: int = 25) -> list[dict]:
-    """Ask DataForSEO for pages that failed one check — more reliable than scanning a partial page dump."""
+    """Ask Searchify SEO for pages that failed one check — more reliable than scanning a partial page dump."""
     try:
         result, _ = _call(
             "POST",
@@ -887,10 +928,10 @@ def _summary(task_id: str) -> dict | None:
 
 
 def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
-    """Starts a DataForSEO site crawl, or reports its progress, or returns the finished report."""
+    """Starts a Searchify SEO site crawl, or reports its progress, or returns the finished report."""
     host = host_of(site)
     if not host:
-        raise ResearchError("Add the website address in setup first.")
+        raise ResearchError("Add the website address in setup first.", code="site_required")
     title = f"Audit {host}"
     row = _record(db, user.id, "dfs-audit", title)
     saved = dict((row.payload if row else {}) or {})
@@ -945,7 +986,7 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
     )
     task_id = task.get("id")
     if not task_id:
-        raise ResearchError("DataForSEO did not start the site crawl. Try again in a minute.")
+        raise ResearchError("Searchify SEO did not start the site crawl. Try again in a minute.")
     _spend(db, user, 1, cost)
     quotas.consume(db, user, "audits")
     payload = {
@@ -958,7 +999,7 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
         "queued": 0,
         "report": saved.get("report"),
         "fetchedAt": saved.get("fetchedAt"),
-        "source": "DataForSEO On-Page",
+        "source": "Searchify SEO On-Page",
     }
     _save(db, user.id, "dfs-audit", title, payload)
     return {**payload, "cached": False}

@@ -786,91 +786,94 @@ def _assistant_fallback(question: str, profile: dict, queue: list[dict], status:
     joined = " ".join(status or [])
     if any(word in lower for word in ("cost", "price", "how much", "cheap")):
         return (
-            "Writing the title and description is the small part. One page is under a cent. "
-            "Five pages is about 3 cents, and ten pages is about 6 cents. "
-            "If a draft has to be rewritten, that page costs about twice. "
-            "That figure is the writing step only. Nothing is published from this chat. "
-            "If you want, I can walk you through the next card."
+            "Happy to demystify that. Writing a title and description is the light part of the cost — "
+            "under a cent for one page, about 3 cents for five, about 6 cents for ten. "
+            "A rewrite on the same page is roughly twice. That’s only the writing step; this chat never publishes. "
+            "Want me to walk you through the next card so you can see the value in practice?"
         )
     if any(word in lower for word in ("next", "how do", "how does", "start", "help", "what should", "where")):
         if "not selected" in joined and "Search Console: not selected" in joined:
             return (
-                f"For {business}, the useful next step is Connections: choose the Search Console property and sync. "
-                "Then press Write title suggestions. Each card shows the current title and the suggested one. "
-                "Approve the ones you want. This chat cannot publish them."
+                f"For {business}, I’d start somewhere calm and useful: open Connections, pick the Search Console property, and sync. "
+                "Then try Write title suggestions — each card shows the current line beside a clearer draft. "
+                "You approve what feels right. I can’t publish from here, and that’s on purpose."
             )
         if pending:
             return (
-                f"You already have {len(pending)} suggestion{'s' if len(pending) != 1 else ''} to review for {business}. "
-                f"I’d open “{_clip(target.get('title') or 'the first card', 80)}” first. "
-                "Dismiss it if it is weak, or approve it on the card. Writing another batch skips pages that are already in the queue."
+                f"Nice — you already have {len(pending)} suggestion{'s' if len(pending) != 1 else ''} waiting for {business}. "
+                f"I’d open “{_clip(target.get('title') or 'the first card', 80)}” first and read it with fresh eyes. "
+                "Keep it if it sounds like the page; dismiss it if it doesn’t. When you’re ready, we can draft another batch for pages still outside the queue."
             )
         return (
-            f"The queue for {business} is clear. Press Write title suggestions to read the connected pages and draft a title and description for each. "
-            "A 5 to 10 page site is a small writing job. You still approve every card before anything goes live."
+            f"Your queue for {business} is clear, which is a lovely place to begin. "
+            "Press Write title suggestions and I’ll help you read each title and description as they arrive. "
+            "A small site is a light writing job — and you still approve every card before anything goes live."
         )
     if target and any(word in lower for word in ("why", "first", "this", "card", "suggest", "title", "description")):
-        live = "It comes from the connected page data." if target.get("live") else "It comes from the setup brief, not a live Search Console page yet."
+        live = "It was shaped from the connected page data." if target.get("live") else "It comes from your setup brief for now — not a live Search Console page yet."
         return (
-            f"The one I’d look at first is {_clip(target.get('title') or 'the open suggestion', 90)} "
+            f"If I were sitting beside you, I’d start with {_clip(target.get('title') or 'the open suggestion', 90)} "
             f"on {_clip(target.get('url') or 'that page', 80)}. "
-            f"The current title is “{_clip(target.get('before') or 'not stored', 70)}” and the suggestion is "
+            f"Today it reads “{_clip(target.get('before') or 'not stored', 70)}”; the draft offers "
             f"“{_clip(target.get('after') or 'not written yet', 70)}”. {live} "
-            "If it does not sound like the page, dismiss it and write again."
+            "If it doesn’t feel true to the page, dismiss it — we can write again without any pressure."
         )
     if any(word in lower for word in ("approve", "publish", "live")):
         return (
-            "Approving a card does not publish it from this chat. "
-            "Use Approve draft on the card. A live recommendation still waits for the publishing step. "
-            "Cards that only come from the setup brief stay here until Search Console is connected."
+            "Good question — approving in this chat never publishes the site. "
+            "Use Approve draft on the card itself. Live recommendations still wait for a separate publishing step, "
+            "and brief-only cards stay in review until Search Console is connected. Want a walkthrough of that flow?"
         )
     if any(word in lower for word in ("contact", "admin", "support", "person")):
         return (
-            "I can point you to the contact page so you can write to the Searchify team. "
-            "Mention the website and what you were trying to do. I don’t send the message myself."
+            "Of course. I can open the contact page so you can reach the Searchify team directly. "
+            "Mention the website and what you were hoping to finish — that helps them help you faster. "
+            "I don’t send the message myself."
         )
     if "wordpress" in lower:
         return (
-            "WordPress is how an approved title and description can be published. "
-            "Open Connections and connect that site. Connecting does not publish the page, and I can’t enter the password for you."
+            "WordPress is the bridge from an approved draft to the live page. "
+            "Open Connections and connect that site when you’re ready — connecting alone doesn’t publish anything. "
+            "I can’t enter the password for you, but I can stay with you through the steps."
         )
     if any(word in lower for word in ("google", "analytics", "search console")):
         return (
-            "Search Console shows queries people already use, and Analytics shows which pages they open. "
+            "Search Console shows the searches people already use; Analytics shows which pages they open. "
             "Open Connections, continue with Google, then choose this website’s property. "
-            "If the site uses a different Google login, add that login in Manage workspace first. I can’t sign in for you."
+            "If it lives under another Google login, add that login in Manage workspace first. I can’t sign in for you — but I’ll keep the path clear."
         )
     if "keyword" in lower:
         return (
-            "Keywords start from what you sell and where you serve. "
-            "After Search Console is connected, the Keywords page can list queries Google already recorded. "
-            "Searchify does not invent a rank or a search volume."
+            "Keywords grow from what you sell and where you serve. "
+            "Once Search Console is connected, the Keywords page can show real Google positions, volume, and ideas — "
+            "never invented ranks. Want me to point you there next?"
         )
     if "backlink" in lower or "referring" in lower:
         return (
-            "Backlinks are referring domains stored for the selected website. "
-            "An empty list means none are stored yet. A lost link is a cue to review it, not an automatic disavow."
+            "Backlinks are the referring domains stored for the selected website. "
+            "An empty list simply means none are stored yet. A lost link is a gentle cue to review — not an automatic disavow."
         )
     if "visibility" in lower:
         return (
-            "AI visibility is a short list of questions a customer might ask about the business. "
-            "Run live checks to ask ChatGPT, Gemini, Perplexity, or Claude and see whether the business is named or the site is cited, "
-            "with the full answer and its sources."
+            "AI visibility is a short, curious list of questions a customer might ask about the business. "
+            "Live checks ask ChatGPT, Gemini, Perplexity, or Claude, then show whether you’re named or cited — "
+            "with the full answer and its sources. Shall we open that page?"
         )
     if any(word in lower for word in ("plan", "subscription", "billing", "usage", "package")):
         return (
-            "Subscription shows the plan: websites, keywords, prompts, and audits. "
-            "The usage line is what this workspace has already used. Change the plan there when you need another site."
+            "Subscription shows your plan — websites, keywords, prompts, and audits — plus what this workspace has already used. "
+            "Change the package when you need room for another site. Happy to help you pick a path."
         )
     count = len(pending) or len(queue)
     if count:
         return (
             f"There are {count} open item{'s' if count != 1 else ''} for {business}. "
-            "Want me to start with the first one, or talk through what approve actually does?"
+            "Want me to start with the first one, or talk through what approve actually does — no rush either way?"
         )
     return (
-        f"I have the brief for {business}, and this queue is still empty. "
-        "Connect Search Console, sync, then press Write title suggestions. I’ll stay with you while you review them."
+        f"I have the brief for {business}, and the queue is still open and quiet. "
+        "Connect Search Console, sync, then press Write title suggestions. "
+        "I’ll stay right here while you review — curious, patient, and ready with the next gentle nudge."
     )
 
 
@@ -932,27 +935,28 @@ def ask_assistant(body: AssistantBody, db: Session = Depends(get_db), user: User
         role = "Searchify" if turn.role == "assistant" else "Operator"
         lines.append(f"{role}: {_clip(turn.text, 500)}")
     system = (
-        "You are Searchify assistance, in a real conversation with the person using this workspace. "
-        "Sound friendly, calm, and easy to talk to. Use plain words. Keep the reply smooth, like a colleague sitting beside them. "
-        "If asked who you are, say you are Searchify assistance. "
-        "Never name a model, GPT, OpenAI, Luna, Terra, Sol, or 4o. "
-        "Answer the question they asked first. Then offer one helpful suggestion tied to that question: a next step in the product, or a follow-up they might want to ask. One suggestion is enough. "
-        "Usually three to six sentences. Use a short numbered list only when they ask what to do next. No headings. "
-        "The working style in the message changes the wording, not publishing. Exact-match stays on the phrase already on the page. Balanced uses the closest honest query. Broader discovery may use one nearby angle the page already supports. "
+        "You are Searchify assistance — a modern, elegant, open-minded guide in a real conversation with the person using this workspace. "
+        "Be warm, charming, and lightly witty without being cute or salesy. Sound like a sharp, kind colleague who notices what they need before they ask. "
+        "Use plain, conversational English. Prefer short, flowing sentences. Avoid stiff corporate tone, jargon piles, and robotic lists. "
+        "If asked who you are, say you are Searchify assistance. Never name a model, GPT, OpenAI, Luna, Terra, Sol, Astra, or 4o. "
+        "Answer their question first, clearly and honestly. Then offer one suggestive next step or one natural follow-up question — never more than one. "
+        "Invite; don’t command. Prefer phrasing like “You might try…”, “A gentle next step…”, “Want me to walk you through…?” "
+        "Usually three to six sentences. Use a short numbered list only when they ask what to do next. No headings, no markdown bold. "
+        "Stay curious and open-minded: if their goal is unusual, explore it with them instead of shutting it down. If something is missing, say so kindly and name what would unlock it. "
+        "The working style in the message changes wording, not publishing. Exact-match stays on the phrase already on the page. Balanced uses the closest honest query. Broader discovery may use one nearby angle the page already supports. "
         "Review every change means they press Generate, then approve or dismiss each card. Prepare drafts automatically fills empty cards when they open the overview. Neither choice publishes. "
-        "Help them use the system: connect WordPress, choose Search Console and Analytics, sync, press Generate, then dismiss or approve each card. "
+        "Help them use the product with confidence: connect WordPress, choose Search Console and Analytics, sync, press Generate, then dismiss or approve each card. "
         "Notice what they are trying to finish, name why that step helps in one plain sentence, then say how to do it. "
-        "You cannot sign in to Google or WordPress for them, and you cannot publish. Offer the page: Connections for Google and WordPress, Manage workspace to add a website or another Google login, Keywords for live Google positions, volume, and ideas, Backlinks for the live link index, AI visibility for live checks of whether ChatGPT, Gemini, Perplexity, or Claude name or cite the business, Subscription for the plan and usage, and the contact page if they want a person on the team. "
+        "You cannot sign in to Google or WordPress for them, and you cannot publish. Offer the page when useful: Connections, Manage workspace, Keywords, Backlinks, AI visibility, Subscription, or contact. "
         "A lost backlink is a review cue, not a disavow. Do not invent ranks, volumes, scores, or link counts. "
         "Each website can use its own Google account. Overview and Settings follow the selected website. Keywords, Backlinks, AI visibility, and the completion log can stay on one website for that page only. "
         "A title suggestion reads the live page, competitor listings, Search Console, and Analytics. The output is one title and one description. It does not publish. "
-        "If they ask cost, say this and do not invent another price: one page is under a cent, five pages about 3 cents, ten pages about 6 cents. "
-        "A rewritten page costs about twice. That is the writing step only. "
+        "If they ask cost, say this and do not invent another price: one page is under a cent, five pages about 3 cents, ten pages about 6 cents. A rewritten page costs about twice. That is the writing step only. "
         "Use the workspace status and the queue in the message. Name the page when you refer to a card. "
-        "If a fact is not there, say so in a friendly way and suggest what would unlock it. Do not invent rankings, clicks, traffic, or backlinks. "
         "Do not say you approved or published anything. Approval happens on the card, not in this chat. "
         "If a card is marked setup brief only, say that it is not from Search Console yet. "
-        "When the queue already has those pages, suggest dismissing a card before writing that page again."
+        "When the queue already has those pages, suggest dismissing a card before writing that page again. "
+        "End most replies feeling open — as if the conversation can continue easily."
     )
     try:
         text, model, _role = chat_text(

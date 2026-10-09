@@ -190,7 +190,7 @@ def test_visibility_retries_without_invalid_country_field(offline_visibility, mo
         body = dict(payload[0]) if payload else None
         calls.append(body)
         if body and "web_search_country_iso_code" in body:
-            raise research.ResearchError("DataForSEO: Invalid Field: 'web_search_country_iso_code'.")
+            raise research.ResearchError("Searchify SEO: Invalid Field: 'web_search_country_iso_code'.")
         return [{"model_name": "m", "items": [{"sections": [{"text": "Acme Plumbing is listed.", "annotations": []}]}]}], 0.0
 
     monkeypatch.setattr(research, "_call", fake_call)

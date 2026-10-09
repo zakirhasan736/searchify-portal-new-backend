@@ -55,14 +55,14 @@ def test_keywords_keep_location_language_nulls_and_dedupe(offline, monkeypatch):
     tracked = {r["keyword"]: r for r in out["tracked"]}
     assert set(tracked) == {"calgary plumber", "unknown term"}
     assert tracked["unknown term"]["volume"] is None and tracked["unknown term"]["position"] is None
-    assert tracked["unknown term"]["source"] == "Not in DataForSEO keyword data"
+    assert tracked["unknown term"]["source"] == "Not in Searchify SEO keyword data"
     assert out["ideas"][0]["volume"] == 120
     assert "keyword suggestions" in out["ideas"][0]["source"]
     assert out["qualityVersion"] == 2
 
 
 def test_keywords_refuse_to_guess_location(offline, monkeypatch):
-    monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("must not call DataForSEO"))
+    monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("must not call Searchify SEO"))
     with pytest.raises(LocationError):
         research.keywords(None, FakeUser(), site="acme.ca", terms=["x"], country="")
 
@@ -104,7 +104,7 @@ def test_backlinks_include_lost_links_dedupe_and_keep_nulls(offline, monkeypatch
 
 
 def test_backlinks_stored_only_never_calls_dataforseo(offline, monkeypatch):
-    monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("stored_only must not call DataForSEO"))
+    monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("stored_only must not call Searchify SEO"))
     monkeypatch.setattr(research, "_record", lambda *a, **k: None)
     out = research.backlinks(None, FakeUser(), site="https://example.com", stored_only=True)
     assert out == {"host": "example.com", "state": "none", "cached": True}

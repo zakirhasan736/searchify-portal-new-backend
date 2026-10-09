@@ -1,4 +1,4 @@
-"""Regression tests for DataForSEO `40501 Invalid Field: 'web_search_country_iso_code'`.
+"""Regression tests for Searchify SEO `40501 Invalid Field: 'web_search_country_iso_code'`.
 
 The old code sent one payload to every engine:
   {"user_prompt", "model_name", "web_search": True, "web_search_country_iso_code": iso, "max_output_tokens": 800}
@@ -151,7 +151,7 @@ def test_visibility_keeps_last_good_answer_when_a_call_fails(offline, monkeypatc
     good_time = first["results"][0]["fetchedAt"]
 
     def boom(*a, **k):
-        raise research.ResearchError("DataForSEO: Invalid Field: 'web_search_country_iso_code'.")
+        raise research.ResearchError("Searchify SEO: Invalid Field: 'web_search_country_iso_code'.")
 
     monkeypatch.setattr(research, "_call", boom)
     second = research.visibility(None, FakeUser(), site="acme.ca", brand="Acme", country="Canada",

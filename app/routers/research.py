@@ -48,7 +48,10 @@ def _run(fn, *args, **kwargs):
     except quotas.QuotaError as exc:
         raise HTTPException(status_code=429, detail={"code": "quota_exceeded", "feature": exc.feature, "message": str(exc)}) from exc
     except research.ResearchError as exc:
-        raise HTTPException(status_code=424, detail=str(exc)) from exc
+        raise HTTPException(
+            status_code=424,
+            detail={"code": getattr(exc, "code", None) or "research_error", "message": str(exc)},
+        ) from exc
 
 
 @router.get("/usage")

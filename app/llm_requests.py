@@ -1,9 +1,9 @@
-"""Build DataForSEO AI Optimization `llm_responses/live` requests that each engine accepts.
+"""Build Searchify SEO AI `llm_responses/live` requests that each engine accepts.
 
 The four endpoints do not share one schema. Sending a field an endpoint does not document returns
 `40501 Invalid Field` for the whole task, so every request is built from that engine's own field list.
 
-Field lists come from the DataForSEO v3 docs (ai_optimization/<engine>/llm_responses/live):
+Field lists come from the Searchify SEO v3 docs (ai_optimization/<engine>/llm_responses/live):
 - chat_gpt: web_search, force_web_search, web_search_country_iso_code, web_search_city.
   Country and city need web_search=true and are not supported by o3-mini, o1, o1-pro.
 - gemini: web_search only. No country or city field.
@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 
 ENGINES = {"ChatGPT": "chat_gpt", "Gemini": "gemini", "Perplexity": "perplexity", "Claude": "claude"}
-# Shown in the product AI list; DataForSEO has no llm_responses endpoint for these yet.
+# Shown in the product AI list; Searchify SEO has no llm_responses endpoint for these yet.
 SOON_ENGINES = ("Copilot", "Google AI Overviews", "Grok")
 ENGINE_ALIASES = {
     "Claude AI": "Claude",
@@ -78,7 +78,7 @@ def pick_model(engine: str, models: list[dict]) -> dict:
     """Choose a cheap model that can search the web. Returns {name, reasoning, webSearch}."""
     rows = [m for m in models or [] if isinstance(m, dict) and m.get("model_name")]
     if not rows:
-        raise RequestError(f"No {engine} model is available on the DataForSEO account.")
+        raise RequestError(f"No {engine} model is available on Searchify SEO.")
     by_name = {m["model_name"]: m for m in rows}
 
     def meta(m: dict) -> dict:
