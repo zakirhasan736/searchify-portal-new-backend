@@ -7,6 +7,8 @@ Credentials stay server-side; real HTTP runs when configured, else dry-run recor
 
 from __future__ import annotations
 
+import json
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -14,6 +16,13 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 PROVIDERS = ("wordpress", "shopify", "webflow", "custom")
+
+_JSONLD_START = "<!--searchify-jsonld-->"
+_JSONLD_END = "<!--/searchify-jsonld-->"
+_JSONLD_BLOCK_RE = re.compile(
+    r"(?:<!--\s*wp:html\s*-->\s*)?<!--searchify-jsonld-->.*?<!--/searchify-jsonld-->(?:\s*<!--\s*/wp:html\s*-->)?",
+    re.DOTALL | re.IGNORECASE,
+)
 
 
 def apply_change(provider: str, credentials: dict, site_url: str, change: dict) -> dict[str, Any]:
@@ -30,14 +39,131 @@ def apply_change(provider: str, credentials: dict, site_url: str, change: dict) 
 
 
 def undo_change(provider: str, credentials: dict, site_url: str, change: dict, previous: dict) -> dict[str, Any]:
-    """Restore previous title/description values."""
+    """Restore previous SEO meta title / meta description (never the WP page name)."""
     payload = dict(change or {})
-    payload["title"] = previous.get("title") or previous.get("beforeTitle")
+    payload["title"] = previous.get("title") or previous.get("beforeTitle") or previous.get("metaTitle")
     payload["metaDescription"] = previous.get("metaDescription") or previous.get("beforeDescription")
     payload["content"] = None  # metadata-only undo
-    payload["excerpt"] = payload.get("metaDescription")
+    payload["updateContent"] = False
+    payload["includeOpenGraph"] = bool(change.get("includeOpenGraph") or previous.get("includeOpenGraph"))
+    payload["includeJsonLd"] = bool(change.get("includeJsonLd") or previous.get("includeJsonLd"))
     payload["undo"] = True
     return apply_change(provider, credentials, site_url, payload)
+
+
+# SEO plugin meta keys — never WordPress post/page `title` (that renames menus / page name).
+_WP_META_TITLE_KEYS = (
+    "_yoast_wpseo_title",
+    "rank_math_title",
+    "_seopress_titles_title",
+)
+_WP_META_DESC_KEYS = (
+    "_yoast_wpseo_metadesc",
+    "rank_math_description",
+    "_seopress_titles_desc",
+)
+_WP_OG_TITLE_KEYS = (
+    "_yoast_wpseo_opengraph-title",
+    "rank_math_facebook_title",
+    "_seopress_social_fb_title",
+)
+_WP_OG_DESC_KEYS = (
+    "_yoast_wpseo_opengraph-description",
+    "rank_math_facebook_description",
+    "_seopress_social_fb_desc",
+)
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _wp_meta_payload(
+    meta_title: str | None,
+    meta_desc: str | None,
+    *,
+    include_open_graph: bool = False,
+) -> dict[str, str]:
+    meta: dict[str, str] = {}
+    title = (meta_title or "").strip()
+    desc = (meta_desc or "").strip()
+    if title:
+        for key in _WP_META_TITLE_KEYS:
+            meta[key] = title
+        if include_open_graph:
+            for key in _WP_OG_TITLE_KEYS:
+                meta[key] = title
+    if desc:
+        for key in _WP_META_DESC_KEYS:
+            meta[key] = desc
+        if include_open_graph:
+            for key in _WP_OG_DESC_KEYS:
+                meta[key] = desc
+    return meta
+
+
+def _wp_pick_meta(meta: dict, keys: tuple[str, ...]) -> str:
+    if not isinstance(meta, dict):
+        return ""
+    for key in keys:
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def build_webpage_json_ld(
+    *,
+    meta_title: str,
+    meta_description: str,
+    page_url: str,
+    site_name: str = "",
+) -> dict[str, Any]:
+    """WebPage JSON-LD generated from the approved meta title and description."""
+    title = (meta_title or "").strip()
+    description = (meta_description or "").strip()
+    url = (page_url or "").strip()
+    graph: dict[str, Any] = {
+        "@context": "https://schema.org",
+        "@type": "WebPage",
+        "name": title,
+        "headline": title,
+        "description": description,
+    }
+    if url:
+        graph["url"] = url
+        graph["@id"] = url
+        graph["mainEntityOfPage"] = {"@type": "WebPage", "@id": url}
+    if site_name.strip():
+        graph["isPartOf"] = {"@type": "WebSite", "name": site_name.strip(), "url": urljoin(url, "/") if url else ""}
+    return {k: v for k, v in graph.items() if v not in ("", None, {})}
+
+
+def _json_ld_html_block(payload: dict[str, Any]) -> str:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    # Gutenberg custom HTML block so themes output the script in page content.
+    return (
+        "<!-- wp:html -->\n"
+        f"{_JSONLD_START}\n"
+        f'<script type="application/ld+json">{body}</script>\n'
+        f"{_JSONLD_END}\n"
+        "<!-- /wp:html -->"
+    )
+
+
+def inject_json_ld_content(raw_content: str | None, payload: dict[str, Any]) -> str:
+    """Replace any prior Searchify JSON-LD block, then append a fresh one."""
+    base = _JSONLD_BLOCK_RE.sub("", raw_content or "").rstrip()
+    block = _json_ld_html_block(payload)
+    if not base:
+        return block
+    return f"{base}\n\n{block}"
 
 
 def _wp_base(creds: dict, site_url: str) -> str:
@@ -180,54 +306,98 @@ def _wp_read(client: httpx.Client, base: str, auth: tuple[str, str], resource: s
     if r.status_code >= 400:
         return {}
     data = r.json()
-    title = ""
+    page_name = ""
     if isinstance(data.get("title"), dict):
-        title = data["title"].get("raw") or data["title"].get("rendered") or ""
+        page_name = data["title"].get("raw") or data["title"].get("rendered") or ""
     elif isinstance(data.get("title"), str):
-        title = data["title"]
+        page_name = data["title"]
     excerpt = ""
     if isinstance(data.get("excerpt"), dict):
         excerpt = data["excerpt"].get("raw") or ""
-    yoast = ""
-    meta = data.get("meta") or {}
-    if isinstance(meta, dict):
-        yoast = meta.get("_yoast_wpseo_metadesc") or meta.get("rank_math_description") or ""
+    content_raw = ""
+    if isinstance(data.get("content"), dict):
+        content_raw = data["content"].get("raw") or ""
+    elif isinstance(data.get("content"), str):
+        content_raw = data["content"]
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    meta_title = _wp_pick_meta(meta, _WP_META_TITLE_KEYS)
+    meta_desc = _wp_pick_meta(meta, _WP_META_DESC_KEYS)
     return {
         "id": str(data.get("id") or post_id),
-        "title": title,
+        # Keep pageName for diagnostics only — Searchify never writes this field.
+        "pageName": page_name,
+        # `title` in before/after means SEO meta title (Google listing), not WP page name.
+        "title": meta_title,
+        "metaTitle": meta_title,
         "excerpt": excerpt,
-        "metaDescription": yoast or excerpt,
+        "metaDescription": meta_desc,
+        "openGraphTitle": _wp_pick_meta(meta, _WP_OG_TITLE_KEYS),
+        "openGraphDescription": _wp_pick_meta(meta, _WP_OG_DESC_KEYS),
+        "contentRaw": content_raw,
+        "hasSearchifyJsonLd": _JSONLD_START in content_raw,
         "link": data.get("link") or "",
         "raw": data,
     }
 
 
 def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
-    """WordPress REST: Application Password. Metadata-first (title + excerpt/Yoast)."""
+    """WordPress REST: Application Password.
+
+    Always writes SEO meta title + meta description (Yoast / Rank Math / SEOPress).
+    Optional (default off): Open Graph meta + JSON-LD WebPage block from the same values.
+    Never updates the WordPress page/post title (page name / menu label / site title).
+    """
     user, password = _wp_auth(creds)
     base = _wp_base(creds, site_url)
     post_id = change.get("remoteId") or creds.get("defaultPostId")
     dry = not (user and password and base.startswith("http"))
 
+    meta_title = (change.get("metaTitle") or change.get("title") or "").strip()
+    meta_desc = (change.get("metaDescription") or change.get("excerpt") or "").strip()
+    include_og = _truthy(change.get("includeOpenGraph"))
+    include_json_ld = _truthy(change.get("includeJsonLd"))
+    page_url = (change.get("targetUrl") or change.get("link") or site_url or "").strip()
+    site_host = urlparse(base).hostname or ""
+
     payload: dict[str, Any] = {}
-    if change.get("title"):
-        payload["title"] = change["title"]
-    # v1: titles & descriptions only — do not push full content unless explicitly requested
+    # Explicit content body only when requested — never remap meta title → WP title.
     if change.get("updateContent") and change.get("content"):
         payload["content"] = change["content"]
-    meta_desc = change.get("excerpt") or change.get("metaDescription")
-    if meta_desc:
-        payload["excerpt"] = meta_desc
-        payload["meta"] = {"_yoast_wpseo_metadesc": meta_desc}
+    meta = _wp_meta_payload(meta_title, meta_desc, include_open_graph=include_og)
+    if meta:
+        payload["meta"] = meta
+
+    json_ld: dict[str, Any] | None = None
+    if include_json_ld and (meta_title or meta_desc):
+        json_ld = build_webpage_json_ld(
+            meta_title=meta_title,
+            meta_description=meta_desc,
+            page_url=page_url,
+            site_name=site_host,
+        )
 
     if dry:
+        intended = dict(payload)
+        if json_ld:
+            intended["jsonLd"] = json_ld
+            intended["contentNote"] = "JSON-LD WebPage block will be appended (Searchify marker)."
         return {
             "ok": True,
             "dryRun": True,
             "provider": "wordpress",
             "detail": "Dry-run — add WordPress Application Password to execute live.",
-            "intended": {"url": urljoin(base, f"wp-json/wp/v2/posts/{post_id or '{id}'}"), "payload": payload},
+            "includeOpenGraph": include_og,
+            "includeJsonLd": include_json_ld,
+            "intended": {"url": urljoin(base, f"wp-json/wp/v2/posts/{post_id or '{id}'}"), "payload": intended},
             "at": datetime.utcnow().isoformat(timespec="seconds"),
+        }
+
+    if not meta and not payload.get("content") and not json_ld:
+        return {
+            "ok": False,
+            "dryRun": False,
+            "provider": "wordpress",
+            "detail": "Nothing to publish — meta title and meta description are both empty.",
         }
 
     auth = (user, password)
@@ -244,36 +414,95 @@ def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
                 }
 
             before = _wp_read(client, base, auth, resource, resolved_id)
-            # Conflict check: if expected before title provided and live differs, abort
+            # Conflict on SEO meta title when we know the previous meta value.
             expected = (change.get("beforeTitle") or "").strip()
-            if expected and before.get("title") and before["title"].strip() != expected:
+            live_meta_title = (before.get("metaTitle") or before.get("title") or "").strip()
+            if expected and live_meta_title and live_meta_title != expected:
                 return {
                     "ok": False,
                     "dryRun": False,
                     "provider": "wordpress",
-                    "detail": "Conflict: page title changed since review. Re-open the opportunity.",
-                    "before": {"title": before.get("title"), "metaDescription": before.get("metaDescription")},
+                    "detail": "Conflict: meta title changed since review. Re-open the opportunity.",
+                    "before": {
+                        "title": before.get("metaTitle") or before.get("title"),
+                        "metaTitle": before.get("metaTitle"),
+                        "metaDescription": before.get("metaDescription"),
+                        "pageName": before.get("pageName"),
+                    },
                 }
+
+            if json_ld:
+                live_url = (before.get("link") or page_url or "").strip()
+                if live_url and not json_ld.get("url"):
+                    json_ld = build_webpage_json_ld(
+                        meta_title=meta_title,
+                        meta_description=meta_desc,
+                        page_url=live_url,
+                        site_name=site_host,
+                    )
+                payload["content"] = inject_json_ld_content(before.get("contentRaw") or "", json_ld)
 
             endpoint = "pages" if resource == "page" else "posts"
             url = urljoin(base, f"wp-json/wp/v2/{endpoint}/{resolved_id}")
             response = client.post(url, auth=auth, json=payload)
+            if response.status_code >= 400 and "meta" in payload:
+                # Retry with Yoast-only keys if the full SEO meta bag was rejected.
+                soft_meta: dict[str, str] = {}
+                if meta_title:
+                    soft_meta["_yoast_wpseo_title"] = meta_title
+                    if include_og:
+                        soft_meta["_yoast_wpseo_opengraph-title"] = meta_title
+                if meta_desc:
+                    soft_meta["_yoast_wpseo_metadesc"] = meta_desc
+                    if include_og:
+                        soft_meta["_yoast_wpseo_opengraph-description"] = meta_desc
+                if soft_meta:
+                    soft_payload = {**{k: v for k, v in payload.items() if k != "meta"}, "meta": soft_meta}
+                    response = client.post(url, auth=auth, json=soft_payload)
+            if response.status_code >= 400 and include_json_ld and "content" in payload:
+                # Meta may have applied; retry JSON-LD content alone after a soft meta success path failed together.
+                meta_only = {k: v for k, v in payload.items() if k != "content"}
+                if meta_only:
+                    meta_resp = client.post(url, auth=auth, json=meta_only)
+                    if meta_resp.status_code < 400:
+                        content_resp = client.post(url, auth=auth, json={"content": payload["content"]})
+                        if content_resp.status_code < 400:
+                            response = content_resp
+                        else:
+                            response = meta_resp
+                            include_json_ld = False
+                            json_ld = None
             if response.status_code >= 400:
-                # Retry without Yoast meta if meta write rejected
-                if "meta" in payload:
-                    soft = {k: v for k, v in payload.items() if k != "meta"}
-                    response = client.post(url, auth=auth, json=soft)
-                if response.status_code >= 400:
-                    return {
-                        "ok": False,
-                        "dryRun": False,
-                        "provider": "wordpress",
-                        "detail": response.text[:400],
-                        "status": response.status_code,
-                    }
+                return {
+                    "ok": False,
+                    "dryRun": False,
+                    "provider": "wordpress",
+                    "detail": response.text[:400],
+                    "status": response.status_code,
+                }
 
             verified = _wp_read(client, base, auth, resource, resolved_id)
-            title_ok = not change.get("title") or (verified.get("title") or "").strip() == str(change.get("title")).strip()
+            after_title = (verified.get("metaTitle") or verified.get("title") or "").strip()
+            after_desc = (verified.get("metaDescription") or "").strip()
+            title_ok = (not meta_title) or after_title == meta_title
+            desc_ok = (not meta_desc) or after_desc == meta_desc
+            # If the SEO plugin does not expose meta via REST, treat HTTP success as published
+            # and rely on the live HTML <title>/meta description check in the operator.
+            meta_readable = bool(after_title or after_desc or before.get("metaTitle") or before.get("metaDescription"))
+            verified_ok = (title_ok and desc_ok) if meta_readable else True
+            page_name_unchanged = (before.get("pageName") or "") == (verified.get("pageName") or "")
+            extras = []
+            if include_og:
+                extras.append("Open Graph")
+            if include_json_ld and verified.get("hasSearchifyJsonLd"):
+                extras.append("JSON-LD")
+            elif include_json_ld:
+                extras.append("JSON-LD (requested)")
+            detail_core = "WordPress meta title and meta description updated" if verified_ok else (
+                "WordPress updated (SEO meta could not be verified via REST — check live page)"
+            )
+            if extras:
+                detail_core = f"{detail_core}; also wrote {' + '.join(extras)}"
             return {
                 "ok": True,
                 "dryRun": False,
@@ -281,15 +510,29 @@ def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
                 "remoteId": resolved_id,
                 "resource": resource,
                 "link": verified.get("link") or change.get("targetUrl"),
-                "detail": "WordPress metadata updated and verified" if title_ok else "WordPress updated (verify mismatch on title)",
-                "verified": title_ok,
+                "detail": detail_core,
+                "verified": verified_ok,
+                "pageNameUnchanged": page_name_unchanged,
+                "includeOpenGraph": include_og,
+                "includeJsonLd": include_json_ld,
+                "jsonLd": json_ld,
                 "before": {
-                    "title": before.get("title"),
+                    "title": before.get("metaTitle") or before.get("title"),
+                    "metaTitle": before.get("metaTitle"),
                     "metaDescription": before.get("metaDescription"),
+                    "openGraphTitle": before.get("openGraphTitle"),
+                    "openGraphDescription": before.get("openGraphDescription"),
+                    "pageName": before.get("pageName"),
+                    "hasSearchifyJsonLd": before.get("hasSearchifyJsonLd"),
                 },
                 "after": {
-                    "title": verified.get("title"),
+                    "title": verified.get("metaTitle") or verified.get("title"),
+                    "metaTitle": verified.get("metaTitle"),
                     "metaDescription": verified.get("metaDescription"),
+                    "openGraphTitle": verified.get("openGraphTitle"),
+                    "openGraphDescription": verified.get("openGraphDescription"),
+                    "pageName": verified.get("pageName"),
+                    "hasSearchifyJsonLd": verified.get("hasSearchifyJsonLd"),
                 },
                 "at": datetime.utcnow().isoformat(timespec="seconds"),
             }

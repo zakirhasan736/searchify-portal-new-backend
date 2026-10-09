@@ -112,6 +112,9 @@ class ChangeBody(BaseModel):
 class ExecuteBody(BaseModel):
     cms_connection_id: int | None = None
     force_dry_run: bool = False
+    # Opt-in extras on publish (default off). Meta title/description always publish.
+    include_open_graph: bool = False
+    include_json_ld: bool = False
 
 
 class FromDraftBody(BaseModel):
@@ -1717,6 +1720,8 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
     target_url = _page_url(row.target_url, _homepage_url(conn.site_url, (conn.credentials or {}).get("siteUrl") or ""))
     if not target_url:
         target_url = _homepage_url(conn.site_url) or (row.target_url or "").strip()
+    include_open_graph = bool(body.include_open_graph)
+    include_json_ld = bool(body.include_json_ld)
     change_payload = {
         "title": approved["title"],
         "metaDescription": approved["metaDescription"],
@@ -1725,6 +1730,8 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
         "changeType": row.change_type or "meta",
         "targetUrl": target_url,
         "collectionId": (conn.credentials or {}).get("collectionId"),
+        "includeOpenGraph": include_open_graph,
+        "includeJsonLd": include_json_ld,
     }
 
     if body.force_dry_run:
@@ -1772,6 +1779,10 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
             proposed["resource"] = result.get("resource") or proposed.get("resource")
         proposed["publishedTitle"] = approved["title"]
         proposed["publishedDescription"] = approved["metaDescription"]
+        proposed["includeOpenGraph"] = include_open_graph
+        proposed["includeJsonLd"] = include_json_ld
+        if result.get("jsonLd"):
+            proposed["publishedJsonLd"] = result.get("jsonLd")
         after = _live_listing(target_url) if is_meta and target_url else None
         title_live = bool(after) and approval._norm(approved["title"]) in approval._norm(after.get("title"))
         result["liveCheck"] = {
