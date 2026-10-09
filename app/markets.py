@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from sqlalchemy.orm import Session
 
 from app import locations, site_profiles
-from app.models import FeatureRecord, User
+from app.models import CmsConnection, FeatureRecord, GoogleConnection, User
 
 # Dashboard region picker. Extensible — not every country DataForSEO knows.
 TARGET_COUNTRIES: list[dict] = [
@@ -194,6 +194,51 @@ def _onboarding_place(answers: dict) -> locations.Location | None:
         return None
 
 
+def _normalize_host(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if raw.startswith("sc-domain:"):
+        raw = raw.split(":", 1)[1]
+    return site_profiles.host_of(raw)
+
+
+def user_owns_host(db: Session, user: User, host: str) -> bool:
+    """True when the host is in the journey, a connected CMS site, or the selected GSC property."""
+    host = _normalize_host(host)
+    if not host:
+        return False
+    journey = site_profiles.get_journey(db, user.id) or {}
+    state = (journey.get("state") if isinstance(journey.get("state"), dict) else journey) or {}
+    for site in state.get("sites") or []:
+        if _normalize_host(((site.get("answers") or {}).get("site") or "")) == host:
+            return True
+    cms = (
+        db.query(CmsConnection)
+        .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
+        .all()
+    )
+    for row in cms:
+        creds = row.credentials if isinstance(row.credentials, dict) else {}
+        candidates = (
+            row.site_url,
+            row.label,
+            creds.get("siteUrl"),
+            creds.get("site_url"),
+            (row.meta or {}).get("siteUrl") if isinstance(row.meta, dict) else "",
+        )
+        if any(_normalize_host(str(value or "")) == host for value in candidates):
+            return True
+    google = (
+        db.query(GoogleConnection)
+        .filter(GoogleConnection.customer_id == user.id)
+        .order_by(GoogleConnection.id.desc())
+        .all()
+    )
+    for row in google:
+        if _normalize_host(row.gsc_site_url or "") == host:
+            return True
+    return False
+
+
 def resolve_for_site(db: Session, user: User, *, site: str = "", site_id=None) -> dict:
     """Apply precedence: user save → onboarding → profile → domain → needs choice."""
     host = site_profiles.host_of(site)
@@ -205,15 +250,16 @@ def resolve_for_site(db: Session, user: User, *, site: str = "", site_id=None) -
         site_row = next((s for s in sites if str(s.get("id")) == str(site_id)), None)
     if site_row is None and host:
         site_row = next((s for s in sites if site_profiles.host_of((s.get("answers") or {}).get("site") or "") == host), None)
-    if site_row is None and state.get("activeId") is not None:
+    if site_row is None and state.get("activeId") is not None and not host:
         site_row = next((s for s in sites if str(s.get("id")) == str(state.get("activeId"))), None)
     answers = (site_row or {}).get("answers") or {}
     if not host:
         host = site_profiles.host_of(answers.get("site") or "")
     sid = (site_row or {}).get("id") if site_row else site_id
+    owned = site_row is not None or user_owns_host(db, user, host)
 
     # Only resolve a market for websites that belong to this workspace.
-    if site_row is None:
+    if not owned:
         out = _empty(host, sid)
         out["domainSuggestion"] = suggest_iso_from_host(host) if host else None
         return out
@@ -294,18 +340,22 @@ def save_market(
         site_row = next((s for s in sites if str(s.get("id")) == str(site_id)), None)
     if site_row is None and host:
         site_row = next((s for s in sites if site_profiles.host_of((s.get("answers") or {}).get("site") or "") == host), None)
-    if site_row is None:
+    if site_row is not None:
+        host = host or site_profiles.host_of((site_row.get("answers") or {}).get("site") or "")
+    if not host:
+        raise MarketError("Add the website address before choosing a target market.")
+    if site_row is None and not user_owns_host(db, user, host):
         raise MarketError("That website is not in this workspace.")
-    host = host or site_profiles.host_of((site_row.get("answers") or {}).get("site") or "")
 
     place = locations.resolve(row["name"])
     lang = (language or row["language"] or place.language or "en").strip().lower()[:8]
     now = datetime.utcnow().isoformat(timespec="seconds")
-    previous = _load_saved(db, user.id, host=host, site_id=site_row.get("id")) or {}
+    sid = site_row.get("id") if site_row else site_id
+    previous = _load_saved(db, user.id, host=host, site_id=sid) or {}
     version = int(previous.get("version") or 0) + 1
     payload = {
         "host": host,
-        "siteId": site_row.get("id"),
+        "siteId": sid,
         "countryIso": iso,
         "countryName": row["name"],
         "language": lang,
@@ -320,8 +370,8 @@ def save_market(
         "updatedAt": now,
         "version": version,
     }
-    title = _title(host=host, site_id=site_row.get("id"))
-    existing = _record(db, user.id, host=host, site_id=site_row.get("id"))
+    title = _title(host=host, site_id=sid)
+    existing = _record(db, user.id, host=host, site_id=sid)
     if existing is None:
         db.add(FeatureRecord(customer_id=user.id, kind=KIND, title=title, payload=payload, status="stored"))
     else:
@@ -329,40 +379,38 @@ def save_market(
         existing.status = "stored"
         existing.title = title
 
-    # Keep journey answers aligned so tools that still read brief.market stay consistent.
-    answers = dict(site_row.get("answers") or {})
-    answers["targetCountry"] = iso
-    answers["marketSource"] = "user"
-    # Prefer a readable country name; keep a more specific city/region if it still matches.
-    old_market = answers.get("market") or ""
-    try:
-        old_place = locations.resolve(old_market) if old_market else None
-    except locations.LocationError:
-        old_place = None
-    if old_place and old_place.iso == iso and (old_place.city or old_place.region):
-        answers["market"] = old_place.label
-        if not payload["city"]:
-            payload["city"] = old_place.city
-        if not payload["region"]:
-            payload["region"] = old_place.region
-    else:
-        answers["market"] = row["name"]
-    site_row["answers"] = site_profiles.clean_answers({**answers, "market": answers["market"], "targetCountry": iso, "marketSource": "user"})
-    # clean_answers only keeps ANSWER_KEYS — extend those keys below.
-    site_row["answers"] = {**site_row["answers"], "targetCountry": iso, "marketSource": "user"}
-    for i, s in enumerate(sites):
-        if str(s.get("id")) == str(site_row.get("id")):
-            sites[i] = site_row
-            break
-    state = {**state, "sites": sites}
-    site_profiles.save_journey(db, user.id, state)
-    # save_journey commits; re-save market after in case journey write replaced nothing for KIND
-    existing = _record(db, user.id, host=host, site_id=site_row.get("id"))
-    if existing is None:
-        db.add(FeatureRecord(customer_id=user.id, kind=KIND, title=title, payload=payload, status="stored"))
-    else:
-        existing.payload = payload
-        existing.title = title
+    # Keep journey answers aligned when this host is also an onboarding site.
+    if site_row is not None:
+        answers = dict(site_row.get("answers") or {})
+        answers["targetCountry"] = iso
+        answers["marketSource"] = "user"
+        old_market = answers.get("market") or ""
+        try:
+            old_place = locations.resolve(old_market) if old_market else None
+        except locations.LocationError:
+            old_place = None
+        if old_place and old_place.iso == iso and (old_place.city or old_place.region):
+            answers["market"] = old_place.label
+            if not payload["city"]:
+                payload["city"] = old_place.city
+            if not payload["region"]:
+                payload["region"] = old_place.region
+        else:
+            answers["market"] = row["name"]
+        site_row["answers"] = site_profiles.clean_answers({**answers, "market": answers["market"], "targetCountry": iso, "marketSource": "user"})
+        site_row["answers"] = {**site_row["answers"], "targetCountry": iso, "marketSource": "user"}
+        for i, s in enumerate(sites):
+            if str(s.get("id")) == str(site_row.get("id")):
+                sites[i] = site_row
+                break
+        state = {**state, "sites": sites}
+        site_profiles.save_journey(db, user.id, state)
+        existing = _record(db, user.id, host=host, site_id=sid)
+        if existing is None:
+            db.add(FeatureRecord(customer_id=user.id, kind=KIND, title=title, payload=payload, status="stored"))
+        else:
+            existing.payload = payload
+            existing.title = title
     db.commit()
     return payload
 

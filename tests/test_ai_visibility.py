@@ -78,15 +78,24 @@ def test_bad_prompts_fail_before_a_paid_call(prompt):
 
 def test_pick_model_prefers_exact_cheap_names():
     perplexity = [{"model_name": "sonar-reasoning-pro", "reasoning": True}, {"model_name": "sonar-pro"}, {"model_name": "sonar"}]
-    assert pick_model("perplexity", perplexity)["name"] == "sonar"
+    assert pick_model("perplexity", perplexity)["name"] == "sonar-pro"
     gpt = [
         {"model_name": "o3-mini", "reasoning": True, "web_search_supported": False},
         {"model_name": "gpt-4.1-nano", "web_search_supported": False},
         {"model_name": "gpt-4o-mini", "web_search_supported": True},
+        {"model_name": "gpt-4.1-mini", "web_search_supported": True},
     ]
-    assert pick_model("chat_gpt", gpt) == {"name": "gpt-4o-mini", "reasoning": False, "webSearch": True}
+    assert pick_model("chat_gpt", gpt) == {"name": "gpt-4.1-mini", "reasoning": False, "webSearch": True}
     with pytest.raises(RequestError):
         pick_model("claude", [])
+
+
+def test_chatgpt_and_claude_force_web_search():
+    payload, applied = build("chat_gpt", prompt="best plumber", model=GPT_MINI, iso="CA")
+    assert payload["web_search"] is True and payload["force_web_search"] is True
+    assert applied["webSearch"] is True
+    payload, _ = build("claude", prompt="best plumber", model=HAIKU, iso="CA")
+    assert payload["web_search"] is True and payload["force_web_search"] is True
 
 
 class FakeUser:
@@ -168,3 +177,33 @@ def test_visibility_requires_a_market(offline):
     with pytest.raises(LocationError):
         research.visibility(None, FakeUser(), site="acme.ca", brand="Acme", country="",
                             prompts=[{"id": 1, "text": "plumber", "engine": "ChatGPT"}])
+
+
+def test_normalize_engine_aliases_claude_ai():
+    assert llm_requests.normalize_engine("Claude AI") == "Claude"
+    assert llm_requests.normalize_engine("claude") == "Claude"
+    assert llm_requests.normalize_engine("Claude") == "Claude"
+    assert llm_requests.normalize_engine("Google AI Overview") == "Google AI Overviews"
+
+
+def test_visibility_accepts_claude_and_rejects_soon_engines(offline, monkeypatch):
+    sent = []
+
+    def fake_call(method, path, payload=None, timeout=60):
+        sent.append(path)
+        return _answer("Acme Plumbing in Calgary.", "https://acme.ca/"), 0.001
+
+    monkeypatch.setattr(research, "_call", fake_call)
+    out = research.visibility(
+        None, FakeUser(), site="https://acme.ca", brand="Acme", country="Canada",
+        prompts=[
+            {"id": 1, "text": "best plumber calgary", "engine": "Claude AI"},
+            {"id": 2, "text": "best plumber calgary", "engine": "Copilot"},
+            {"id": 3, "text": "best plumber calgary", "engine": "Grok"},
+        ],
+    )
+    by_id = {r["id"]: r for r in out["results"]}
+    assert by_id[1]["engine"] == "Claude" and by_id[1]["status"] == "ok"
+    assert any("/claude/" in path for path in sent)
+    assert by_id[2]["status"] == "error" and by_id[2]["code"] == "engine_unavailable"
+    assert by_id[3]["status"] == "error" and by_id[3]["code"] == "engine_unavailable"

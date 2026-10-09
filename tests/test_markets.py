@@ -128,6 +128,58 @@ def test_markets_are_per_tenant(env):
     assert bad.status_code == 422
 
 
+def test_connected_cms_host_can_save_market_without_journey(env):
+    """WordPress/CMS websites are in the workspace even when setup was never finished."""
+    from app.database import SessionLocal
+    from app.models import CmsConnection
+
+    owner = env["owner"]
+    with SessionLocal() as db:
+        db.add(CmsConnection(
+            customer_id=owner.id,
+            provider="wordpress",
+            label="sovereignstandard.ca",
+            site_url="https://sovereignstandard.ca",
+            status="connected",
+        ))
+        db.commit()
+    c = env["client"]
+    r = c.put("/api/v1/operator/market", json={"site": "https://sovereignstandard.ca", "countryIso": "CA"})
+    assert r.status_code == 200, r.text
+    assert r.json()["market"]["countryIso"] == "CA"
+    assert r.json()["market"]["host"] == "sovereignstandard.ca"
+    got = c.get("/api/v1/operator/market", params={"site": "sovereignstandard.ca"}).json()["market"]
+    assert got["countryIso"] == "CA" and got["explicit"] is True
+    # .ca also suggests Canada before an explicit save when owned
+    with SessionLocal() as db:
+        from app import markets
+        hinted = markets.resolve_for_site(db, owner, site="https://other.ca")
+    # other.ca is not owned
+    assert hinted["needsChoice"] is True
+
+
+def test_cms_label_alone_counts_as_workspace_site(env):
+    """Production sometimes stores the host in label when site_url is blank."""
+    from app.database import SessionLocal
+    from app.models import CmsConnection
+
+    owner = env["owner"]
+    with SessionLocal() as db:
+        db.add(CmsConnection(
+            customer_id=owner.id,
+            provider="wordpress",
+            label="sovereignstandard.ca",
+            site_url="",
+            status="connected",
+            credentials={"siteUrl": "https://www.sovereignstandard.ca"},
+        ))
+        db.commit()
+    c = env["client"]
+    r = c.put("/api/v1/operator/market", json={"site": "https://sovereignstandard.ca", "countryIso": "CA"})
+    assert r.status_code == 200, r.text
+    assert r.json()["market"]["countryIso"] == "CA"
+
+
 def test_visibility_retries_without_invalid_country_field(offline_visibility, monkeypatch):
     """Regression: Invalid Field web_search_country_iso_code must not fail the whole check."""
     from app import research

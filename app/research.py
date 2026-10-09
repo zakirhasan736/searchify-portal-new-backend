@@ -194,6 +194,30 @@ def _place_for(db: Session, user: User, *, site: str, country: str = "", reach: 
     return place, ctx
 
 
+def _rank_key(row: dict) -> tuple:
+    """Best organic position first, then higher volume."""
+    pos = row.get("position")
+    vol = row.get("volume")
+    return (pos if isinstance(pos, int) else 10**6, -(vol if isinstance(vol, (int, float)) else -1))
+
+
+def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3) -> list[str]:
+    """Prefer tracked terms, then strongest ranking terms, for suggestion seeds."""
+    seeds: list[str] = []
+    for term in clean:
+        if term and term not in seeds:
+            seeds.append(term)
+        if len(seeds) >= limit:
+            return seeds
+    for row in sorted(ranked, key=_rank_key):
+        kw = (row.get("keyword") or "").strip()
+        if kw and kw.lower() not in {s.lower() for s in seeds}:
+            seeds.append(kw)
+        if len(seeds) >= limit:
+            break
+    return seeds
+
+
 def keywords(db: Session, user: User, *, site: str, terms: list[str], country: str = "", reach: str = "", force: bool = False) -> dict:
     host = host_of(site)
     if not host:
@@ -207,25 +231,45 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         clean = clean[:term_limit]
     title = f"Keywords {host} {place.iso or location} {language}"
     saved = None if force else cached(db, user.id, "dfs-keywords", title, WINDOWS["keywords"])
-    if saved and set(clean) <= set(saved.get("terms") or []):
+    if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == 2:
         return {**saved, "cached": True, "termsDropped": dropped}
     quotas.check(db, user, "keywords")
-    _budget(db, user, 3)
+    _budget(db, user, 5)
     cost = 0.0
-    ranked_res, c = _call(
-        "POST",
-        "/dataforseo_labs/google/ranked_keywords/live",
-        [{"target": host, "location_name": location, "language_code": language, "limit": 100,
-          "order_by": ["keyword_data.keyword_info.search_volume,desc"]}],
-    )
+    ranked_payload = {
+        "target": host,
+        "location_name": location,
+        "language_code": language,
+        "limit": 200,
+        "item_types": ["organic"],
+        "filters": ["ranked_serp_element.serp_item.rank_group", "<=", 100],
+        "order_by": [
+            "ranked_serp_element.serp_item.rank_group,asc",
+            "keyword_data.keyword_info.search_volume,desc",
+        ],
+    }
+    try:
+        ranked_res, c = _call("POST", "/dataforseo_labs/google/ranked_keywords/live", [ranked_payload])
+    except ResearchError:
+        # Older account schemas may reject item_types/filters — retry with the core fields.
+        ranked_payload = {
+            "target": host,
+            "location_name": location,
+            "language_code": language,
+            "limit": 200,
+            "order_by": ["keyword_data.keyword_info.search_volume,desc"],
+        }
+        ranked_res, c = _call("POST", "/dataforseo_labs/google/ranked_keywords/live", [ranked_payload])
     cost += c
     best: dict[str, dict] = {}
     for item in ((ranked_res or [{}])[0] or {}).get("items") or []:
         row = _kw_row(item)
         serp = (item.get("ranked_serp_element") or {}).get("serp_item") or {}
+        if (serp.get("type") or "organic") not in ("", "organic"):
+            continue
         changes = serp.get("rank_changes") or {}
         row.update({
-            "position": serp.get("rank_group"),
+            "position": serp.get("rank_group") or serp.get("rank_absolute"),
             "previous": changes.get("previous_rank_absolute"),
             "isNew": bool(changes.get("is_new")),
             "url": serp.get("url") or "",
@@ -238,13 +282,14 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         if held is None:
             best[key] = row
         elif (row["position"] or 10**6) < (held["position"] or 10**6):
-            row["otherUrls"] = [held["url"], *held.get("otherUrls", [])]
+            row["otherUrls"] = [u for u in [held["url"], *held.get("otherUrls", [])] if u]
             best[key] = row
         else:
-            held.setdefault("otherUrls", []).append(row["url"])
-    ranked = list(best.values())
+            if row.get("url"):
+                held.setdefault("otherUrls", []).append(row["url"])
+    ranked = sorted(best.values(), key=_rank_key)
     for row in ranked:
-        row["source"] = "DataForSEO Labs ranked keywords (estimated Google position)"
+        row["source"] = "DataForSEO Labs ranked keywords (estimated Google organic position)"
     by_term = {row["keyword"].lower(): row for row in ranked}
 
     tracked = []
@@ -252,12 +297,15 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         overview_res, c = _call(
             "POST",
             "/dataforseo_labs/google/keyword_overview/live",
-            [{"keywords": clean, "location_name": location, "language_code": language, "include_serp_info": False}],
+            [{"keywords": clean, "location_name": location, "language_code": language, "include_serp_info": True}],
         )
         cost += c
         found = {}
         for item in ((overview_res or [{}])[0] or {}).get("items") or []:
             row = _kw_row(item)
+            serp = item.get("serp_info") or {}
+            if serp.get("se_results_count") is not None:
+                row["results"] = serp.get("se_results_count")
             found[row["keyword"].lower()] = row
         for term in clean:
             base = found.get(term.lower()) or {"keyword": term, "volume": None, "difficulty": None, "intent": ""}
@@ -269,27 +317,35 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 "previous": rank.get("previous"),
                 "page": rank.get("page") or "",
                 "url": rank.get("url") or "",
-                "source": "DataForSEO keyword overview" if term.lower() in found else "Not in DataForSEO keyword data",
+                "source": "DataForSEO keyword overview + ranked keywords" if term.lower() in found or rank else "Not in DataForSEO keyword data",
             })
 
     ideas = []
-    seed = clean[0] if clean else (ranked[0]["keyword"] if ranked else "")
-    if seed:
+    seeds = _idea_seeds(clean, ranked, limit=3)
+    known = {t.lower() for t in clean} | set(by_term)
+    idea_calls = 0
+    for seed in seeds:
         ideas_res, c = _call(
             "POST",
             "/dataforseo_labs/google/keyword_suggestions/live",
-            [{"keyword": seed, "location_name": location, "language_code": language, "limit": 30,
+            [{"keyword": seed, "location_name": location, "language_code": language, "limit": 40,
               "order_by": ["keyword_info.search_volume,desc"]}],
         )
         cost += c
-        known = {t.lower() for t in clean} | set(by_term)
+        idea_calls += 1
         for item in ((ideas_res or [{}])[0] or {}).get("items") or []:
             row = _kw_row(item)
-            if row["keyword"] and row["keyword"].lower() not in known:
-                known.add(row["keyword"].lower())
-                ideas.append({**row, "source": "DataForSEO keyword suggestions"})
-    _spend(db, user, 1 + bool(clean) + bool(seed), cost)
+            key = (row.get("keyword") or "").lower()
+            if not key or key in known:
+                continue
+            # Prefer ideas with real demand; keep null-volume ideas only as filler.
+            known.add(key)
+            ideas.append({**row, "source": f"DataForSEO keyword suggestions · seed “{seed}”", "seed": seed})
+    ideas.sort(key=lambda r: (-(r["volume"] if isinstance(r.get("volume"), (int, float)) else -1), r.get("keyword") or ""))
+    paid_calls = 1 + bool(clean) + idea_calls
+    _spend(db, user, paid_calls, cost)
     quotas.consume(db, user, "keywords")
+    idea_limit = quotas.keyword_idea_limit(db, user)
     payload = {
         "host": host,
         "location": location,
@@ -305,13 +361,77 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "terms": clean,
         "ranked": ranked,
         "tracked": tracked,
-        "ideas": ideas[:quotas.keyword_idea_limit(db, user)],
+        "ideas": ideas[:idea_limit],
+        "seeds": seeds,
         "termLimit": term_limit,
+        "qualityVersion": 2,
         "source": "DataForSEO Labs",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
     _save(db, user.id, "dfs-keywords", title, payload)
     return {**payload, "cached": False, "termsDropped": dropped}
+
+
+def _link_domain(item: dict) -> str:
+    return (item.get("domain_from") or "").lower().removeprefix("www.")
+
+
+def _link_quality(item: dict) -> tuple:
+    """Prefer live, dofollow, stronger referring domains, lower spam."""
+    lost = 1 if item.get("is_lost") else 0
+    follow = 0 if item.get("dofollow") else 1
+    domain_rank = item.get("domain_from_rank")
+    link_rank = item.get("rank")
+    spam = item.get("backlink_spam_score")
+    return (
+        lost,
+        follow,
+        -(domain_rank if isinstance(domain_rank, (int, float)) else -1),
+        -(link_rank if isinstance(link_rank, (int, float)) else -1),
+        spam if isinstance(spam, (int, float)) else 999,
+    )
+
+
+def _map_backlink(item: dict) -> dict:
+    state = "Lost" if item.get("is_lost") else "New" if item.get("is_new") else "Active"
+    domain = item.get("domain_from") or ""
+    return {
+        "domain": domain.removeprefix("www.") if domain.lower().startswith("www.") else domain,
+        "source": item.get("url_from") or "",
+        "target": item.get("url_to") or "",
+        "anchor": item.get("anchor") or "",
+        "follow": "Follow" if item.get("dofollow") else "Nofollow",
+        "state": state,
+        "rank": item.get("domain_from_rank") if item.get("domain_from_rank") is not None else item.get("rank"),
+        "linkRank": item.get("rank"),
+        "domainRank": item.get("domain_from_rank"),
+        "pageRank": item.get("page_from_rank"),
+        "spamScore": item.get("backlink_spam_score"),
+        "pageTitle": item.get("page_from_title") or "",
+        "firstSeen": str(item.get("first_seen") or "")[:10] or None,
+        "lastSeen": str(item.get("last_seen") or "")[:10] or None,
+        "lostDate": str(item.get("lost_date") or item.get("date_lost") or "")[:10] or None,
+        "seen": f"First seen {str(item.get('first_seen') or '')[:10]} · last seen {str(item.get('last_seen') or '')[:10]}",
+    }
+
+
+def _collect_backlinks(items: list, *, prefer: dict[str, dict] | None = None) -> dict[str, dict]:
+    """One best link per referring domain (www stripped)."""
+    best = dict(prefer or {})
+    for item in items or []:
+        key = _link_domain(item)
+        if not key or item.get("is_broken"):
+            continue
+        spam = item.get("backlink_spam_score")
+        if isinstance(spam, (int, float)) and spam >= 60 and not item.get("is_lost"):
+            # Keep high-spam live links out of the “best” list; lost still show for review.
+            continue
+        held = best.get(key)
+        if held is None or _link_quality(item) < _link_quality(held["_raw"]):
+            mapped = _map_backlink(item)
+            mapped["_raw"] = item
+            best[key] = mapped
+    return best
 
 
 def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored_only: bool = False) -> dict:
@@ -323,43 +443,62 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
         row = _record(db, user.id, "dfs-backlinks", title)
         return {**dict(row.payload or {}), "cached": True} if row and row.payload else {"host": host, "state": "none", "cached": True}
     saved = None if force else cached(db, user.id, "dfs-backlinks", title, WINDOWS["backlinks"])
-    if saved:
+    if saved and saved.get("qualityVersion") == 2:
         return {**saved, "cached": True}
     quotas.check(db, user, "backlinks")
-    _budget(db, user, 2)
+    _budget(db, user, 3)
     cost = 0.0
-    summary_res, c = _call("POST", "/backlinks/summary/live", [{"target": host, "include_subdomains": True}])
-    cost += c
-    s = (summary_res or [{}])[0] or {}
-    links_res, c = _call(
+    summary_res, c = _call(
         "POST",
-        "/backlinks/backlinks/live",
-        [{"target": host, "mode": "one_per_domain", "backlinks_status_type": "all", "limit": 100,
-          "include_subdomains": True, "order_by": ["rank,desc"]}],
+        "/backlinks/summary/live",
+        [{"target": host, "include_subdomains": True, "backlinks_status_type": "live", "exclude_internal_backlinks": True}],
     )
     cost += c
-    page = (links_res or [{}])[0] or {}
-    links, seen = [], set()
-    for item in page.get("items") or []:
-        key = (item.get("domain_from") or "").lower().removeprefix("www.")
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        state = "Lost" if item.get("is_lost") else "New" if item.get("is_new") else "Active"
-        links.append({
-            "domain": item.get("domain_from") or "",
-            "source": item.get("url_from") or "",
-            "target": item.get("url_to") or "",
-            "anchor": item.get("anchor") or "",
-            "follow": "Follow" if item.get("dofollow") else "Nofollow",
-            "state": state,
-            "rank": item.get("rank"),
-            "firstSeen": str(item.get("first_seen") or "")[:10] or None,
-            "lastSeen": str(item.get("last_seen") or "")[:10] or None,
-            "lostDate": str(item.get("date_lost") or "")[:10] or None,
-            "seen": f"First seen {str(item.get('first_seen') or '')[:10]} · last seen {str(item.get('last_seen') or '')[:10]}",
-        })
-    _spend(db, user, 2, cost)
+    s = (summary_res or [{}])[0] or {}
+    live_base = {
+        "target": host,
+        "mode": "one_per_domain",
+        "backlinks_status_type": "live",
+        "limit": 200,
+        "include_subdomains": True,
+        "exclude_internal_backlinks": True,
+        "order_by": ["domain_from_rank,desc", "rank,desc"],
+    }
+    try:
+        live_res, c = _call(
+            "POST",
+            "/backlinks/backlinks/live",
+            [{**live_base, "filters": [["is_broken", "=", False], "and", ["backlink_spam_score", "<", 60]]}],
+        )
+    except ResearchError:
+        live_res, c = _call("POST", "/backlinks/backlinks/live", [live_base])
+    cost += c
+    try:
+        lost_res, c = _call(
+            "POST",
+            "/backlinks/backlinks/live",
+            [{
+                "target": host,
+                "mode": "one_per_domain",
+                "backlinks_status_type": "lost",
+                "limit": 50,
+                "include_subdomains": True,
+                "exclude_internal_backlinks": True,
+                "order_by": ["domain_from_rank,desc", "rank,desc"],
+            }],
+        )
+    except ResearchError:
+        lost_res, c = [], 0.0
+    cost += c
+    live_page = (live_res or [{}])[0] or {}
+    lost_page = (lost_res or [{}])[0] or {}
+    merged = _collect_backlinks(live_page.get("items") or [])
+    merged = _collect_backlinks(lost_page.get("items") or [], prefer=merged)
+    links = []
+    for row in sorted(merged.values(), key=lambda r: _link_quality(r["_raw"])):
+        row.pop("_raw", None)
+        links.append(row)
+    _spend(db, user, 3, cost)
     quotas.consume(db, user, "backlinks")
     payload = {
         "host": host,
@@ -370,13 +509,18 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
             "nofollowDomains": s.get("referring_domains_nofollow"),
             "brokenBacklinks": s.get("broken_backlinks"),
             "rank": s.get("rank"),
-            "rankScale": "DataForSEO rank, 0 to 1000",
-            "counts": "Live links only, from DataForSEO backlinks summary",
+            "rankScale": "DataForSEO domain rank, 0 to 1000",
+            "counts": "Live referring domains from DataForSEO backlinks summary",
         },
         "links": links,
-        "linksNote": "One sample link per referring domain, highest DataForSEO rank first. Includes lost links.",
+        "linksNote": (
+            "Best live link per referring domain first (strongest domain rank, dofollow preferred, spam score under 60). "
+            "Lost links are listed separately for review."
+        ),
         "linksShown": len(links),
-        "referringDomainsListed": page.get("total_count"),
+        "referringDomainsListed": live_page.get("total_count"),
+        "lostDomainsListed": lost_page.get("total_count"),
+        "qualityVersion": 2,
         "market": {"scope": "domain", "countryFilter": False, "note": "Backlink counts are domain-wide, not filtered by the SEO target country."},
         "source": "DataForSEO Backlinks",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
@@ -385,7 +529,7 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     return {**payload, "cached": False}
 
 
-MODEL_CACHE_VERSION = 3
+MODEL_CACHE_VERSION = 4
 
 
 def _model_for(db: Session, user: User, engine: str) -> dict:
@@ -422,8 +566,18 @@ def _parse_answer(first: dict) -> tuple[str, list[dict]]:
 
 
 def _mentions(body: str, names: set[str]) -> bool:
+    """Brand/host mention check — tolerate spaces, hyphens, and punctuation variants."""
     low = (body or "").lower()
-    return any(re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", low) for name in names)
+    for name in names:
+        if not name:
+            continue
+        compact = re.sub(r"[^a-z0-9]+", "", name)
+        if len(compact) >= 3 and compact in re.sub(r"[^a-z0-9]+", "", low):
+            return True
+        pattern = re.escape(name).replace(r"\ ", r"[\s\-_.]+")
+        if re.search(rf"(?<![a-z0-9]){pattern}(?![a-z0-9])", low):
+            return True
+    return False
 
 
 def visibility(
@@ -450,8 +604,31 @@ def visibility(
     results, todo = [], []
     for prompt in prompts[:30]:
         text = " ".join(str(prompt.get("text") or "").split())
-        engine_label = prompt.get("engine") if prompt.get("engine") in ENGINES else "ChatGPT"
+        engine_label = llm_requests.normalize_engine(prompt.get("engine"))
         if not text:
+            continue
+        if engine_label in llm_requests.SOON_ENGINES:
+            results.append({
+                "id": prompt.get("id"),
+                "text": text,
+                "engine": engine_label,
+                "status": "error",
+                "code": "engine_unavailable",
+                "error": (
+                    f"Live checks for {engine_label} are not available yet. "
+                    "Choose ChatGPT, Gemini, Perplexity, or Claude (Claude supports country proximity)."
+                ),
+            })
+            continue
+        if engine_label not in ENGINES:
+            results.append({
+                "id": prompt.get("id"),
+                "text": text,
+                "engine": engine_label,
+                "status": "error",
+                "code": "unknown_engine",
+                "error": f"Unknown answer engine: {prompt.get('engine') or engine_label}.",
+            })
             continue
         if len(text) > llm_requests.PROMPT_LIMIT:
             results.append({"id": prompt.get("id"), "text": text, "engine": engine_label, "status": "error",
@@ -581,6 +758,51 @@ def _audit_limit(user: User) -> int:
     return AUDIT_PAGES.get(plan, AUDIT_PAGES["starter"])
 
 
+def _page_snippet(item: dict) -> dict:
+    meta = item.get("meta") or {}
+    return {
+        "url": item.get("url") or "",
+        "status": item.get("status_code"),
+        "title": str(meta.get("title") or "")[:200],
+        "description": str(meta.get("description") or "")[:300],
+    }
+
+
+def _check_true(checks: dict, key: str) -> bool:
+    value = checks.get(key)
+    return value is True or value == 1 or str(value).lower() == "true"
+
+
+def _pages_with_check(items: list[dict], key: str) -> list[dict]:
+    hit = [i for i in items if _check_true(i.get("checks") or {}, key)]
+    if hit or key not in {"no_title", "no_description"}:
+        return hit
+    # Some crawls omit checks.no_title unless canonical validation ran — fall back to empty meta.
+    if key == "no_title":
+        return [i for i in items if not str((i.get("meta") or {}).get("title") or "").strip()]
+    if key == "no_description":
+        return [i for i in items if not str((i.get("meta") or {}).get("description") or "").strip()]
+    return hit
+
+
+def _fetch_checked_pages(task_id: str, key: str, limit: int = 25) -> list[dict]:
+    """Ask DataForSEO for pages that failed one check — more reliable than scanning a partial page dump."""
+    try:
+        result, _ = _call(
+            "POST",
+            "/on_page/pages",
+            [{
+                "id": task_id,
+                "limit": limit,
+                "filters": [["resource_type", "=", "html"], "and", [f"checks.{key}", "=", True]],
+            }],
+            timeout=60,
+        )
+    except ResearchError:
+        return []
+    return list(((result or [{}])[0] or {}).get("items") or [])
+
+
 def _audit_report(task_id: str, summary: dict) -> dict:
     pages_res, _ = _call("POST", "/on_page/pages", [{"id": task_id, "limit": 1000}], timeout=90)
     items = [i for i in (((pages_res or [{}])[0] or {}).get("items") or []) if i.get("resource_type") == "html"]
@@ -590,10 +812,16 @@ def _audit_report(task_id: str, summary: dict) -> dict:
         for link in (((broken_res or [{}])[0] or {}).get("items") or [])
     ]
 
+    metrics = summary.get("page_metrics") or {}
+    metric_checks = metrics.get("checks") if isinstance(metrics.get("checks"), dict) else {}
     issues = []
     for key, (name, severity, fix, meta) in PAGE_CHECKS.items():
-        hit = [i for i in items if (i.get("checks") or {}).get(key)]
-        if not hit:
+        hit = _pages_with_check(items, key)
+        counted = metric_checks.get(key)
+        count_hint = int(counted) if isinstance(counted, (int, float)) and counted else 0
+        if not hit and count_hint:
+            hit = _fetch_checked_pages(task_id, key)
+        if not hit and not count_hint:
             continue
         issues.append({
             "key": key,
@@ -601,16 +829,10 @@ def _audit_report(task_id: str, summary: dict) -> dict:
             "severity": severity,
             "fix": fix,
             "meta": meta,
-            "count": len(hit),
-            "pages": [
-                {
-                    "url": i.get("url") or "",
-                    "status": i.get("status_code"),
-                    "title": ((i.get("meta") or {}).get("title") or "")[:200],
-                    "description": ((i.get("meta") or {}).get("description") or "")[:300],
-                }
-                for i in hit[:25]
-            ],
+            "count": max(len(hit), count_hint) or len(hit),
+            "pages": [_page_snippet(i) for i in hit[:25]] or (
+                [{"url": "", "status": None, "title": "", "description": ""}] if count_hint else []
+            ),
         })
     if broken:
         issues.append({
@@ -637,10 +859,14 @@ def _audit_report(task_id: str, summary: dict) -> dict:
                            "pages": [{"url": f"https://{domain.get('name') or ''}/", "status": None, "title": "", "description": ""}]})
 
     issues.sort(key=lambda row: (SEVERITY_ORDER.get(row["severity"], 3), -row["count"]))
-    metrics = summary.get("page_metrics") or {}
     status = summary.get("crawl_status") or {}
+    raw_score = metrics.get("onpage_score")
+    score = round(float(raw_score), 1) if raw_score is not None else None
+    critical_count = sum(1 for row in issues if row["severity"] == "Critical")
     return {
-        "score": round(float(metrics.get("onpage_score") or 0), 1) if metrics.get("onpage_score") is not None else None,
+        "score": score,
+        "seoScore": score,
+        "criticalCount": critical_count,
         "pagesCrawled": status.get("pages_crawled") or len(items),
         "maxPages": status.get("max_crawl_pages"),
         "cms": domain.get("cms") or "",
@@ -688,6 +914,15 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
         return {**payload, "cached": False}
 
     if saved.get("state") == "ready" and not force and age(saved.get("fetchedAt")) < WINDOWS["audit"]:
+        report = saved.get("report") or {}
+        # Rebuild once for older crawls that stored a score but dropped critical findings.
+        if saved.get("taskId") and report.get("criticalCount") is None:
+            summary = _summary(saved["taskId"])
+            if summary and summary.get("crawl_progress") == "finished":
+                rebuilt = _audit_report(saved["taskId"], summary)
+                payload = {**saved, "state": "ready", "report": rebuilt, "fetchedAt": now.isoformat(timespec="seconds")}
+                _save(db, user.id, "dfs-audit", title, payload)
+                return {**payload, "cached": False}
         return {**saved, "cached": True}
 
     quotas.check(db, user, "audits")

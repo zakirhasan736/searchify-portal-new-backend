@@ -17,6 +17,21 @@ from __future__ import annotations
 import re
 
 ENGINES = {"ChatGPT": "chat_gpt", "Gemini": "gemini", "Perplexity": "perplexity", "Claude": "claude"}
+# Shown in the product AI list; DataForSEO has no llm_responses endpoint for these yet.
+SOON_ENGINES = ("Copilot", "Google AI Overviews", "Grok")
+ENGINE_ALIASES = {
+    "Claude AI": "Claude",
+    "Anthropic": "Claude",
+    "Chat GPT": "ChatGPT",
+    "GPT": "ChatGPT",
+    "Google Gemini": "Gemini",
+    "Bing Copilot": "Copilot",
+    "Microsoft Copilot": "Copilot",
+    "Google AI Overview": "Google AI Overviews",
+    "AI Overviews": "Google AI Overviews",
+    "AI Overview": "Google AI Overviews",
+    "xAI Grok": "Grok",
+}
 
 COMMON = {"user_prompt", "model_name", "max_output_tokens", "temperature", "top_p", "system_message", "tag"}
 FIELDS = {
@@ -25,16 +40,31 @@ FIELDS = {
     "perplexity": COMMON | {"web_search_country_iso_code"},
     "claude": COMMON | {"web_search", "force_web_search", "web_search_country_iso_code", "web_search_city"},
 }
+
+
+def normalize_engine(label: str) -> str:
+    """Map UI labels / aliases to a canonical engine name."""
+    raw = " ".join(str(label or "").split())
+    if not raw:
+        return "ChatGPT"
+    if raw in ENGINES or raw in SOON_ENGINES:
+        return raw
+    alias = ENGINE_ALIASES.get(raw) or ENGINE_ALIASES.get(raw.title())
+    if alias:
+        return alias
+    lower = {name.lower(): name for name in (*ENGINES, *SOON_ENGINES)}
+    return lower.get(raw.lower(), raw)
 CHATGPT_NO_LOCATION = {"o3-mini", "o1", "o1-pro"}
 CLAUDE_COUNTRIES = {
     "AR", "AT", "AU", "BE", "BR", "CA", "CH", "CL", "CN", "DE", "DK", "ES", "FI", "FR", "GB", "HK", "ID", "IN",
     "IT", "JP", "KR", "MX", "MY", "NL", "NO", "NZ", "PH", "PL", "PT", "RU", "SA", "SE", "TR", "TW", "US", "ZA",
 }
+# Prefer web-search models that stay current; still avoid the most expensive reasoning tiers.
 PREFERRED = {
-    "chat_gpt": ("gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"),
+    "chat_gpt": ("gpt-4.1-mini", "gpt-4o-mini", "gpt-4o", "gpt-4.1"),
     "gemini": ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-flash-lite"),
-    "perplexity": ("sonar",),
-    "claude": ("claude-haiku-4-5", "claude-3-5-haiku"),
+    "perplexity": ("sonar-pro", "sonar", "sonar-reasoning"),
+    "claude": ("claude-sonnet-4-5", "claude-haiku-4-5", "claude-3-5-haiku", "claude-3-5-sonnet"),
 }
 PROMPT_LIMIT = 500
 TOKENS = {"plain": 800, "reasoning": 1024}
@@ -58,12 +88,24 @@ def pick_model(engine: str, models: list[dict]) -> dict:
         return {"name": m["model_name"], "reasoning": bool(m.get("reasoning")), "webSearch": bool(web)}
 
     for name in PREFERRED.get(engine, ()):
-        if name in by_name and (engine == "perplexity" or by_name[name].get("web_search_supported")):
-            return meta(by_name[name])
+        row = by_name.get(name)
+        if not row:
+            continue
+        if engine == "perplexity" or row.get("web_search_supported"):
+            return meta(row)
     searchable = [m for m in rows if m.get("web_search_supported") or engine == "perplexity"] or rows
+    # Prefer non-reasoning web models, then mid-tier names, avoid nano/lite last.
     plain = [m for m in searchable if not m.get("reasoning")] or searchable
-    cheap = [m for m in plain if re.search(r"mini|flash|haiku|^sonar$", m["model_name"], re.I)] or plain
-    return meta(sorted(cheap, key=lambda m: len(m["model_name"]))[0])
+    ranked = sorted(
+        plain,
+        key=lambda m: (
+            0 if re.search(r"mini|flash|haiku|sonar-pro|^sonar$", m["model_name"], re.I) else 1,
+            0 if "pro" in m["model_name"].lower() else 1,
+            2 if re.search(r"nano|lite", m["model_name"], re.I) else 0,
+            len(m["model_name"]),
+        ),
+    )
+    return meta(ranked[0])
 
 
 def build(engine: str, *, prompt: str, model: dict, iso: str = "", city: str = "") -> tuple[dict, dict]:
@@ -93,6 +135,7 @@ def build(engine: str, *, prompt: str, model: dict, iso: str = "", city: str = "
     if engine == "chat_gpt":
         if web:
             payload["web_search"] = True
+            payload["force_web_search"] = True
             applied["webSearch"] = True
             if iso and name not in CHATGPT_NO_LOCATION:
                 payload["web_search_country_iso_code"] = iso
@@ -116,6 +159,7 @@ def build(engine: str, *, prompt: str, model: dict, iso: str = "", city: str = "
     elif engine == "claude":
         if web:
             payload["web_search"] = True
+            payload["force_web_search"] = True
             applied["webSearch"] = True
             if iso in CLAUDE_COUNTRIES:
                 payload["web_search_country_iso_code"] = iso

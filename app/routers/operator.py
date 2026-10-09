@@ -848,7 +848,7 @@ def _assistant_fallback(question: str, profile: dict, queue: list[dict], status:
     if "visibility" in lower:
         return (
             "AI visibility is a short list of questions a customer might ask about the business. "
-            "Run live checks to ask ChatGPT, Gemini, and Perplexity and see whether the business is named or the site is cited, "
+            "Run live checks to ask ChatGPT, Gemini, Perplexity, or Claude and see whether the business is named or the site is cited, "
             "with the full answer and its sources."
         )
     if any(word in lower for word in ("plan", "subscription", "billing", "usage", "package")):
@@ -936,7 +936,7 @@ def ask_assistant(body: AssistantBody, db: Session = Depends(get_db), user: User
         "Review every change means they press Generate, then approve or dismiss each card. Prepare drafts automatically fills empty cards when they open the overview. Neither choice publishes. "
         "Help them use the system: connect WordPress, choose Search Console and Analytics, sync, press Generate, then dismiss or approve each card. "
         "Notice what they are trying to finish, name why that step helps in one plain sentence, then say how to do it. "
-        "You cannot sign in to Google or WordPress for them, and you cannot publish. Offer the page: Connections for Google and WordPress, Manage workspace to add a website or another Google login, Keywords for live Google positions, volume, and ideas, Backlinks for the live link index, AI visibility for live checks of whether ChatGPT, Gemini, and Perplexity name or cite the business, Subscription for the plan and usage, and the contact page if they want a person on the team. "
+        "You cannot sign in to Google or WordPress for them, and you cannot publish. Offer the page: Connections for Google and WordPress, Manage workspace to add a website or another Google login, Keywords for live Google positions, volume, and ideas, Backlinks for the live link index, AI visibility for live checks of whether ChatGPT, Gemini, Perplexity, or Claude name or cite the business, Subscription for the plan and usage, and the contact page if they want a person on the team. "
         "A lost backlink is a review cue, not a disavow. Do not invent ranks, volumes, scores, or link counts. "
         "Each website can use its own Google account. Overview and Settings follow the selected website. Keywords, Backlinks, AI visibility, and the completion log can stay on one website for that page only. "
         "A title suggestion reads the live page, competitor listings, Search Console, and Analytics. The output is one title and one description. It does not publish. "
@@ -1704,13 +1704,16 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
 
     proposed = dict(row.proposed or {})
     is_meta = (row.change_type or proposed.get("changeType") or "meta") == "meta"
+    target_url = _page_url(row.target_url, _homepage_url(conn.site_url, (conn.credentials or {}).get("siteUrl") or ""))
+    if not target_url:
+        target_url = _homepage_url(conn.site_url) or (row.target_url or "").strip()
     change_payload = {
         "title": approved["title"],
         "metaDescription": approved["metaDescription"],
-        "remoteId": proposed.get("remoteId") or (conn.credentials or {}).get("defaultPostId"),
+        "remoteId": proposed.get("remoteId") or (conn.credentials or {}).get("defaultPostId") or (conn.credentials or {}).get("defaultPageId"),
         "resource": proposed.get("resource") or "page",
         "changeType": row.change_type or "meta",
-        "targetUrl": row.target_url,
+        "targetUrl": target_url,
         "collectionId": (conn.credentials or {}).get("collectionId"),
     }
 
@@ -1721,8 +1724,8 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
         db.commit()
         return {"ok": True, "dryRun": True, "change": _change_row(row), "execution": row.execution}
 
-    if is_meta and row.target_url:
-        live = _live_listing(row.target_url)
+    if is_meta and target_url:
+        live = _live_listing(target_url)
         if live is None:
             raise HTTPException(
                 status_code=409,
@@ -1759,7 +1762,7 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
             proposed["resource"] = result.get("resource") or proposed.get("resource")
         proposed["publishedTitle"] = approved["title"]
         proposed["publishedDescription"] = approved["metaDescription"]
-        after = _live_listing(row.target_url) if is_meta and row.target_url else None
+        after = _live_listing(target_url) if is_meta and target_url else None
         title_live = bool(after) and approval._norm(approved["title"]) in approval._norm(after.get("title"))
         result["liveCheck"] = {
             "read": after is not None,

@@ -81,28 +81,96 @@ def probe_wordpress(creds: dict, site_url: str) -> dict[str, Any]:
     return {"ok": False, "detail": f"WordPress did not confirm the connection (HTTP {response.status_code})."}
 
 
+def _norm_wp_url(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    parsed = urlparse(raw if "://" in raw else f"https://{raw.lstrip('/')}")
+    host = (parsed.netloc or "").lower().removeprefix("www.")
+    path = (parsed.path or "/").rstrip("/") or "/"
+    return f"{host}{path}".lower()
+
+
+def _wp_match_link(items: list, want: str) -> tuple[str | None, str | None]:
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        if _norm_wp_url(item.get("link") or "") == want and item.get("id") is not None:
+            return str(item["id"]), None
+    return None, None
+
+
 def _wp_resolve_id(client: httpx.Client, base: str, auth: tuple[str, str], change: dict) -> tuple[str | None, str]:
-    """Return (id, resource) resolving by remoteId or target URL slug."""
+    """Return (id, resource) resolving by remoteId, front page, slug, or exact link match."""
     post_id = change.get("remoteId") or ""
-    resource = change.get("resource") or "post"
+    resource = change.get("resource") or "page"
     if post_id:
         return str(post_id), resource
 
     target = (change.get("targetUrl") or "").strip()
     if not target:
         return None, resource
-
+    if not target.startswith("http"):
+        target = urljoin(base, target.lstrip("/") if target != "/" else "")
+    want = _norm_wp_url(target)
     path = urlparse(target).path.strip("/")
     slug = path.split("/")[-1] if path else ""
+
+    # Homepage / site root — use Reading settings, then match page/post links to the root URL.
     if not slug:
+        try:
+            settings = client.get(urljoin(base, "wp-json/wp/v2/settings"), auth=auth)
+            if settings.status_code < 400:
+                data = settings.json() if isinstance(settings.json(), dict) else {}
+                front = data.get("page_on_front") or data.get("page_for_posts")
+                show = str(data.get("show_on_front") or "")
+                if show == "page" and front:
+                    return str(front), "page"
+        except Exception:
+            pass
+        for res, kind in (("pages", "page"), ("posts", "post")):
+            r = client.get(
+                urljoin(base, f"wp-json/wp/v2/{res}"),
+                auth=auth,
+                params={"per_page": 100, "orderby": "menu_order", "order": "asc", "status": "publish"},
+            )
+            if r.status_code >= 400:
+                continue
+            data = r.json() if isinstance(r.json(), list) else []
+            matched, _ = _wp_match_link(data, want)
+            if matched:
+                return matched, kind
+            # Some homes use slug "home" / "homepage".
+            for candidate in ("home", "homepage", "front-page", "index"):
+                r2 = client.get(
+                    urljoin(base, f"wp-json/wp/v2/{res}"),
+                    auth=auth,
+                    params={"slug": candidate, "per_page": 1},
+                )
+                if r2.status_code < 400:
+                    rows = r2.json() if isinstance(r2.json(), list) else []
+                    if rows and rows[0].get("id") is not None:
+                        return str(rows[0]["id"]), kind
         return None, resource
 
-    for res in ("pages", "posts"):
-        r = client.get(urljoin(base, f"wp-json/wp/v2/{res}"), auth=auth, params={"slug": slug, "per_page": 1})
+    for res, kind in (("pages", "page"), ("posts", "post")):
+        r = client.get(urljoin(base, f"wp-json/wp/v2/{res}"), auth=auth, params={"slug": slug, "per_page": 5})
         if r.status_code < 400:
-            data = r.json()
-            if isinstance(data, list) and data:
-                return str(data[0].get("id")), ("page" if res == "pages" else "post")
+            data = r.json() if isinstance(r.json(), list) else []
+            if data:
+                matched, _ = _wp_match_link(data, want)
+                if matched:
+                    return matched, kind
+                return str(data[0].get("id")), kind
+        # Fallback: search and match absolute link (handles nested paths / custom permalinks).
+        r = client.get(urljoin(base, f"wp-json/wp/v2/{res}"), auth=auth, params={"search": slug, "per_page": 20})
+        if r.status_code < 400:
+            data = r.json() if isinstance(r.json(), list) else []
+            matched, _ = _wp_match_link(data, want)
+            if matched:
+                return matched, kind
     return None, resource
 
 
