@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 
-from app import cms_connectors
+from app import approval, cms_connectors, markets, quotas, site_profiles
 from app.database import get_db
 from app.models import CmsConnection, Draft, FeatureRecord, GoogleConnection, Job, SiteChange, User
 from app.routers.google_connect import _connection_payload
@@ -17,6 +19,7 @@ from app.openai_client import chat_text, generate_draft_body, openai_configured
 from app.security import get_current_user
 
 router = APIRouter(prefix="/api/v1/operator", tags=["operator"])
+log = logging.getLogger("searchify.operator")
 
 LIVE = "google-live-v1"
 PLAN_LIMITS = {"starter": 5, "agency": 10, "scale": 15}
@@ -116,7 +119,7 @@ class FromDraftBody(BaseModel):
     target_url: str = ""
     change_type: str = "content"
     cms_connection_id: int | None = None
-    auto_approve: bool = True
+    auto_approve: bool = False
     execute: bool = False
     force_dry_run: bool = True
 
@@ -277,7 +280,7 @@ def _sync_operator_features(db: Session, user: User):
             "rows": change_rows,
             "kpis": [
                 ["Changes", str(len(changes))],
-                ["Applied", str(sum(1 for c in changes if c.status in {"applied", "monitoring", "closed"}))],
+                ["Applied", str(sum(1 for c in changes if c.status in {"applied", "monitoring", "closed", "published_unverified"}))],
                 ["Awaiting approval", str(sum(1 for c in changes if c.status in {"proposed", "awaiting_approval"}))],
             ],
             "source": "searchify_operator",
@@ -285,7 +288,7 @@ def _sync_operator_features(db: Session, user: User):
         },
     )
 
-    mon = [c for c in changes if c.status in {"applied", "monitoring", "closed"}]
+    mon = [c for c in changes if c.status in {"applied", "monitoring", "closed", "published_unverified"}]
     mon_rows = [
         [
             str(c.id),
@@ -1012,6 +1015,8 @@ def _brief_profile(profile: dict, brief: dict | None) -> dict:
         data["services"] = b["businessType"]
     if not (data.get("areas") or data.get("locations")) and b.get("market"):
         data["areas"] = data["locations"] = b["market"]
+    if b.get("market"):
+        data["market"] = b["market"]
     if b.get("goal"):
         data["goal"] = b["goal"]
     if b.get("avoid"):
@@ -1020,6 +1025,24 @@ def _brief_profile(profile: dict, brief: dict | None) -> dict:
     if b.get("sensitive"):
         data["restrictions"] = f"{data.get('restrictions') or ''} Sensitive category: {b['sensitive']}, keep claims careful.".strip()
     return data
+
+
+def _market_location(profile: dict) -> tuple[str, str]:
+    """(DataForSEO location name, language) from the saved market, or ("", "") when it is not clear."""
+    from app.locations import LocationError, resolve
+
+    iso = str(profile.get("targetCountry") or profile.get("countryIso") or "").strip().upper()
+    if iso:
+        try:
+            place = resolve(iso)
+            return place.country, place.language
+        except LocationError:
+            pass
+    try:
+        place = resolve(str(profile.get("market") or profile.get("locations") or profile.get("areas") or ""))
+    except LocationError:
+        return "", ""
+    return place.country, place.language
 
 
 def _scan_title(host: str) -> str:
@@ -1040,7 +1063,7 @@ def _latest_scan(db: Session, user_id: int, host: str) -> dict:
 
 def _scan_fresh(scan: dict) -> bool:
     stamp = scan.get("scannedAt")
-    if not stamp or not scan.get("pages"):
+    if not stamp or not scan.get("pages") or scan.get("stale"):
         return False
     try:
         age = datetime.utcnow() - datetime.fromisoformat(stamp)
@@ -1067,7 +1090,16 @@ def _ensure_scan(db: Session, user: User, home: str, brief: dict | None, force: 
     if scan and _scan_fresh(scan) and not force:
         return scan, False
     profile = _brief_profile(_profile_for(db, user.id), brief)
-    scan = site_scan.scan_site(home, brief=brief or {}, profile=profile, places_rows=_places_rows(db, user.id))
+    counter = {"serp": 0}
+    scan = site_scan.scan_site(
+        home,
+        brief=brief or {},
+        profile=profile,
+        places_rows=_places_rows(db, user.id),
+        serp_limit=quotas.left(db, user, "competitors"),
+        counter=counter,
+    )
+    quotas.consume(db, user, "competitors", counter["serp"])
     if scan.get("pages"):
         _upsert_feature(db, user.id, "site-scan", _scan_title(host), scan)
     return scan, True
@@ -1080,7 +1112,9 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
     sources = sorted({r.get("source") or "competitor" for rows in rivals.values() for r in rows})
     page_map = scan.get("pageMap") or {}
     draftable = [p for p in pages if (page_map.get(p["url"]) or {}).get("role") != "legal" and not p.get("noindex")]
-    covered = len([p for p in draftable if p["url"].rstrip("/") in (open_urls or set())])
+    from app.site_scan import page_key
+
+    covered = len([p for p in draftable if page_key(p["url"]) in (open_urls or set())])
     return {
         "host": scan.get("host") or "",
         "scannedAt": scan.get("scannedAt") or "",
@@ -1096,18 +1130,29 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
         "competitorPages": sum(len(rows) for rows in rivals.values()),
         "competitorSources": sources,
         "error": scan.get("error") or "",
+        "failedPages": (scan.get("failed") or [])[:20],
+        "skipped": (scan.get("skipped") or [])[:40],
+        "conflicts": site_profiles.conflicts(scan.get("brief") or {}, scan),
+        "stale": bool(scan.get("stale")),
     }
 
 
+OPEN_OR_DONE = [
+    "proposed", "awaiting_approval", "approved", "dismissed", "failed", "executing",
+    "needs_review", "applied", "monitoring", "published_unverified", "closed",
+]
+
+
 def _open_urls(db: Session, user_id: int) -> set[str]:
+    """Page keys that already have a draft, a decision, or a published change."""
+    from app.site_scan import page_key
+
     return {
-        (c.target_url or "").rstrip("/")
+        page_key(c.target_url or "")
         for c in db.query(SiteChange)
-        .filter(
-            SiteChange.customer_id == user_id,
-            SiteChange.status.in_(["proposed", "awaiting_approval", "approved", "dismissed"]),
-        )
+        .filter(SiteChange.customer_id == user_id, SiteChange.status.in_(OPEN_OR_DONE))
         .all()
+        if c.target_url
     }
 
 
@@ -1115,6 +1160,80 @@ class SiteScanBody(BaseModel):
     site: str = ""
     brief: dict = Field(default_factory=dict)
     force: bool = False
+
+
+def _stored_brief(db: Session, user: User, home: str, fallback: dict | None) -> dict:
+    """The saved onboarding brief for this site. The request's copy is only used if nothing is saved."""
+    stored = site_profiles.profile_for_host(db, user.id, site_profiles.host_of(home))
+    if stored and stored.get("brief"):
+        extra = {k: v for k, v in (fallback or {}).items() if k == "competitors" and v and not stored["brief"].get(k)}
+        return {**stored["brief"], **extra}
+    return dict(fallback or {})
+
+
+class JourneyBody(BaseModel):
+    state: dict = Field(default_factory=dict)
+
+
+@router.get("/journey")
+def get_journey(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return {"ok": True, "journey": site_profiles.get_journey(db, user.id)}
+
+
+@router.put("/journey")
+def put_journey(body: JourneyBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        saved = site_profiles.save_journey(db, user.id, body.state)
+    except site_profiles.ProfileError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    log.info("journey_saved", extra={"user_id": user.id, "sites": len(saved["journey"]["state"]["sites"])})
+    return {"ok": True, **saved}
+
+
+@router.get("/site-profile")
+def get_site_profile(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return {"ok": True, "profile": site_profiles.profile_for_host(db, user.id, site)}
+
+
+class MarketBody(BaseModel):
+    site: str = ""
+    siteId: str | int | None = None
+    countryIso: str = ""
+    language: str = ""
+    city: str = ""
+    region: str = ""
+    serviceArea: str = ""
+
+
+@router.get("/markets/countries")
+def list_target_countries(user: User = Depends(get_current_user)):
+    _ = user
+    return {"ok": True, "countries": markets.countries()}
+
+
+@router.get("/market")
+def get_market(site: str = "", siteId: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    ctx = markets.resolve_for_site(db, user, site=site, site_id=siteId or None)
+    return {"ok": True, "market": ctx, "countries": markets.countries()}
+
+
+@router.put("/market")
+def put_market(body: MarketBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    try:
+        saved = markets.save_market(
+            db,
+            user,
+            site=body.site,
+            site_id=body.siteId,
+            country_iso=body.countryIso,
+            language=body.language,
+            city=body.city,
+            region=body.region,
+            service_area=body.serviceArea,
+        )
+    except markets.MarketError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"ok": True, "market": saved}
 
 
 def _home_for(db: Session, user: User, site: str = "") -> str:
@@ -1132,7 +1251,7 @@ def run_site_scan(body: SiteScanBody, db: Session = Depends(get_db), user: User 
     home = _home_for(db, user, body.site)
     if not home:
         raise HTTPException(status_code=400, detail="Add the website address in setup or connect WordPress first.")
-    scan, ran = _ensure_scan(db, user, home, body.brief, force=body.force)
+    scan, ran = _ensure_scan(db, user, home, _stored_brief(db, user, home, body.brief), force=body.force)
     if not scan.get("pages"):
         raise HTTPException(status_code=422, detail=scan.get("error") or "No readable pages were found on this website.")
     return {"ok": True, "ran": ran, "scan": _scan_summary(scan, _open_urls(db, user.id))}
@@ -1181,8 +1300,11 @@ def propose_from_gsc(
     """Read the whole site, understand the business and competitors, then draft a title and description per page."""
     from concurrent.futures import ThreadPoolExecutor
 
+    from urllib.parse import urlparse
+
+    from app import page_quality
     from app.meta_writer import _overlap, write_title_description
-    from app.site_scan import normalize
+    from app.site_scan import normalize, page_key
 
     body = body or FromGscBody()
     google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
@@ -1250,8 +1372,9 @@ def propose_from_gsc(
             "position": cells[4] if len(cells) > 4 else "—",
         }
 
-    scan, scanned_now = _ensure_scan(db, user, homepage, body.brief, force=body.rescan)
-    profile = _brief_profile(_profile_for(db, user.id), body.brief)
+    brief = _stored_brief(db, user, homepage, body.brief)
+    scan, scanned_now = _ensure_scan(db, user, homepage, brief, force=body.rescan)
+    profile = _brief_profile(_profile_for(db, user.id), brief)
     page_map = scan.get("pageMap") or {}
 
     query_terms = [str(q[0]).strip() for q in queries if isinstance(q, (list, tuple)) and q and str(q[0]).strip()][:8]
@@ -1265,7 +1388,10 @@ def propose_from_gsc(
             from app import dataforseo
 
             seed = query_terms[0] if query_terms else f"{services.split(',')[0]} {areas}".strip()
-            fallback_rivals = dataforseo.competitor_serp(seed)
+            where, language = _market_location(profile)
+            if where and quotas.left(db, user, "competitors") != 0:
+                fallback_rivals = dataforseo.competitor_serp(seed, location_name=where, language_code=language or "en")
+                quotas.consume(db, user, "competitors")
         except Exception:  # noqa: BLE001
             fallback_rivals = []
 
@@ -1276,18 +1402,21 @@ def propose_from_gsc(
             impressions = -float(str(ev.get("impressions") or 0).replace(",", ""))
         except ValueError:
             impressions = 0.0
-        return (0 if url in evidence else 1, impressions, ROLE_ORDER.get(info.get("role") or "other", 3), len(url))
+        is_home = not urlparse(url).path.strip("/")
+        return (0 if is_home else 1, 0 if url in evidence else 1, impressions, ROLE_ORDER.get(info.get("role") or "other", 3), len(url))
 
     scanned_urls = [
         p["url"] for p in scan.get("pages") or []
         if not p.get("noindex") and (page_map.get(p["url"]) or {}).get("role") != "legal"
     ]
-    candidates = sorted(dict.fromkeys([*evidence.keys(), *scanned_urls]), key=rank)
-    if not candidates:
-        candidates = [normalize(homepage)]
+    home_url = normalize(homepage)
+    unique: dict[str, str] = {}
+    for url in [home_url, *evidence.keys(), *scanned_urls]:
+        unique.setdefault(page_key(url), url)
+    candidates = sorted(unique.values(), key=rank)
 
     open_urls = _open_urls(db, user.id)
-    pending = [url for url in candidates if url.rstrip("/") not in open_urls]
+    pending = [url for url in candidates if page_key(url) not in open_urls]
     limit = max(1, min(int(body.limit or 8), 12))
     if scanned_now:
         limit = min(limit, 5)
@@ -1302,10 +1431,27 @@ def propose_from_gsc(
     if cms_for_site is None and len(cms_rows) == 1:
         cms_for_site = cms_rows[0]
 
-    jobs = []
+    if not openai_configured():
+        raise HTTPException(status_code=503, detail="The title writer is not configured, so no drafts were written.")
+
+    jobs, skipped = [], []
     for url in batch:
         page, site_ctx, rivals = _site_context(scan, url)
+        if page is None:
+            import httpx
+
+            from app import site_scan as scanner
+
+            with httpx.Client(headers={"User-Agent": scanner.AGENT}) as client:
+                page = scanner.read_page(client, url)
+        state, why = page_quality.content_status(page)
+        kind = page_quality.page_type(url, (site_ctx.get("page") or {}).get("role") or "", page)
+        if state != "ok":
+            skipped.append({"url": url, "status": state, "reason": why, "pageType": kind, "words": (page or {}).get("words")})
+            continue
         jobs.append({
+            "kind": kind,
+            "content": state,
             "url": url,
             "page": page,
             "site": site_ctx,
@@ -1327,12 +1473,13 @@ def propose_from_gsc(
                 page=job["page"],
                 site=job["site"],
                 taken=taken,
+                kind=job["kind"],
             )
         except Exception as exc:  # noqa: BLE001
             return {"aiError": str(exc)[:200]}
 
     results: list[dict] = []
-    if openai_configured() and jobs:
+    if jobs:
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(draft, jobs))
         rewrites = 0
@@ -1342,12 +1489,17 @@ def propose_from_gsc(
             if title and rewrites < 2 and any(_overlap(title, other) >= 0.6 for other in earlier if other):
                 results[index] = draft(jobs[index], taken=[t for t in earlier if t])
                 rewrites += 1
-    else:
-        results = [{} for _ in jobs]
 
-    created = []
+    created, failed = [], []
+    db.execute(sql_text("SELECT pg_advisory_xact_lock(:k)"), {"k": 7_300_000 + user.id})
+    open_urls = _open_urls(db, user.id)
     for job, drafted in zip(jobs, results):
         url = job["url"]
+        if page_key(url) in open_urls:
+            continue
+        if drafted.get("aiError") or not drafted.get("title") or not drafted.get("metaDescription"):
+            failed.append({"url": url, "reason": drafted.get("aiError") or "The writer returned no usable title and description."})
+            continue
         scraped = drafted.get("scraped") or job["page"] or {}
         info = job["site"].get("page") or {}
         change = SiteChange(
@@ -1379,7 +1531,18 @@ def propose_from_gsc(
                 "specificity": drafted.get("specificity") or body.breadth or "balanced",
                 "writer": "site-scan+brief+competitors+gsc+analytics",
                 "profileHints": {k: profile.get(k) or "" for k in ("business", "services", "areas", "goal", "restrictions")},
-                **({"aiError": drafted["aiError"]} if drafted.get("aiError") else {}),
+                "pageType": drafted.get("pageType") or job["kind"],
+                "contentStatus": job["content"],
+                "validation": drafted.get("validation") or {"status": "unverified", "claims": []},
+                "openIssues": drafted.get("openIssues") or [],
+                "confidence": page_quality.confidence(
+                    content=job["content"], gsc=job["gsc"], rivals=job["rivals"],
+                    validation=(drafted.get("validation") or {}).get("status") or "",
+                    analytics=bool((job["analytics"] or {}).get("connected")),
+                ),
+                "sourceHash": (job["page"] or {}).get("contentHash") or "",
+                "sourceFetchedAt": (job["page"] or {}).get("fetchedAt") or scan.get("scannedAt") or "",
+                "isHomepage": not urlparse(url).path.strip("/"),
                 **({"scrapeError": scraped["error"]} if scraped.get("error") else {}),
             },
             status="awaiting_approval",
@@ -1387,22 +1550,28 @@ def propose_from_gsc(
         db.add(change)
         db.flush()
         created.append(_change_row(change))
-        open_urls.add(url.rstrip("/"))
+        open_urls.add(page_key(url))
 
+    if skipped and scan:
+        known = {item["url"] for item in skipped}
+        scan["skipped"] = [*skipped, *[s for s in scan.get("skipped") or [] if s.get("url") not in known]][:60]
+        from app.site_scan import host_of as _host
+
+        _upsert_feature(db, user.id, "site-scan", _scan_title(_host(homepage)), scan)
     db.commit()
     if created:
         _sync_operator_features(db, user)
     summary = _scan_summary(scan, open_urls) if scan else None
     if not created:
-        return {
-            "ok": True,
-            "created": 0,
-            "changes": [],
-            "remaining": 0,
-            "scan": summary,
-            "reason": "Every page that was read already has a draft. Review or dismiss them to write new ones.",
-        }
-    return {"ok": True, "created": len(created), "changes": created, "remaining": remaining, "scan": summary}
+        reason = "Every page that was read already has a draft. Review or dismiss them to write new ones."
+        if failed:
+            reason = "The writer could not produce a usable draft for these pages. Try again."
+        elif skipped:
+            reason = "The pages left to draft need content work first. See the warnings."
+        return {"ok": True, "created": 0, "changes": [], "remaining": remaining, "scan": summary,
+                "skipped": skipped, "failed": failed, "reason": reason}
+    return {"ok": True, "created": len(created), "changes": created, "remaining": remaining, "scan": summary,
+            "skipped": skipped, "failed": failed}
 
 
 @router.post("/changes/from-draft")
@@ -1414,7 +1583,7 @@ def change_from_draft(body: FromDraftBody, db: Session = Depends(get_db), user: 
     if not draft.body:
         raise HTTPException(status_code=409, detail="Draft has no body")
 
-    if body.auto_approve or draft.status == "approved":
+    if body.auto_approve:
         draft.status = "approved"
 
     target = body.target_url.strip()
@@ -1449,8 +1618,13 @@ def change_from_draft(body: FromDraftBody, db: Session = Depends(get_db), user: 
             "changeType": body.change_type,
             "targetUrl": target,
         },
-        status="approved" if body.auto_approve or draft.status == "approved" else "awaiting_approval",
+        status="awaiting_approval",
     )
+    if body.auto_approve:
+        try:
+            approval.stamp_approval(change, user)
+        except approval.ApprovalError as exc:
+            raise _approval_http(exc) from exc
     db.add(change)
     db.commit()
     db.refresh(change)
@@ -1467,22 +1641,41 @@ def change_from_draft(body: FromDraftBody, db: Session = Depends(get_db), user: 
     return result
 
 
+def _approval_http(exc: "approval.ApprovalError") -> HTTPException:
+    return HTTPException(status_code=exc.status, detail={"code": exc.code, "message": str(exc)})
+
+
+def _live_listing(url: str) -> dict | None:
+    """The live page's title and meta description, or None if it could not be read."""
+    import httpx
+
+    from app import site_scan
+
+    if not url or not site_scan.public_host(url):
+        return None
+    with httpx.Client(headers={"User-Agent": site_scan.AGENT}) as client:
+        page = site_scan.read_page(client, url)
+    if page.get("error"):
+        return None
+    return {"title": page.get("title") or "", "description": page.get("description") or ""}
+
+
 @router.post("/changes/{change_id}/approve")
 def approve_change(change_id: int, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     row = db.get(SiteChange, change_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(status_code=404, detail="Change not found")
-    row.status = "approved"
-    row.updated_at = datetime.utcnow()
-    row.approved_by = user.id
-    row.approved_by_name = user.username or user.email or "Approver"
-    row.approved_at = datetime.utcnow()
+    try:
+        approval.stamp_approval(row, user)
+    except approval.ApprovalError as exc:
+        raise _approval_http(exc) from exc
     if row.draft_id:
         draft = db.get(Draft, row.draft_id)
         if draft and draft.customer_id == user.id:
             draft.status = "approved"
     db.commit()
     db.refresh(row)
+    log.info("change_approved", extra={"change_id": row.id, "user_id": user.id})
     _sync_operator_features(db, user)
     return _change_row(row)
 
@@ -1492,13 +1685,14 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
     row = db.get(SiteChange, change_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(status_code=404, detail="Change not found")
-    if row.status not in {"approved", "failed"}:
-        raise HTTPException(status_code=409, detail=f"Approve first (status={row.status})")
+    try:
+        approved = approval.check_publishable(row)
+    except approval.ApprovalError as exc:
+        raise _approval_http(exc) from exc
 
     conn_id = body.cms_connection_id or row.cms_connection_id
     conn = db.get(CmsConnection, conn_id) if conn_id else None
     if conn is None or conn.customer_id != user.id:
-        # fall back to any connected CMS
         conn = (
             db.query(CmsConnection)
             .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
@@ -1509,75 +1703,110 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
         raise HTTPException(status_code=400, detail="Connect WordPress, Shopify, Webflow, or a custom webhook first")
 
     proposed = dict(row.proposed or {})
+    is_meta = (row.change_type or proposed.get("changeType") or "meta") == "meta"
     change_payload = {
-        "title": proposed.get("title"),
-        # v1 metadata-only — do not push full HTML content
-        "metaDescription": proposed.get("metaDescription"),
+        "title": approved["title"],
+        "metaDescription": approved["metaDescription"],
         "remoteId": proposed.get("remoteId") or (conn.credentials or {}).get("defaultPostId"),
         "resource": proposed.get("resource") or "page",
         "changeType": row.change_type or "meta",
         "targetUrl": row.target_url,
-        "beforeTitle": proposed.get("beforeTitle"),
         "collectionId": (conn.credentials or {}).get("collectionId"),
     }
 
-    row.status = "executing"
+    if body.force_dry_run:
+        result = cms_connectors.apply_change(conn.provider, {k: "" for k in (conn.credentials or {})}, conn.site_url, change_payload)
+        row.execution = {**result, "dryRun": True}
+        row.updated_at = datetime.utcnow()
+        db.commit()
+        return {"ok": True, "dryRun": True, "change": _change_row(row), "execution": row.execution}
+
+    if is_meta and row.target_url:
+        live = _live_listing(row.target_url)
+        if live is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "source_unreadable", "message": "Could not read the live page to confirm it has not changed since review. Nothing was published. Try again."},
+            )
+        changed = approval.listing_changed({"title": proposed.get("beforeTitle"), "description": proposed.get("beforeDescription")}, live)
+        if changed:
+            approval.send_back_for_review(row, live, changed)
+            db.commit()
+            _sync_operator_features(db, user)
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "source_changed", "message": f"The live page {' and '.join(changed)} changed since review. Nothing was published. Review the update again."},
+            )
+
+    if not approval.claim_for_publish(db, row):
+        raise HTTPException(status_code=409, detail={"code": "already_published", "message": "This change is already publishing or published."})
     row.cms_connection_id = conn.id
     db.commit()
+    log.info("change_publish_started", extra={"change_id": row.id, "provider": conn.provider, "user_id": user.id})
 
-    creds = dict(conn.credentials or {})
-    if body.force_dry_run:
-        # strip secrets so adapters dry-run
-        creds = {k: "" for k in creds}
-
-    result = cms_connectors.apply_change(conn.provider, creds, conn.site_url, change_payload)
-    row.execution = result
+    result = cms_connectors.apply_change(conn.provider, dict(conn.credentials or {}), conn.site_url, change_payload)
     row.updated_at = datetime.utcnow()
     conn.last_used_at = datetime.utcnow()
+    proposed = dict(row.proposed or {})
 
-    if result.get("ok"):
-        # Persist before/after for undo history
+    if result.get("ok") and not result.get("dryRun"):
         before = result.get("before") or {}
         if before.get("title") or before.get("metaDescription"):
-            proposed["beforeTitle"] = before.get("title") or proposed.get("beforeTitle") or ""
-            proposed["beforeDescription"] = before.get("metaDescription") or proposed.get("beforeDescription") or ""
-            row.proposed = proposed
+            proposed["undoTitle"] = before.get("title") or ""
+            proposed["undoDescription"] = before.get("metaDescription") or ""
         if result.get("remoteId"):
             proposed["remoteId"] = result["remoteId"]
             proposed["resource"] = result.get("resource") or proposed.get("resource")
-            row.proposed = proposed
-
-        if not result.get("dryRun"):
-            row.applied_at = datetime.utcnow()
-            row.status = "monitoring"
-        else:
-            row.status = "applied"
-            row.applied_at = datetime.utcnow()
+        proposed["publishedTitle"] = approved["title"]
+        proposed["publishedDescription"] = approved["metaDescription"]
+        after = _live_listing(row.target_url) if is_meta and row.target_url else None
+        title_live = bool(after) and approval._norm(approved["title"]) in approval._norm(after.get("title"))
+        result["liveCheck"] = {
+            "read": after is not None,
+            "titleLive": title_live,
+            "descriptionLive": bool(after) and approval._norm(after.get("description")) == approval._norm(approved["metaDescription"]),
+            "note": "" if after else "The live page could not be read after publishing.",
+        }
+        verified = result.get("verified")
+        row.proposed = proposed
+        row.applied_at = datetime.utcnow()
+        row.status = "monitoring" if verified is not False else "published_unverified"
         row.monitoring = {
             "startedAt": datetime.utcnow().isoformat(timespec="seconds"),
             "baselinePosition": None,
             "latestPosition": None,
-            "note": "Dry-run recorded" if result.get("dryRun") else "Live apply recorded — monitoring GSC",
-            "dryRun": bool(result.get("dryRun")),
-            "verified": result.get("verified"),
+            "note": "Published. Watching Search Console." if verified is not False else "Published, but the CMS did not confirm the new title.",
+            "dryRun": False,
+            "verified": verified,
         }
         conn.last_error = ""
+    elif result.get("ok"):
+        row.status = "approved"
+        result["detail"] = f"Nothing was published. {result.get('detail') or 'The connection is missing credentials.'}"
+        conn.last_error = result["detail"][:500]
     else:
         row.status = "failed"
         conn.last_error = str(result.get("detail") or "execute failed")[:500]
+    row.execution = result
 
     db.add(
         Job(
             customer_id=user.id,
             kind="cms_execute",
-            status="done" if result.get("ok") else "error",
-            detail={"changeId": row.id, "provider": conn.provider, "result": result},
+            status="done" if result.get("ok") and not result.get("dryRun") else "error",
+            detail={"changeId": row.id, "provider": conn.provider, "ok": bool(result.get("ok")), "dryRun": bool(result.get("dryRun")), "detail": str(result.get("detail") or "")[:300]},
         )
     )
     db.commit()
     db.refresh(row)
     _sync_operator_features(db, user)
-    return {"ok": bool(result.get("ok")), "change": _change_row(row), "execution": result}
+    log.info("change_publish_finished", extra={"change_id": row.id, "status": row.status, "user_id": user.id})
+    if not result.get("ok") or result.get("dryRun"):
+        raise HTTPException(
+            status_code=409 if result.get("dryRun") else 502,
+            detail={"code": "not_published" if result.get("dryRun") else "publish_failed", "message": str(result.get("detail") or "Publish failed.")[:400], "change": _change_row(row)},
+        )
+    return {"ok": True, "change": _change_row(row), "execution": result}
 
 
 @router.post("/changes/{change_id}/monitor")
@@ -1631,11 +1860,11 @@ def patch_change(change_id: int, body: PatchChangeBody, db: Session = Depends(ge
     row = db.get(SiteChange, change_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(status_code=404, detail="Change not found")
+    try:
+        withdrawn = approval.apply_edit(row, title=body.title, description=body.metaDescription)
+    except approval.ApprovalError as exc:
+        raise _approval_http(exc) from exc
     proposed = dict(row.proposed or {})
-    if body.title is not None:
-        proposed["title"] = body.title.strip()[:120]
-    if body.metaDescription is not None:
-        proposed["metaDescription"] = body.metaDescription.strip()[:320]
     if body.remote_id is not None:
         proposed["remoteId"] = body.remote_id.strip()
     if body.resource is not None:
@@ -1643,10 +1872,9 @@ def patch_change(change_id: int, body: PatchChangeBody, db: Session = Depends(ge
     row.proposed = proposed
     if body.opportunity is not None:
         row.opportunity = body.opportunity.strip()
-    row.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(row)
-    return _change_row(row)
+    return {**_change_row(row), "approvalWithdrawn": withdrawn}
 
 
 @router.post("/changes/{change_id}/dismiss")
@@ -1654,6 +1882,12 @@ def dismiss_change(change_id: int, db: Session = Depends(get_db), user: User = D
     row = db.get(SiteChange, change_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(status_code=404, detail="Change not found")
+    if row.status not in approval.DISMISSABLE:
+        raise _approval_http(approval.ApprovalError(f"This change is {row.status.replace('_', ' ')} and cannot be rejected. Use undo instead."))
+    proposed = dict(row.proposed or {})
+    for key in ("approvedHash", "approvedTitle", "approvedDescription"):
+        proposed.pop(key, None)
+    row.proposed = proposed
     row.status = "dismissed"
     row.updated_at = datetime.utcnow()
     db.commit()
@@ -1691,7 +1925,10 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             from app import dataforseo
 
             seed = query_terms[0] if query_terms else ""
-            competitors = dataforseo.competitor_serp(seed)
+            where, language = _market_location(_brief_profile(profile, (scan or {}).get("brief")))
+            if seed and where and quotas.left(db, user, "competitors") != 0:
+                competitors = dataforseo.competitor_serp(seed, location_name=where, language_code=language or "en")
+                quotas.consume(db, user, "competitors")
         except Exception:  # noqa: BLE001
             competitors = []
     taken = [
@@ -1723,9 +1960,6 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     options = [
         {"title": drafted.get("title") or "", "description": drafted.get("metaDescription") or "", "reason": drafted.get("reason") or ""},
     ]
-    proposed["title"] = drafted.get("title") or proposed.get("title") or ""
-    proposed["metaDescription"] = drafted.get("metaDescription") or proposed.get("metaDescription") or ""
-    proposed["reason"] = drafted.get("reason") or proposed.get("reason") or ""
     proposed["aiAlternatives"] = options
     proposed["model"] = drafted.get("model")
     proposed["role"] = drafted.get("role")
@@ -1758,7 +1992,7 @@ def undo_change(change_id: int, db: Session = Depends(get_db), user: User = Depe
     row = db.get(SiteChange, change_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(status_code=404, detail="Change not found")
-    if row.status not in {"applied", "monitoring", "closed"}:
+    if row.status not in {"applied", "monitoring", "closed", "published_unverified"}:
         raise HTTPException(status_code=409, detail=f"Nothing to undo (status={row.status})")
 
     conn = db.get(CmsConnection, row.cms_connection_id) if row.cms_connection_id else None
@@ -1774,8 +2008,8 @@ def undo_change(change_id: int, db: Session = Depends(get_db), user: User = Depe
 
     proposed = dict(row.proposed or {})
     previous = {
-        "title": proposed.get("beforeTitle") or "",
-        "metaDescription": proposed.get("beforeDescription") or "",
+        "title": proposed.get("undoTitle") or proposed.get("beforeTitle") or "",
+        "metaDescription": proposed.get("undoDescription") or proposed.get("beforeDescription") or "",
         "beforeTitle": proposed.get("title") or "",
         "beforeDescription": proposed.get("metaDescription") or "",
     }

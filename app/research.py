@@ -8,35 +8,24 @@ Nothing is invented: an empty provider answer is returned as empty.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from datetime import datetime, timedelta
 
 import httpx
 from sqlalchemy.orm import Session
 
-from app import config
+from app import config, llm_requests, locations, markets, quotas
 from app.models import FeatureRecord, User
+
+log = logging.getLogger("searchify.research")
 
 BASE = "https://api.dataforseo.com/v3"
 DAILY_CALLS = {"starter": 40, "growth": 150, "agency": 500, "scale": 800}
 WINDOWS = {"keywords": timedelta(hours=24), "backlinks": timedelta(hours=24), "visibility": timedelta(days=7), "models": timedelta(days=7), "audit": timedelta(days=7)}
 AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
-ENGINES = {"ChatGPT": "chat_gpt", "Gemini": "gemini", "Perplexity": "perplexity", "Claude": "claude"}
-COUNTRIES = {
-    "canada": ("Canada", "CA"),
-    "united kingdom": ("United Kingdom", "GB"),
-    "uk": ("United Kingdom", "GB"),
-    "england": ("United Kingdom", "GB"),
-    "australia": ("Australia", "AU"),
-    "new zealand": ("New Zealand", "NZ"),
-    "ireland": ("Ireland", "IE"),
-    "india": ("India", "IN"),
-    "bangladesh": ("Bangladesh", "BD"),
-    "germany": ("Germany", "DE"),
-    "united states": ("United States", "US"),
-    "usa": ("United States", "US"),
-}
+ENGINES = llm_requests.ENGINES
 PROVIDER_ERRORS = {
     40104: "The DataForSEO account is not verified yet. Finish verification in the DataForSEO panel.",
     40200: "The DataForSEO balance is empty. Add funds in the DataForSEO panel.",
@@ -60,12 +49,10 @@ def host_of(value: str) -> str:
     return raw.removeprefix("www.")
 
 
-def location_for(text: str = "") -> tuple[str, str]:
-    low = (text or "").lower()
-    for key, value in COUNTRIES.items():
-        if re.search(rf"\b{re.escape(key)}\b", low):
-            return value
-    return ("United States", "US")
+def location_for(text: str = "", reach: str = "") -> tuple[str, str]:
+    """(DataForSEO location_name, ISO). Raises locations.LocationError instead of defaulting."""
+    place = locations.resolve(text, reach=reach)
+    return place.country, place.iso
 
 
 def _record(db: Session, user_id: int, kind: str, title: str) -> FeatureRecord | None:
@@ -153,20 +140,25 @@ def _task(method: str, path: str, payload: list | None = None, timeout: float = 
     return task, float(data.get("cost") or 0)
 
 
+_STATUS: dict = {}
+STATUS_TTL = timedelta(minutes=10)
+
+
 def status() -> dict:
+    """Account check through the free user_data endpoint, reused for ten minutes."""
     if not configured():
         return {"connected": False, "ready": False, "message": "Add the DataForSEO API login and password to the backend settings."}
+    if _STATUS.get("at") and datetime.utcnow() - _STATUS["at"] < STATUS_TTL:
+        return {**_STATUS["value"], "cached": True}
     try:
         result, _ = _call("GET", "/appendix/user_data", None, timeout=20)
     except ResearchError as exc:
         return {"connected": True, "ready": False, "message": str(exc)}
     info = (result or [{}])[0] or {}
     balance = (info.get("money") or {}).get("balance")
-    try:
-        _call("POST", "/dataforseo_labs/google/keyword_overview/live", [{"keywords": ["seo"], "location_name": "United States", "language_code": "en"}], timeout=30)
-    except ResearchError as exc:
-        return {"connected": True, "ready": False, "balance": balance, "message": str(exc)}
-    return {"connected": True, "ready": True, "balance": balance, "message": "DataForSEO is connected."}
+    value = {"connected": True, "ready": True, "balance": balance, "message": "DataForSEO is connected."}
+    _STATUS.update(at=datetime.utcnow(), value=value)
+    return value
 
 
 def _kw_row(item: dict) -> dict:
@@ -183,26 +175,51 @@ def _kw_row(item: dict) -> dict:
     }
 
 
-def keywords(db: Session, user: User, *, site: str, terms: list[str], country: str = "", force: bool = False) -> dict:
+def _place_for(db: Session, user: User, *, site: str, country: str = "", reach: str = "", tool: str = "") -> tuple[locations.Location, dict]:
+    """Resolve the shared market, or an explicit override from the request."""
+    if (country or "").strip() or db is None:
+        place = locations.resolve(country, reach=reach)
+        ctx = {"source": "request", "countryIso": place.iso, "language": place.language, "version": 0}
+        return place, ctx
+    ctx = markets.get_market_context(db, user, site=site, tool_name=tool)
+    place = locations.Location(
+        country=(ctx.get("place") or {}).get("country") or ctx.get("countryName") or "",
+        iso=ctx.get("countryIso") or "",
+        language=ctx.get("language") or "en",
+        city=ctx.get("city") or "",
+        region=ctx.get("region") or "",
+        worldwide=bool(ctx.get("worldwide")),
+        source=ctx.get("source") or "market",
+    )
+    return place, ctx
+
+
+def keywords(db: Session, user: User, *, site: str, terms: list[str], country: str = "", reach: str = "", force: bool = False) -> dict:
     host = host_of(site)
     if not host:
         raise ResearchError("Add the website address in setup first.")
-    location, _iso = location_for(country)
-    clean = [t.strip()[:80] for t in dict.fromkeys(terms or []) if t and t.strip()][:50]
-    title = f"Keywords {host} {location}"
+    place, market = _place_for(db, user, site=site, country=country, reach=reach, tool="keywords")
+    location, language = place.country, place.language or market.get("language") or "en"
+    clean = [t.strip()[:80] for t in dict.fromkeys(t.strip().lower() for t in terms or [] if t and t.strip())][:50]
+    term_limit = quotas.tracked_keyword_limit(db, user)
+    dropped = len(clean) - term_limit if term_limit is not None and len(clean) > term_limit else 0
+    if dropped:
+        clean = clean[:term_limit]
+    title = f"Keywords {host} {place.iso or location} {language}"
     saved = None if force else cached(db, user.id, "dfs-keywords", title, WINDOWS["keywords"])
     if saved and set(clean) <= set(saved.get("terms") or []):
-        return {**saved, "cached": True}
+        return {**saved, "cached": True, "termsDropped": dropped}
+    quotas.check(db, user, "keywords")
     _budget(db, user, 3)
     cost = 0.0
     ranked_res, c = _call(
         "POST",
         "/dataforseo_labs/google/ranked_keywords/live",
-        [{"target": host, "location_name": location, "language_code": "en", "limit": 100,
+        [{"target": host, "location_name": location, "language_code": language, "limit": 100,
           "order_by": ["keyword_data.keyword_info.search_volume,desc"]}],
     )
     cost += c
-    ranked = []
+    best: dict[str, dict] = {}
     for item in ((ranked_res or [{}])[0] or {}).get("items") or []:
         row = _kw_row(item)
         serp = (item.get("ranked_serp_element") or {}).get("serp_item") or {}
@@ -214,8 +231,20 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             "url": serp.get("url") or "",
             "page": serp.get("relative_url") or "",
         })
-        if row["keyword"]:
-            ranked.append(row)
+        if not row["keyword"]:
+            continue
+        key = row["keyword"].lower()
+        held = best.get(key)
+        if held is None:
+            best[key] = row
+        elif (row["position"] or 10**6) < (held["position"] or 10**6):
+            row["otherUrls"] = [held["url"], *held.get("otherUrls", [])]
+            best[key] = row
+        else:
+            held.setdefault("otherUrls", []).append(row["url"])
+    ranked = list(best.values())
+    for row in ranked:
+        row["source"] = "DataForSEO Labs ranked keywords (estimated Google position)"
     by_term = {row["keyword"].lower(): row for row in ranked}
 
     tracked = []
@@ -223,7 +252,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         overview_res, c = _call(
             "POST",
             "/dataforseo_labs/google/keyword_overview/live",
-            [{"keywords": clean, "location_name": location, "language_code": "en", "include_serp_info": False}],
+            [{"keywords": clean, "location_name": location, "language_code": language, "include_serp_info": False}],
         )
         cost += c
         found = {}
@@ -233,7 +262,15 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         for term in clean:
             base = found.get(term.lower()) or {"keyword": term, "volume": None, "difficulty": None, "intent": ""}
             rank = by_term.get(term.lower()) or {}
-            tracked.append({**base, "keyword": term, "position": rank.get("position"), "previous": rank.get("previous"), "page": rank.get("page") or ""})
+            tracked.append({
+                **base,
+                "keyword": term,
+                "position": rank.get("position"),
+                "previous": rank.get("previous"),
+                "page": rank.get("page") or "",
+                "url": rank.get("url") or "",
+                "source": "DataForSEO keyword overview" if term.lower() in found else "Not in DataForSEO keyword data",
+            })
 
     ideas = []
     seed = clean[0] if clean else (ranked[0]["keyword"] if ranked else "")
@@ -241,7 +278,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         ideas_res, c = _call(
             "POST",
             "/dataforseo_labs/google/keyword_suggestions/live",
-            [{"keyword": seed, "location_name": location, "language_code": "en", "limit": 30,
+            [{"keyword": seed, "location_name": location, "language_code": language, "limit": 30,
               "order_by": ["keyword_info.search_volume,desc"]}],
         )
         cost += c
@@ -249,30 +286,46 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         for item in ((ideas_res or [{}])[0] or {}).get("items") or []:
             row = _kw_row(item)
             if row["keyword"] and row["keyword"].lower() not in known:
-                ideas.append(row)
-    _spend(db, user, 3 if seed else 2, cost)
+                known.add(row["keyword"].lower())
+                ideas.append({**row, "source": "DataForSEO keyword suggestions"})
+    _spend(db, user, 1 + bool(clean) + bool(seed), cost)
+    quotas.consume(db, user, "keywords")
     payload = {
         "host": host,
         "location": location,
+        "language": language,
+        "place": place.to_dict(),
+        "market": {
+            "countryIso": place.iso,
+            "language": language,
+            "source": market.get("source"),
+            "version": market.get("version"),
+            "scope": "country",
+        },
         "terms": clean,
         "ranked": ranked,
         "tracked": tracked,
-        "ideas": ideas[:25],
+        "ideas": ideas[:quotas.keyword_idea_limit(db, user)],
+        "termLimit": term_limit,
         "source": "DataForSEO Labs",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
     _save(db, user.id, "dfs-keywords", title, payload)
-    return {**payload, "cached": False}
+    return {**payload, "cached": False, "termsDropped": dropped}
 
 
-def backlinks(db: Session, user: User, *, site: str, force: bool = False) -> dict:
+def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored_only: bool = False) -> dict:
     host = host_of(site)
     if not host:
         raise ResearchError("Add the website address in setup first.")
     title = f"Backlinks {host}"
+    if stored_only:
+        row = _record(db, user.id, "dfs-backlinks", title)
+        return {**dict(row.payload or {}), "cached": True} if row and row.payload else {"host": host, "state": "none", "cached": True}
     saved = None if force else cached(db, user.id, "dfs-backlinks", title, WINDOWS["backlinks"])
     if saved:
         return {**saved, "cached": True}
+    quotas.check(db, user, "backlinks")
     _budget(db, user, 2)
     cost = 0.0
     summary_res, c = _call("POST", "/backlinks/summary/live", [{"target": host, "include_subdomains": True}])
@@ -281,11 +334,17 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False) -> dic
     links_res, c = _call(
         "POST",
         "/backlinks/backlinks/live",
-        [{"target": host, "mode": "one_per_domain", "limit": 100, "include_subdomains": True, "order_by": ["rank,desc"]}],
+        [{"target": host, "mode": "one_per_domain", "backlinks_status_type": "all", "limit": 100,
+          "include_subdomains": True, "order_by": ["rank,desc"]}],
     )
     cost += c
-    links = []
-    for item in ((links_res or [{}])[0] or {}).get("items") or []:
+    page = (links_res or [{}])[0] or {}
+    links, seen = [], set()
+    for item in page.get("items") or []:
+        key = (item.get("domain_from") or "").lower().removeprefix("www.")
+        if not key or key in seen:
+            continue
+        seen.add(key)
         state = "Lost" if item.get("is_lost") else "New" if item.get("is_new") else "Active"
         links.append({
             "domain": item.get("domain_from") or "",
@@ -295,9 +354,13 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False) -> dic
             "follow": "Follow" if item.get("dofollow") else "Nofollow",
             "state": state,
             "rank": item.get("rank"),
+            "firstSeen": str(item.get("first_seen") or "")[:10] or None,
+            "lastSeen": str(item.get("last_seen") or "")[:10] or None,
+            "lostDate": str(item.get("date_lost") or "")[:10] or None,
             "seen": f"First seen {str(item.get('first_seen') or '')[:10]} · last seen {str(item.get('last_seen') or '')[:10]}",
         })
     _spend(db, user, 2, cost)
+    quotas.consume(db, user, "backlinks")
     payload = {
         "host": host,
         "summary": {
@@ -307,8 +370,14 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False) -> dic
             "nofollowDomains": s.get("referring_domains_nofollow"),
             "brokenBacklinks": s.get("broken_backlinks"),
             "rank": s.get("rank"),
+            "rankScale": "DataForSEO rank, 0 to 1000",
+            "counts": "Live links only, from DataForSEO backlinks summary",
         },
         "links": links,
+        "linksNote": "One sample link per referring domain, highest DataForSEO rank first. Includes lost links.",
+        "linksShown": len(links),
+        "referringDomainsListed": page.get("total_count"),
+        "market": {"scope": "domain", "countryFilter": False, "note": "Backlink counts are domain-wide, not filtered by the SEO target country."},
         "source": "DataForSEO Backlinks",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
@@ -316,86 +385,155 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False) -> dic
     return {**payload, "cached": False}
 
 
-def _model_for(db: Session, user: User, engine: str) -> str:
+MODEL_CACHE_VERSION = 3
+
+
+def _model_for(db: Session, user: User, engine: str) -> dict:
+    """{name, reasoning, webSearch} for the cheapest web-searching model DataForSEO lists for this engine."""
     title = f"Models {engine}"
     saved = cached(db, user.id, "dfs-models", title, WINDOWS["models"])
-    if saved and saved.get("model"):
+    if saved and saved.get("version") == MODEL_CACHE_VERSION and (saved.get("model") or {}).get("name"):
         return saved["model"]
     result, _ = _call("GET", f"/ai_optimization/{engine}/llm_responses/models", None, timeout=30)
-    models = [m for m in result or [] if isinstance(m, dict) and m.get("model_name")]
-    searchable = [m for m in models if m.get("web_search_supported") or m.get("web_search")] or models
-    plain = [m for m in searchable if not m.get("reasoning")] or searchable
-    cheap = [m for m in plain if re.search(r"mini|flash|sonar|haiku", m["model_name"], re.I)] or plain
-    if not cheap:
-        raise ResearchError(f"No {engine} model is available on the DataForSEO account.")
-    model = cheap[0]["model_name"]
-    _save(db, user.id, "dfs-models", title, {"model": model, "fetchedAt": datetime.utcnow().isoformat(timespec="seconds")})
+    try:
+        model = llm_requests.pick_model(engine, result)
+    except llm_requests.RequestError as exc:
+        raise ResearchError(str(exc)) from exc
+    _save(db, user.id, "dfs-models", title, {"version": MODEL_CACHE_VERSION, "model": model, "fetchedAt": _now()})
     return model
 
 
-def visibility(db: Session, user: User, *, site: str, brand: str, prompts: list[dict], country: str = "", force: bool = False) -> dict:
+def _now() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds")
+
+
+def _parse_answer(first: dict) -> tuple[str, list[dict]]:
+    answer, sources, seen = [], [], set()
+    for item in first.get("items") or []:
+        for section in item.get("sections") or []:
+            if section.get("text"):
+                answer.append(section["text"])
+            for note in section.get("annotations") or []:
+                url = note.get("url")
+                if url and url not in seen:
+                    seen.add(url)
+                    sources.append({"url": url, "title": note.get("title") or ""})
+    return "\n".join(answer), sources
+
+
+def _mentions(body: str, names: set[str]) -> bool:
+    low = (body or "").lower()
+    return any(re.search(rf"(?<![a-z0-9]){re.escape(name)}(?![a-z0-9])", low) for name in names)
+
+
+def visibility(
+    db: Session,
+    user: User,
+    *,
+    site: str,
+    brand: str,
+    prompts: list[dict],
+    country: str = "",
+    reach: str = "",
+    force: bool = False,
+) -> dict:
     host = host_of(site)
     if not host:
         raise ResearchError("Add the website address in setup first.")
-    _location, iso = location_for(country)
+    if (country or "").strip() or db is None:
+        place = locations.resolve(country, reach=reach, allow_worldwide=True)
+        market = {"source": "request", "countryIso": place.iso, "version": 0}
+    else:
+        place, market = _place_for(db, user, site=site, country="", reach=reach, tool="visibility")
+    iso, city = place.iso, place.city
     names = {n.lower() for n in [brand, host, host.split(".")[0]] if n and len(n) > 2}
-    results = []
-    todo = []
+    results, todo = [], []
     for prompt in prompts[:30]:
-        text = str(prompt.get("text") or "").strip()[:480]
+        text = " ".join(str(prompt.get("text") or "").split())
         engine_label = prompt.get("engine") if prompt.get("engine") in ENGINES else "ChatGPT"
         if not text:
             continue
-        digest = hashlib.sha1(f"{iso}|{text.lower()}".encode()).hexdigest()[:16]
+        if len(text) > llm_requests.PROMPT_LIMIT:
+            results.append({"id": prompt.get("id"), "text": text, "engine": engine_label, "status": "error",
+                            "error": f"Prompt is {len(text)} characters. Shorten it to {llm_requests.PROMPT_LIMIT}."})
+            continue
+        digest = hashlib.sha1(f"{iso}|{city.lower()}|{text.lower()}".encode()).hexdigest()[:16]
         title = f"Visibility {host} {engine_label} {digest}"[:200]
         saved = None if force else cached(db, user.id, "dfs-visibility", title, WINDOWS["visibility"])
-        if saved:
+        if saved and saved.get("status", "ok") == "ok":
             results.append({**saved, "cached": True})
         else:
             todo.append((text, engine_label, title, prompt.get("id")))
+    allowed = quotas.left(db, user, "visibility")
+    if allowed is not None and len(todo) > allowed:
+        if not allowed and not results:
+            quotas.check(db, user, "visibility", len(todo))
+        message = str(quotas.QuotaError("visibility", quotas.PLANS[quotas.plan_for(db, user)]["monthly"]["visibility"], quotas.plan_for(db, user)))
+        for text, engine_label, _title, prompt_id in todo[allowed:]:
+            results.append({"id": prompt_id, "text": text, "engine": engine_label, "status": "error", "code": "quota_exceeded", "error": message})
+        todo = todo[:allowed]
     if todo:
         _budget(db, user, len(todo))
-    spent = 0.0
+    spent, calls = 0.0, 0
     for text, engine_label, title, prompt_id in todo:
         engine = ENGINES[engine_label]
-        model = _model_for(db, user, engine)
-        result, cost = _call(
-            "POST",
-            f"/ai_optimization/{engine}/llm_responses/live",
-            [{"user_prompt": text, "model_name": model, "web_search": True, "web_search_country_iso_code": iso, "max_output_tokens": 800}],
-            timeout=130,
-        )
-        spent += cost
+        previous = dict(((_record(db, user.id, "dfs-visibility", title) or FeatureRecord()).payload) or {})
+        try:
+            model = _model_for(db, user, engine)
+            payload, applied = llm_requests.build(engine, prompt=text, model=model, iso=iso, city=city)
+            calls += 1
+            try:
+                result, cost = _call("POST", f"/ai_optimization/{engine}/llm_responses/live", [payload], timeout=130)
+            except ResearchError as exc:
+                # Provider docs and live accounts disagree on some models. Retry once without location fields.
+                msg = str(exc)
+                if "web_search_country_iso_code" in msg or "web_search_city" in msg:
+                    payload.pop("web_search_country_iso_code", None)
+                    payload.pop("web_search_city", None)
+                    applied = {**applied, "country": "", "city": "", "note": (applied.get("note") or "") + " Location fields were omitted after the provider rejected them."}
+                    result, cost = _call("POST", f"/ai_optimization/{engine}/llm_responses/live", [payload], timeout=130)
+                else:
+                    raise
+            spent += cost
+        except (ResearchError, llm_requests.RequestError) as exc:
+            log.warning("visibility_failed", extra={"engine": engine, "host": host, "error": str(exc)[:200]})
+            failed = {"id": prompt_id, "text": text, "engine": engine_label, "status": "error", "error": str(exc), "failedAt": _now()}
+            if previous.get("fetchedAt") and previous.get("status", "ok") == "ok":
+                failed.update({k: previous.get(k) for k in ("model", "mention", "citation", "sources", "snippet", "fetchedAt", "location")})
+                failed["stale"] = True
+            results.append(failed)
+            continue
         first = (result or [{}])[0] or {}
-        answer, sources = [], []
-        for item in first.get("items") or []:
-            for section in item.get("sections") or []:
-                if section.get("text"):
-                    answer.append(section["text"])
-                for note in section.get("annotations") or []:
-                    if note.get("url"):
-                        sources.append({"url": note["url"], "title": note.get("title") or ""})
-        body = "\n".join(answer)
-        low = body.lower()
-        mentioned = any(name in low for name in names)
+        body, sources = _parse_answer(first)
         cited = [s["url"] for s in sources if host_of(s["url"]) == host]
         row = {
             "id": prompt_id,
             "text": text,
             "engine": engine_label,
-            "model": first.get("model_name") or model,
-            "mention": mentioned,
+            "status": "ok" if body else "empty",
+            "model": first.get("model_name") or model["name"],
+            "mention": _mentions(body, names) if body else None,
             "citation": cited[0] if cited else "",
             "sources": sources[:12],
             "snippet": body[:1600],
-            "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
-            "country": iso,
+            "fetchedAt": _now(),
+            "country": applied["country"],
+            "location": {"requested": place.to_dict(), "applied": applied},
+            "market": {"countryIso": place.iso, "language": place.language, "source": market.get("source"), "version": market.get("version"), "scope": "country" if applied.get("country") else "global"},
         }
-        _save(db, user.id, "dfs-visibility", title, row)
+        if row["status"] == "ok" or not previous.get("fetchedAt"):
+            _save(db, user.id, "dfs-visibility", title, row)
         results.append({**row, "cached": False})
-    if todo:
-        _spend(db, user, len(todo), spent)
-    return {"host": host, "results": results, "source": "DataForSEO AI Optimization"}
+    if calls:
+        _spend(db, user, calls, spent)
+        quotas.consume(db, user, "visibility", calls)
+    return {
+        "host": host,
+        "location": place.to_dict(),
+        "market": {"countryIso": place.iso, "language": place.language, "source": market.get("source"), "version": market.get("version")},
+        "results": results,
+        "source": "DataForSEO AI Optimization",
+    }
 
 
 # key: (finding name, severity, fix, a title/description draft can fix it)
@@ -552,6 +690,7 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
     if saved.get("state") == "ready" and not force and age(saved.get("fetchedAt")) < WINDOWS["audit"]:
         return {**saved, "cached": True}
 
+    quotas.check(db, user, "audits")
     _budget(db, user, 1)
     netloc, start = _audit_target(site)
     limit = _audit_limit(user)
@@ -573,6 +712,7 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
     if not task_id:
         raise ResearchError("DataForSEO did not start the site crawl. Try again in a minute.")
     _spend(db, user, 1, cost)
+    quotas.consume(db, user, "audits")
     payload = {
         "host": host,
         "state": "crawling",

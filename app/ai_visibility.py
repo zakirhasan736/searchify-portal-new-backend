@@ -124,9 +124,9 @@ def _parse_json(text: str) -> dict:
 
 
 def _score_engine(checks: list[dict], engine_name: str) -> dict:
-    rows = [c for c in checks if c.get("engine") == engine_name]
+    rows = [c for c in checks if c.get("engine") == engine_name and c.get("mention") is not None]
     if not rows:
-        return {"id": engine_name.lower(), "name": engine_name, "score": 0, "mentions": 0, "citations": 0, "gaps": 0}
+        return {"id": engine_name.lower(), "name": engine_name, "score": None, "mentions": 0, "citations": 0, "gaps": 0}
     mentions = sum(1 for c in rows if c.get("mention"))
     citations = sum(1 for c in rows if c.get("citation"))
     gaps = sum(1 for c in rows if c.get("status") != "ok")
@@ -148,9 +148,9 @@ def _fallback_report(profile: dict, prompts: list[str], site: str, reason: str) 
         prompt = prompts[0] if prompts else f"Who should I hire in this area?"
         missing_profile = not (profile.get("business") and profile.get("services"))
         error = (
-            "Business name and services are missing, so this engine has nothing to mention."
+            "Business name and services are missing, so nothing could be estimated."
             if missing_profile
-            else f"{engine['name']} is unlikely to name {biz} — no indexed entity page or citations were found in your connected data."
+            else f"Not estimated for {engine['name']}: {reason}"
         )
         suggestion = "Complete business profile" if missing_profile else "Add a named entity FAQ"
         checks.append(
@@ -158,9 +158,9 @@ def _fallback_report(profile: dict, prompts: list[str], site: str, reason: str) 
                 "id": f"{engine['id']}-0",
                 "engine": engine["name"],
                 "prompt": prompt,
-                "mention": False,
-                "citation": False,
-                "status": "error",
+                "mention": None,
+                "citation": None,
+                "status": "not_checked",
                 "error": error,
                 "suggestion": suggestion,
                 "excerpt": reason,
@@ -186,17 +186,20 @@ def _pack(profile: dict, prompts: list[str], engines: list, checks: list, *, mod
     mentions = sum(1 for c in checks if c.get("mention"))
     citations = sum(1 for c in checks if c.get("citation"))
     errors = [c for c in checks if c.get("status") != "ok"]
-    rows = [[c.get("prompt"), c.get("engine"), "Yes" if c.get("mention") else "No", "Yes" if c.get("citation") else "No", c.get("excerpt") or ""] for c in checks]
+    def est(value):
+        return "Not estimated" if value is None else "Likely" if value else "Unlikely"
+
+    rows = [[c.get("prompt"), c.get("engine"), est(c.get("mention")), est(c.get("citation")), c.get("excerpt") or ""] for c in checks]
     return {
         "summary": note,
-        "columns": ["Prompt", "Engine", "Mentioned", "Cited", "Excerpt"],
+        "columns": ["Prompt", "Engine", "Mention (estimate)", "Citation (estimate)", "Excerpt"],
         "rows": rows,
         "engines": engines,
         "checks": checks,
         "prompts": prompts,
         "kpis": [
-            ["Mentions", str(mentions)],
-            ["Citations", str(citations)],
+            ["Estimated mentions", str(mentions)],
+            ["Estimated citations", str(citations)],
             ["Issues", str(len(errors))],
             ["Engines", str(len(engines))],
         ],
@@ -204,7 +207,8 @@ def _pack(profile: dict, prompts: list[str], engines: list, checks: list, *, mod
         "source": "searchify_operator",
         "seedVersion": LIVE,
         "model": model,
-        "live": True,
+        "live": False,
+        "estimate": True,
         "method": "owned-data-likelihood",
         "profile": {
             "business": profile.get("business") or "",

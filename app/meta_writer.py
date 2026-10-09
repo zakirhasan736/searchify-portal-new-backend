@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 
+from app import page_quality
 from app.openai_client import chat_text, openai_configured
 from app.page_scrape import scrape_page
 
@@ -251,8 +252,11 @@ def write_title_description(
     page: dict | None = None,
     site: dict | None = None,
     taken: list[str] | None = None,
+    kind: str = "",
 ) -> dict:
     scraped = page if page and not page.get("error") and page.get("url") else scrape_page(url)
+    kind = kind or page_quality.page_type(url, ((site or {}).get("page") or {}).get("role") or "", scraped)
+    brand = str(((site or {}).get("business") or {}).get("brand") or profile.get("business") or "")
     headings = scraped.get("headings")
     if isinstance(headings, list):
         headings = " | ".join(headings)
@@ -305,12 +309,36 @@ def write_title_description(
         f"Competitor pages for this page's search. Beat them: be more specific, give a clearer reason to click. "
         f"Do not copy them. Ignore any with a different intent:\n{_rival_block(rivals)}\n"
     )
+    if kind == "case_study":
+        brief += (
+            "\nThis page is a CASE STUDY about work the site owner did for a client. "
+            "The client's name, city and industry belong to the client, not to the site owner. "
+            "Write the listing as a case study by the site owner (for example \"Case study: …\" or \"How we helped …\"). "
+            "Never present the client's location or business as the site owner's.\n"
+        )
     if taken:
         brief += "\nTitles already written for other pages on this site (yours must differ):\n" + "\n".join(f"- {t}" for t in taken[:20]) + "\n"
     current = scraped.get("title") or ""
+    evidence_text = " ".join(
+        str(part) for part in (scraped.get("title"), scraped.get("description"), scraped.get("h1"), headings, scraped.get("text")) if part
+    )
+    places = list(((site or {}).get("business") or {}).get("places") or [])
+
+    def checks(t: str, d: str) -> list[str]:
+        found = _issues(t, d, current, page_bits, taken, rivals)
+        claims = page_quality.validate_claims(t, d, evidence=evidence_text, places=places)
+        for claim in claims["claims"]:
+            if claim["status"] == "contradicted":
+                found.append(f"“{claim['claim']}” contradicts the page, which says {claim.get('page')}. Use the page's figure or drop it.")
+            elif claim["status"] == "unverified" and claim["kind"] in {"number", "promise"}:
+                found.append(f"“{claim['claim']}” is not on this page. Remove it unless the page says it.")
+        if kind == "case_study":
+            found.extend(page_quality.case_study_problems(t, d, scraped, brand))
+        return found[:8]
+
     text, model, role = _ask(brief + "\nWrite the listing for this page only.")
     title, desc, reason = _parse_meta(text)
-    issues = _issues(title, desc, current, page_bits, taken, rivals)
+    issues = checks(title, desc)
     if issues:
         retry_text, retry_model, retry_role = _ask(
             brief
@@ -320,13 +348,17 @@ def write_title_description(
             + "Write a new listing that fixes every check. Keep a real detail from the page copy."
         )
         retry_title, retry_desc, retry_reason = _parse_meta(retry_text)
-        retry_issues = _issues(retry_title, retry_desc, current, page_bits, taken, rivals)
+        retry_issues = checks(retry_title, retry_desc)
         if len(retry_issues) <= len(issues) and retry_title and retry_desc:
             title, desc, reason = retry_title, retry_desc, retry_reason
             text, model, role = retry_text, retry_model, retry_role
     if not reason:
         reason = "Written from this page’s heading, the rest of the site, and the search it can win."
+    validation = page_quality.validate_claims(title, desc, evidence=evidence_text, places=places)
     return {
+        "pageType": kind,
+        "validation": validation,
+        "openIssues": checks(title, desc) if title else ["The writer returned no title."],
         "title": title,
         "metaDescription": desc,
         "reason": reason,

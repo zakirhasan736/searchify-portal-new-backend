@@ -19,15 +19,15 @@ def configured() -> bool:
 def competitor_serp(
     keyword: str,
     *,
-    location_code: int = 2840,
     location_name: str = "",
     language_code: str = "en",
     depth: int = 10,
 ) -> list[dict]:
+    """Google organic results for one search. Without a resolved location there is no request."""
     query = (keyword or "").strip()
-    if not query or not configured():
+    if not query or not location_name or not configured():
         return []
-    where = {"location_name": location_name} if location_name else {"location_code": location_code}
+    where = {"location_name": location_name}
     try:
         with httpx.Client(timeout=25.0) as client:
             response = client.post(

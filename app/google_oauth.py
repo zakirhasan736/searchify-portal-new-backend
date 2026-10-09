@@ -100,8 +100,35 @@ def refresh_access_token(refresh_token: str) -> dict:
             },
         )
     if response.status_code >= 400:
-        raise RuntimeError(f"token refresh failed: {response.text[:400]}")
+        try:
+            error = (response.json() or {}).get("error") or ""
+        except ValueError:
+            error = ""
+        if error in {"invalid_grant", "unauthorized_client", "invalid_client"} or response.status_code in {400, 401}:
+            raise GoogleReauthRequired(error or f"HTTP {response.status_code}")
+        raise RuntimeError(f"token refresh failed: HTTP {response.status_code}")
     return response.json()
+
+
+class GoogleReauthRequired(RuntimeError):
+    """The refresh token was revoked, expired, or the OAuth client changed. The owner must reconnect."""
+
+
+def list_ga4_streams(access_token: str, property_id: str) -> list[str]:
+    """Default URIs of the property's web data streams. Empty if they cannot be read."""
+    url = f"https://analyticsadmin.googleapis.com/v1beta/properties/{property_id}/dataStreams"
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+    except httpx.HTTPError:
+        return []
+    if response.status_code >= 400:
+        return []
+    return [
+        (stream.get("webStreamData") or {}).get("defaultUri") or ""
+        for stream in response.json().get("dataStreams") or []
+        if (stream.get("webStreamData") or {}).get("defaultUri")
+    ]
 
 
 def fetch_userinfo(access_token: str) -> dict:

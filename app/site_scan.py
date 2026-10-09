@@ -12,6 +12,7 @@ Nothing here invents a rank, a volume, or a competitor. An empty source stays em
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -87,6 +88,7 @@ class PageReader(HTMLParser):
         self.text: list[str] = []
         self.links: list[str] = []
         self.description = ""
+        self.og_description = ""
         self.canonical = ""
         self.noindex = False
         self.skip = 0
@@ -106,8 +108,10 @@ class PageReader(HTMLParser):
             self.links.append(attr["href"])
         if tag == "meta":
             name = (attr.get("name") or attr.get("property") or "").lower()
-            if name in {"description", "og:description"} and not self.description:
+            if name == "description" and not self.description:
                 self.description = attr.get("content", "")
+            elif name == "og:description" and not self.og_description:
+                self.og_description = attr.get("content", "")
             if name == "robots" and "noindex" in attr.get("content", "").lower():
                 self.noindex = True
         if tag == "link" and "canonical" in attr.get("rel", "").lower():
@@ -148,29 +152,48 @@ class PageReader(HTMLParser):
             self.text.append(chunk)
 
 
+def page_key(url: str) -> str:
+    """Dedupe key: scheme-less, www-less, no trailing slash."""
+    parts = urlparse(normalize(url))
+    return f"{(parts.netloc or '').removeprefix('www.')}{parts.path.rstrip('/') or '/'}"
+
+
 def read_page(client: httpx.Client, url: str) -> dict:
-    response = _get(client, url)
-    if response is None:
-        return {"url": url, "error": "could not load"}
+    fetched = datetime.utcnow().isoformat(timespec="seconds")
+    try:
+        response = client.get(url, timeout=10.0, follow_redirects=True)
+    except httpx.HTTPError as exc:
+        return {"url": url, "requestedUrl": url, "error": f"could not load ({type(exc).__name__})", "status": None, "fetchedAt": fetched}
+    final = str(response.url)
+    base = {"url": normalize(final), "requestedUrl": url, "status": response.status_code, "fetchedAt": fetched,
+            "redirected": page_key(final) != page_key(url)}
+    if response.status_code >= 400:
+        return {**base, "url": url, "error": f"HTTP {response.status_code}"}
     kind = response.headers.get("content-type", "")
     if "html" not in kind:
-        return {"url": str(response.url), "error": "not html"}
-    reader = PageReader(str(response.url))
+        return {**base, "error": "not html"}
+    reader = PageReader(final)
     try:
         reader.feed(response.text[:600_000])
     except Exception:  # noqa: BLE001
         pass
     text = " ".join(reader.text)
+    title = " ".join(reader.title)[:200]
+    description = reader.description.strip()[:400]
+    canonical = urljoin(final, reader.canonical) if reader.canonical else ""
     return {
-        "url": normalize(str(response.url)),
-        "title": " ".join(reader.title)[:200],
-        "description": reader.description.strip()[:400],
+        **base,
+        "title": title,
+        "description": description,
+        "ogDescription": reader.og_description.strip()[:400],
         "h1": " | ".join(reader.h1)[:240],
         "headings": reader.headings[:14],
         "text": text[:4000],
         "words": len(text.split()),
-        "canonical": urljoin(str(response.url), reader.canonical) if reader.canonical else "",
+        "canonical": canonical,
+        "canonicalElsewhere": bool(canonical) and page_key(canonical) != page_key(final),
         "noindex": reader.noindex,
+        "contentHash": hashlib.sha256(f"{title}\n{description}\n{text}".encode()).hexdigest()[:32],
         "links": reader.links[:400],
         "error": "",
     }
@@ -263,14 +286,16 @@ def crawl(home: str, limit: int = 40) -> dict:
     queue, robots = discover(home, limit)
     queue = sorted(queue, key=_priority)
     pages: list[dict] = []
+    failed: list[dict] = []
     seen: set[str] = set()
+    keys: set[str] = set()
     with httpx.Client(headers={"User-Agent": AGENT}) as client, ThreadPoolExecutor(max_workers=6) as pool:
         rounds = 0
         while queue and len(pages) < limit and rounds < 4:
             rounds += 1
             batch = []
             for url in queue:
-                if url not in seen:
+                if url not in seen and page_key(url) not in keys:
                     seen.add(url)
                     batch.append(url)
                 if len(batch) >= limit - len(pages):
@@ -280,12 +305,16 @@ def crawl(home: str, limit: int = 40) -> dict:
             fresh_links: list[str] = []
             for page in results:
                 if page.get("error"):
+                    if len(failed) < 50:
+                        failed.append({"url": page.get("requestedUrl") or page.get("url"), "error": page["error"], "status": page.get("status")})
                     continue
-                if page["url"] in {p["url"] for p in pages}:
+                key = page_key(page["url"])
+                if key in keys:
                     continue
+                keys.add(key)
                 for href in page.pop("links", []):
                     absolute = normalize(urljoin(page["url"], href.split("#", 1)[0]))
-                    if absolute in seen or not _allowed(absolute, home_host):
+                    if absolute in seen or page_key(absolute) in keys or not _allowed(absolute, home_host):
                         continue
                     if robots is not None and not robots.can_fetch(AGENT, absolute):
                         continue
@@ -294,7 +323,7 @@ def crawl(home: str, limit: int = 40) -> dict:
             queue = sorted(dict.fromkeys([*queue, *fresh_links]), key=_priority)
     for page in pages:
         page.pop("links", None)
-    return {"home": home, "host": home_host, "pages": pages, "error": "" if pages else "No readable pages were found."}
+    return {"home": home, "host": home_host, "pages": pages, "failed": failed, "error": "" if pages else "No readable pages were found."}
 
 
 UNDERSTAND = (
@@ -406,12 +435,19 @@ def research_competitors(
     per_query: int = 4,
     manual: list | str | None = None,
     market: str = "",
+    serp_limit: int | None = None,
+    counter: dict | None = None,
 ) -> dict:
-    """Competitor listings per target search. Only real sources; an empty dict means none were available."""
+    """Competitor listings per target search. Only real sources; an empty dict means none were available.
+    serp_limit caps paid search-result lookups (None = no cap); counter["serp"] receives the number made."""
     from app import dataforseo
-    from app.research import location_for
+    from app.locations import LocationError, resolve
 
-    location_name = location_for(market)[0]
+    try:
+        place = resolve(market)
+        location_name, language = place.country, place.language
+    except LocationError:
+        location_name, language = "", "en"
     out: dict[str, list[dict]] = {}
     named = _manual_rivals(manual, own_host)
     places = named or _places_rivals(places_rows or [], own_host)
@@ -422,8 +458,11 @@ def research_competitors(
     with httpx.Client(headers={"User-Agent": AGENT}) as client, ThreadPoolExecutor(max_workers=6) as pool:
         for target in [t for t in dict.fromkeys(targets) if t][:8]:
             rivals: list[dict] = []
-            if dataforseo.configured():
-                for row in dataforseo.competitor_serp(target, location_name=location_name):
+            made = (counter or {}).get("serp", 0)
+            if dataforseo.configured() and location_name and (serp_limit is None or made < serp_limit):
+                if counter is not None:
+                    counter["serp"] = made + 1
+                for row in dataforseo.competitor_serp(target, location_name=location_name, language_code=language):
                     if host_of(row.get("url") or "") == own_host:
                         continue
                     rivals.append({**row, "source": "Google results"})
@@ -439,7 +478,16 @@ def research_competitors(
     return out
 
 
-def scan_site(home: str, *, brief: dict, profile: dict, places_rows: list | None = None, limit: int = 40) -> dict:
+def scan_site(
+    home: str,
+    *,
+    brief: dict,
+    profile: dict,
+    places_rows: list | None = None,
+    limit: int = 40,
+    serp_limit: int | None = None,
+    counter: dict | None = None,
+) -> dict:
     crawled = crawl(home, limit=limit)
     pages = crawled.get("pages") or []
     understanding = understand(pages, brief, profile)
@@ -455,6 +503,8 @@ def scan_site(home: str, *, brief: dict, profile: dict, places_rows: list | None
         places_rows,
         manual=(brief or {}).get("competitors"),
         market=" ".join(str(v or "") for v in ((brief or {}).get("market"), profile.get("areas"), profile.get("locations"))),
+        serp_limit=serp_limit,
+        counter=counter,
     )
     return {
         "home": crawled.get("home"),
@@ -465,5 +515,6 @@ def scan_site(home: str, *, brief: dict, profile: dict, places_rows: list | None
         "pageMap": page_map,
         "competitors": competitors,
         "brief": brief,
+        "failed": crawled.get("failed") or [],
         "error": crawled.get("error") or "",
     }

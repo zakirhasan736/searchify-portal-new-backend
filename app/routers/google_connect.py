@@ -9,7 +9,9 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import config
+import logging
+
+from app import config, google_match
 from app.database import get_db
 from app import google_ads as gads
 from app import google_oauth as goauth
@@ -17,6 +19,8 @@ from app.models import CmsConnection, FeatureRecord, GoogleConnection, Job, Site
 from app.security import get_current_user
 
 router = APIRouter(prefix="/api/v1", tags=["google"])
+log = logging.getLogger("searchify.google")
+REAUTH = "Google access was revoked or has expired. Reconnect Google to keep syncing."
 
 
 class SelectBody(BaseModel):
@@ -85,10 +89,30 @@ def _connection_payload(row: GoogleConnection | None) -> dict:
             "scopes": [],
             "lastSyncAt": None,
             "lastError": "",
+            "account": {"status": "disconnected", "email": ""},
+            "gsc": {"status": "not_selected", "siteUrl": "", "checkedAt": None},
+            "ga4": {"status": "not_selected", "propertyId": "", "propertyName": "", "checkedAt": None},
         }
     meta = row.meta or {}
+    has_tokens = bool(row.access_token or row.refresh_token)
+    validated = meta.get("validated") or {}
+    account_status = "reauth_required" if row.status == "reauth_required" else ("connected" if has_tokens else "disconnected")
+
+    def property_status(selected: str, key: str) -> str:
+        if account_status != "connected":
+            return account_status if selected else "not_selected"
+        if not selected:
+            return "not_selected"
+        stamp = validated.get(key) or {}
+        return "connected" if stamp.get("value") == selected else "unverified"
+
     return {
-        "connected": bool(row.access_token or row.refresh_token),
+        "account": {"status": account_status, "email": row.google_email or ""},
+        "gsc": {"status": property_status(row.gsc_site_url or "", "gsc"), "siteUrl": row.gsc_site_url or "",
+                "checkedAt": (validated.get("gsc") or {}).get("at")},
+        "ga4": {"status": property_status(row.ga4_property_id or "", "ga4"), "propertyId": row.ga4_property_id or "",
+                "propertyName": row.ga4_property_name or "", "checkedAt": (validated.get("ga4") or {}).get("at")},
+        "connected": has_tokens and account_status == "connected",
         "status": row.status,
         "googleEmail": row.google_email,
         "gscSiteUrl": row.gsc_site_url,
@@ -167,8 +191,11 @@ def _valid_access_token(db: Session, row: GoogleConnection) -> str:
     if row.access_token and row.token_expiry and row.token_expiry > now + timedelta(minutes=2):
         return row.access_token
     if not row.refresh_token:
-        raise HTTPException(status_code=401, detail="Google reconnect required")
-    data = goauth.refresh_access_token(row.refresh_token)
+        _mark_reauth(db, row)
+    try:
+        data = goauth.refresh_access_token(row.refresh_token)
+    except goauth.GoogleReauthRequired:
+        _mark_reauth(db, row)
     row.access_token = data.get("access_token") or row.access_token
     expires_in = int(data.get("expires_in") or 3600)
     row.token_expiry = now + timedelta(seconds=expires_in)
@@ -177,6 +204,36 @@ def _valid_access_token(db: Session, row: GoogleConnection) -> str:
     row.updated_at = now
     db.commit()
     return row.access_token
+
+
+def _mark_reauth(db: Session, row: GoogleConnection):
+    row.status = "reauth_required"
+    row.access_token = ""
+    row.token_expiry = None
+    row.last_error = REAUTH
+    row.updated_at = datetime.utcnow()
+    db.commit()
+    log.warning("google_reauth_required", extra={"user_id": row.customer_id})
+    raise HTTPException(status_code=401, detail={"code": "google_reauth_required", "message": REAUTH})
+
+
+def _stamp_validated(row: GoogleConnection, key: str, value: str) -> None:
+    meta = dict(row.meta or {})
+    validated = dict(meta.get("validated") or {})
+    if value:
+        validated[key] = {"value": value, "at": datetime.utcnow().isoformat(timespec="seconds")}
+    else:
+        validated.pop(key, None)
+    meta["validated"] = validated
+    row.meta = meta
+    flag_modified(row, "meta")
+
+
+def _ga4_with_streams(token: str, properties: list[dict]) -> list[dict]:
+    out = []
+    for prop in properties[:25]:
+        out.append({**prop, "streams": goauth.list_ga4_streams(token, prop["propertyId"])})
+    return out + [{**p, "streams": []} for p in properties[25:]]
 
 
 def _upsert_feature(db: Session, user_id: int, kind: str, title: str, payload: dict, status: str = "stored"):
@@ -293,6 +350,7 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
         row.updated_at = now
         _remember_account(row)
         db.commit()
+        _auto_match_after_connect(db, row)
 
         db.add(
             Job(
@@ -313,8 +371,40 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
     return RedirectResponse(f"{dest}?{q}")
 
 
+def _auto_match_after_connect(db: Session, row: GoogleConnection) -> None:
+    """If the workspace has exactly one website and no property is chosen, pick the property only when the match is unambiguous."""
+    if row.gsc_site_url and row.ga4_property_id:
+        return
+    try:
+        from app import site_profiles
+
+        journey = site_profiles.get_journey(db, row.customer_id) or {}
+        sites = [s for s in (journey.get("state") or {}).get("sites") or [] if s.get("status") == "ready" and (s.get("answers") or {}).get("site")]
+        if len(sites) != 1:
+            return
+        site = sites[0]["answers"]["site"]
+        token = row.access_token
+        if not row.gsc_site_url:
+            found = google_match.match_gsc(site, goauth.list_gsc_sites(token))
+            if found["status"] == "matched":
+                row.gsc_site_url = found["selected"]
+                _stamp_validated(row, "gsc", found["selected"])
+        if not row.ga4_property_id:
+            found = google_match.match_ga4(site, _ga4_with_streams(token, goauth.list_ga4_properties(token)))
+            if found["status"] == "matched":
+                row.ga4_property_id = found["selected"]
+                row.ga4_property_name = found.get("selectedName") or ""
+                _stamp_validated(row, "ga4", found["selected"])
+        _remember_account(row)
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.warning("google_auto_match_failed", extra={"user_id": row.customer_id, "error": type(exc).__name__})
+
+
 @router.get("/oauth/google/sites")
-def google_sites(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def google_sites(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Properties this Google account can read, plus the best match for `site` when one is clear."""
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     if row is None or not (row.access_token or row.refresh_token):
         raise HTTPException(status_code=404, detail="Connect Google first")
@@ -324,10 +414,14 @@ def google_sites(db: Session = Depends(get_db), user: User = Depends(get_current
         ga4 = goauth.list_ga4_properties(token)
     except Exception as exc:  # noqa: BLE001
         row.last_error = str(exc)[:500]
-        row.status = "error"
         db.commit()
-        raise HTTPException(status_code=502, detail=str(exc)[:300]) from exc
-    return {"gscSites": gsc, "ga4Properties": ga4}
+        raise HTTPException(status_code=502, detail=_friendly_google_error(exc)[:300]) from exc
+    out = {"gscSites": gsc, "ga4Properties": ga4, "account": row.google_email or ""}
+    if site:
+        ga4_full = _ga4_with_streams(token, ga4)
+        out["ga4Properties"] = ga4_full
+        out["match"] = {"gsc": google_match.match_gsc(site, gsc), "ga4": google_match.match_ga4(site, ga4_full)}
+    return out
 
 
 def _write_ads_features(
@@ -520,16 +614,37 @@ def google_ads_disconnect(body: SyncBody = SyncBody(), db: Session = Depends(get
 @router.post("/oauth/google/select")
 def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
-    if row is None:
+    if row is None or not (row.access_token or row.refresh_token):
         raise HTTPException(status_code=404, detail="Connect Google first")
-    if body.gsc_site_url is not None:
-        row.gsc_site_url = body.gsc_site_url.strip()
-    if body.ga4_property_id is not None:
-        row.ga4_property_id = body.ga4_property_id.strip()
+    token = _valid_access_token(db, row)
+    gsc_value = body.gsc_site_url.strip() if body.gsc_site_url is not None else None
+    ga4_value = body.ga4_property_id.strip() if body.ga4_property_id is not None else None
+    try:
+        if gsc_value:
+            allowed = {p["siteUrl"]: p for p in goauth.list_gsc_sites(token)}
+            if gsc_value not in allowed or allowed[gsc_value].get("permissionLevel") in google_match.UNUSABLE:
+                raise HTTPException(status_code=422, detail={"code": "gsc_no_access", "message": f"{row.google_email or 'This Google account'} cannot read Search Console data for {gsc_value}."})
+        if ga4_value:
+            props = {p["propertyId"]: p for p in goauth.list_ga4_properties(token)}
+            if ga4_value not in props:
+                raise HTTPException(status_code=422, detail={"code": "ga4_no_access", "message": f"{row.google_email or 'This Google account'} cannot read Analytics property {ga4_value}."})
+            if body.ga4_property_name is None:
+                body.ga4_property_name = props[ga4_value].get("displayName") or ""
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=_friendly_google_error(exc)[:300]) from exc
+    if gsc_value is not None:
+        row.gsc_site_url = gsc_value
+        _stamp_validated(row, "gsc", gsc_value)
+    if ga4_value is not None:
+        row.ga4_property_id = ga4_value
+        _stamp_validated(row, "ga4", ga4_value)
     if body.ga4_property_name is not None:
         row.ga4_property_name = body.ga4_property_name.strip()
     row.updated_at = datetime.utcnow()
     row.status = "connected"
+    row.last_error = ""
     _remember_account(row)
     if body.cms_connection_id:
         cms = db.get(CmsConnection, body.cms_connection_id)
@@ -826,6 +941,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
                 },
             )
             synced["gsc"] = True
+            _stamp_validated(row, "gsc", row.gsc_site_url)
 
         if row.ga4_property_id:
             report = goauth.fetch_ga4_overview(token, row.ga4_property_id)
@@ -1023,6 +1139,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
                 }
             )
             synced["ga4"] = True
+            _stamp_validated(row, "ga4", row.ga4_property_id)
 
         # PageSpeed on connected site (API key) — full PSI report + GSC findings
         speed_url = row.gsc_site_url or ""
