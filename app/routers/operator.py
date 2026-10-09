@@ -548,15 +548,29 @@ def delete_connection(connection_id: int, db: Session = Depends(get_db), user: U
     row = db.get(CmsConnection, connection_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(status_code=404, detail="Connection not found")
-    for change in db.query(SiteChange).filter(SiteChange.cms_connection_id == row.id).all():
+    conn_id = row.id
+    # Detach then delete queue rows so the FK never blocks removing the CMS site.
+    linked = db.query(SiteChange).filter(SiteChange.cms_connection_id == conn_id).all()
+    for change in linked:
+        change.cms_connection_id = None
         db.delete(change)
+    db.flush()
     db.delete(row)
+    db.flush()
     remaining = db.query(CmsConnection).filter(CmsConnection.customer_id == user.id).count()
     if remaining == 0 and not _google_is_connected(db, user.id):
         _clear_user_queue(db, user.id)
-    db.commit()
-    _sync_operator_features(db, user)
-    return {"ok": True}
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.exception("cms_disconnect_failed", extra={"connection_id": conn_id, "user_id": user.id})
+        raise HTTPException(status_code=500, detail=f"Could not disconnect WordPress: {exc}") from exc
+    try:
+        _sync_operator_features(db, user)
+    except Exception:  # noqa: BLE001
+        log.exception("cms_disconnect_feature_sync_failed", extra={"user_id": user.id})
+    return {"ok": True, "disconnectedId": conn_id}
 
 
 @router.post("/workspace/reset")

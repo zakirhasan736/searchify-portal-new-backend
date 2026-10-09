@@ -1766,7 +1766,7 @@ def google_disconnect(db: Session = Depends(get_db), user: User = Depends(get_cu
     feature_rows = db.query(FeatureRecord).filter(FeatureRecord.customer_id == user.id).all()
     removed = 0
     for fr in feature_rows:
-        payload = fr.payload or {}
+        payload = fr.payload if isinstance(fr.payload, dict) else {}
         source = str(payload.get("source") or "")
         seed = str(payload.get("seedVersion") or "")
         if seed == LIVE or source.startswith("google") or source.startswith("places"):
@@ -1778,7 +1778,12 @@ def google_disconnect(db: Session = Depends(get_db), user: User = Depends(get_cu
         db.delete(change)
         queue_cleared += 1
 
-    db.commit()
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.exception("google_disconnect_failed", extra={"user_id": user.id})
+        raise HTTPException(status_code=500, detail=f"Could not disconnect Google: {exc}") from exc
     return {
         "ok": True,
         "connection": _connection_payload(None),
