@@ -415,14 +415,14 @@ UNDERSTAND = (
     "Use only what the pages and the owner's brief say. Do not invent awards, prices, years, reviews, or locations. "
     "Return JSON only, no prose, with this shape:\n"
     '{"business":"one sentence: who they are and what they sell",'
-    '"offers":["main products or services, as the site names them"],'
+    '"offers":["the main services a customer would search for. Not a single case study, not the brand, and not the city by itself"],'
     '"audience":"who buys",'
     '"places":["cities or regions the site serves, only if stated"],'
     '"proof":["concrete facts on the site a listing may use, e.g. same-day service, free quote, 24/7"],'
     '"voice":"how the brand talks, 3-6 words",'
     '"brand":"the brand name as written on the site",'
     '"pages":[{"url":"...","role":"home|service|product|category|location|about|contact|blog|legal|other",'
-    '"target":"the one search this page should win, 2-6 words, in the customer\'s words",'
+    '"target":"the search a customer types for this page, 2-6 words. Homepage: the main service, not the brand and not the city alone. Include a city only when this page is about that place. Do not copy the current title.",'
     '"angle":"what makes this page different from the other pages on the site"}]}'
 )
 

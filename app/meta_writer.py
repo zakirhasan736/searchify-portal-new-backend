@@ -40,7 +40,7 @@ SYSTEM = (
     "Work in this order: (1) read the page topic in the brief and stay on that concept — do not switch to another service from the business brief or from a popular site-wide query; "
     "(2) put the best keyword, in those words, near the front of the title; "
     "(3) add one concrete fact from this page (a place, an offer, a proof) so the listing is specific; "
-    "(4) look at competitor titles only to avoid copying them. Do not change the topic just to sound different. "
+    "(4) meet the hardest competitor on that same search. Match the strength of their keyword. Add one fact only this business can say. Do not copy their title or their claims. "
     "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
     "Every page on the site needs its own topic: never reuse another page's title. "
     "It does not sound like an agency slogan. "
@@ -119,8 +119,8 @@ def _issues(
             issues.append(f"Another page on this site already uses a title like “{other}”. Give this page its own angle.")
             break
     for rival in rivals or []:
-        if rival.get("title") and _overlap(title, rival["title"]) >= 0.6:
-            issues.append("The title is too close to a competitor title. Say what they do not say.")
+        if rival.get("title") and _overlap(title, rival["title"]) >= 0.85:
+            issues.append("This copies a competitor title. Meet them on the same keyword with a fact only this page can say.")
             break
     if len(title) < 42 or len(title) > 60:
         issues.append(f"Title is {len(title)} characters. Rewrite it to 50–60.")
@@ -215,6 +215,262 @@ def best_keyword(queries: list[str], topic: str) -> str:
     if queries:
         return queries[0]
     return topic
+
+
+def _lead_phrase(title: str) -> str:
+    head = str(title or "").split("|")[0].split(" - ")[0]
+    return _clean(head, 80)
+
+
+def _brand_tokens(brand: str, url: str = "") -> set[str]:
+    host = ""
+    match = re.search(r"https?://([^/]+)", url or "", re.I)
+    if match:
+        host = match.group(1).split(".")[0]
+    return _content_tokens(brand) | _content_tokens(host)
+
+
+def brand_only_keyword(keyword: str, brand: str, url: str = "") -> bool:
+    """A search that is only the company name. It is not the homepage keyword."""
+    words = _content_tokens(keyword)
+    brand_words = _brand_tokens(brand, url)
+    return bool(words) and bool(brand_words) and words <= brand_words
+
+
+def coverage_keywords(
+    *,
+    offers: list[str],
+    places: list[str],
+    queries: list[str],
+    brand: str,
+    url: str = "",
+) -> list[str]:
+    """Best keyword first, then alternatives. A city is included only when that search already uses it."""
+    offer_blob = " ".join(str(item) for item in offers if str(item).strip())
+    place_words = set()
+    for place in places:
+        place_words |= _content_tokens(place)
+    ranked: list[tuple[float, str]] = []
+    seen: set[str] = set()
+
+    def add(term: str, bonus: float) -> None:
+        text = " ".join(str(term or "").split())[:80]
+        key = text.lower()
+        if not text or key in seen or brand_only_keyword(text, brand, url):
+            return
+        words = _content_tokens(text)
+        if not words or words <= place_words:
+            return
+        fit = _keyword_fit(text, offer_blob, offer_blob) if offer_blob else 1.0
+        if offer_blob and fit < 0.34 and not (words & _content_tokens(offer_blob)):
+            return
+        seen.add(key)
+        ranked.append((fit + bonus, text))
+
+    for offer in offers:
+        add(str(offer), 2.0)
+    for index, query in enumerate(queries):
+        add(str(query), max(0.0, 1.2 - index * 0.15))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    return [text for _score, text in ranked[:4]]
+
+
+def rival_to_meet(rivals: list[dict], keyword: str, offers: list[str]) -> dict:
+    """The listed competitor this listing has to be strong enough to stand next to."""
+    pool = [rival for rival in rivals or [] if isinstance(rival, dict) and rival.get("title")]
+    named = [rival for rival in pool if "named" in str(rival.get("source") or "").lower()]
+    pool = named or pool
+    target = _content_tokens(keyword) or _content_tokens(" ".join(offers))
+    best, best_score = {}, -1
+    for rival in pool:
+        score = len(_content_tokens(rival.get("title") or "") & target)
+        if named:
+            score += 2
+        if score > best_score:
+            best, best_score = rival, score
+    return best
+
+
+def meets_competitor(title: str, rival: dict, keyword: str) -> bool:
+    """True when the title can stand on the same search without copying the competitor."""
+    if not rival or not rival.get("title"):
+        return True
+    if _overlap(title, rival["title"]) >= 0.85:
+        return False
+    need = _content_tokens(keyword)
+    if len(need) >= 2 and len(_content_tokens(title) & need) < max(1, (len(need) + 1) // 2):
+        return False
+    return True
+
+
+def conceptual_rivals(rivals: list[dict], offers: list[str]) -> list[dict]:
+    """Keep competitors that sell the same kind of thing. Drop unrelated search results."""
+    offer_blob = " ".join(str(item) for item in offers if str(item).strip())
+    if not offer_blob:
+        return list(rivals or [])[:6]
+    kept = []
+    for rival in rivals or []:
+        if not isinstance(rival, dict):
+            continue
+        text = " ".join(str(rival.get(key) or "") for key in ("title", "h1", "description"))
+        words = _content_tokens(text)
+        shared = words & _content_tokens(offer_blob)
+        if shared or _keyword_fit(text, offer_blob, offer_blob) >= 0.34:
+            kept.append(rival)
+    return kept[:6]
+
+
+def drops_homepage_promise(title: str, current: str, brand: str) -> bool:
+    """True when a draft drops the offer and place the current title already states."""
+    promise = _content_tokens(_lead_phrase(current)) - _brand_tokens(brand)
+    if len(promise) < 2:
+        return False
+    lost = promise - _content_tokens(title)
+    return len(lost) >= 2
+
+
+def _named_services(description: str) -> list[str]:
+    text = description or ""
+    match = re.search(r"\bin\b(.+)$", text, re.I)
+    chunk = match.group(1) if match else text
+    services = []
+    for part in re.split(r",|\band\b", chunk):
+        label = _clean(re.sub(r"[.:;].*$", "", part), 32)
+        words = _content_tokens(label)
+        if not words or words <= {"selected", "work", "explore", "review", "including", "the", "cases"}:
+            continue
+        if label.lower() not in {item.lower() for item in services}:
+            services.append(label)
+    return services[:6]
+
+
+def _proof_name(text: str, headings: str, brand: str, already: str) -> str:
+    blob = f"{text or ''} {headings or ''}"
+    used = _content_tokens(already) | _content_tokens(brand) | {"seo", "web", "ads", "google", "home", "selected", "client", "work"}
+    for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b", blob):
+        name = match.group(1)
+        if _content_tokens(name) & used:
+            continue
+        return name
+    for match in re.finditer(r"\b([A-Z][A-Z0-9]{3,})\b", blob):
+        name = match.group(1)
+        if name.lower() in used:
+            continue
+        return name
+    return ""
+
+
+def _label_case(label: str) -> str:
+    words = []
+    for word in label.split():
+        if word.isupper() or sum(1 for char in word if char.isupper()) >= 2:
+            words.append(word)
+        else:
+            words.append(word[:1].upper() + word[1:])
+    return " ".join(words)
+
+
+def _title_tail(services: list[str], lead: str) -> str:
+    room = 60 - len(lead) - 3
+    if room < 8:
+        return ""
+    chosen = []
+    for service in services:
+        if _content_tokens(service) <= _content_tokens(lead):
+            continue
+        trial = " & ".join([*chosen, _label_case(service)])
+        if len(trial) <= room and len(chosen) < 2:
+            chosen.append(_label_case(service))
+    return " & ".join(chosen)
+
+
+def _audience(description: str, lead: str) -> str:
+    if re.search(r"business owners", description or "", re.I):
+        place = (lead.split() or [""])[0]
+        return f"{place} business owners".strip()
+    return "Customers"
+
+
+def stronger_listing(
+    *,
+    keyword: str,
+    alternatives: list[str],
+    offers: list[str],
+    places: list[str],
+    current_title: str,
+    current_desc: str,
+    headings: str,
+    text: str,
+    brand: str,
+) -> tuple[str, str, str]:
+    """A listing led by the business keyword. The current title is not copied."""
+    lead = _label_case((keyword or (offers[0] if offers else "") or _lead_phrase(current_title)).strip())
+    extras = []
+    for item in [*alternatives[1:], *offers]:
+        label = " ".join(str(item).split())
+        if not label or _content_tokens(label) <= _content_tokens(lead):
+            continue
+        if label.lower() not in {row.lower() for row in extras}:
+            extras.append(label)
+    tail = _title_tail(extras, lead)
+    title = _clean(f"{lead} | {tail}" if tail else lead, 60)
+    proof = _proof_name(text, headings, brand, f"{current_title} {current_desc} {lead}")
+    cover = extras[:3]
+    if cover:
+        listed = ", ".join(cover[:-1]) + (f" and {cover[-1]}" if len(cover) > 1 else cover[0])
+        if len(cover) == 1:
+            listed = cover[0]
+    else:
+        listed = lead
+    place_in_keyword = any(str(place).lower() in lead.lower() for place in places if str(place).strip())
+    audience = f"{places[0]} buyers" if place_in_keyword and places else "Buyers"
+    sentence = f"{audience} can compare {listed}"
+    if proof:
+        sentence += f", including {proof}."
+    else:
+        sentence += "."
+    sentence += " See the work."
+    desc = _clean(sentence, 155)
+    others = ", ".join(extras[:3]) or "the same offer"
+    reason = f"The business concept chose “{lead}” ahead of the current title. The description also covers {others}."
+    return title, desc, reason
+
+
+def listing_is_stronger(
+    title: str,
+    desc: str,
+    current_title: str,
+    current_desc: str,
+    brand: str,
+    *,
+    keyword: str = "",
+    places: list[str] | None = None,
+    offers: list[str] | None = None,
+    rival: dict | None = None,
+) -> bool:
+    """True when the draft leads with the business keyword and is not a copy of the current title."""
+    _ = brand
+    if not (title and desc):
+        return False
+    if (current_title or "").strip() and title.strip().lower() == current_title.strip().lower() and desc.strip().lower() == (current_desc or "").strip().lower():
+        return False
+    concept = " ".join(str(item) for item in (offers or []) if str(item).strip()) or keyword
+    concept_words = _content_tokens(concept)
+    title_words = _content_tokens(title)
+    if concept_words and not (title_words & concept_words):
+        return False
+    keyword_words = _content_tokens(keyword)
+    if len(keyword_words) >= 2 and len(title_words & keyword_words) < max(1, (len(keyword_words) + 1) // 2):
+        return False
+    for place in places or []:
+        name = str(place or "").strip()
+        if not name or name.lower() in (keyword or "").lower():
+            continue
+        if title.split("|")[0].strip().lower().startswith(name.lower()):
+            return False
+    if rival and not meets_competitor(title, rival, keyword):
+        return False
+    return True
 
 
 def topic_issues(title: str, desc: str, topic: str, keyword: str) -> list[str]:
@@ -383,7 +639,24 @@ def write_title_description(
     else:
         matched = matching_queries([*extra_terms, *queries], topic, page_only)
         keyword = best_keyword(matched, topic)
-    query_block = "\n".join(f"- {q}" for q in matched) or "(No Search Console query matches this page. Use the page topic as the keyword.)"
+    business = ((site or {}).get("business") or {})
+    offers = [str(item).strip() for item in (business.get("offers") or []) if str(item).strip()]
+    if not offers and profile.get("services"):
+        offers = [part.strip() for part in str(profile.get("services")).split(",") if part.strip()]
+    places = [str(item).strip() for item in (business.get("places") or []) if str(item).strip()]
+    if not places and (profile.get("areas") or profile.get("locations")):
+        places = [part.strip() for part in str(profile.get("areas") or profile.get("locations")).split(",") if part.strip()]
+    options = coverage_keywords(offers=offers, places=places, queries=[*matched, *queries], brand=brand, url=page_url)
+    if options:
+        keyword = options[0]
+        place_words = set()
+        for place in places:
+            place_words |= _content_tokens(place)
+        if not topic or _content_tokens(topic) <= place_words or brand_only_keyword(topic, brand, page_url):
+            topic = offers[0] if offers else keyword
+    rivals = conceptual_rivals(rivals, offers)
+    meet = rival_to_meet(rivals, keyword, offers)
+    query_block = "\n".join(f"- {q}" for q in options or matched) or "(No Search Console query matches this business yet. Use the business offer as the keyword.)"
     schema_types = ", ".join(scraped.get("schemaTypes") or []) or "(none found)"
     current_listing = (
         f"Current meta title: {scraped.get('title') or '(none)'}\n"
@@ -430,22 +703,31 @@ def write_title_description(
         f"Voice: {profile.get('voice') or 'specific and concrete'}\n"
         f"Only claim what is on the page or the site. Allowed notes: {profile.get('claims') or 'visible page facts only'}\n"
         f"Do not say: {profile.get('restrictions') or profile.get('rules') or 'invented awards, prices, or results'}\n\n"
-        f"What the whole site says:\n{_site_block(site)}\n\n"
+        f"1. BUSINESS CONCEPT. Decide from this before you look at the current title:\n{_site_block(site)}\n"
+        f"PAGE TOPIC inside that business: {topic or '(use the main offer)'}\n"
+        f"2. KEYWORD COVERAGE. Best keyword first. Use the first one near the front of the title. "
+        f"Use a different one in the description so the listing covers more than one search. "
+        f"A city leads the title only when the best keyword itself contains that city:\n{query_block}\n"
+        f"BEST KEYWORD: {keyword or topic or '(use the business offer)'}\n\n"
+        f"3. COMPETITOR TO MEET. This is the hard competitor. The title must be strong enough to stand on the same search. Use the best keyword, then a fact only this business can say. Do not copy their title:\n{meet.get('title') or '(none listed)'}\n"
+        f"Other competitors that sell the same kind of service:\n{_rival_block(rivals)}\n\n"
+        f"4. SEARCH CONSOLE AND RESEARCH, already matched to this business:\n{research_lines(research, page_url, topic)}\n"
+        f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} position={gsc.get('position')}\n\n"
+        f"5. CURRENT LISTING. This is what is live. Beat it. Do not copy it, and do not start with its city unless the best keyword contains that city:\n{current_listing}\n"
         f"Page: {scraped.get('url') or url}\n"
-        f"PAGE TOPIC (the concept — the title and description must be about this, not another service): {topic or '(use the page heading)'}\n"
-        f"BEST KEYWORD (use these words near the front of the title): {keyword or topic or '(use the page topic)'}\n"
-        f"What this page already publishes:\n{current_listing}\n"
-        f"Stored Searchify SEO research for this business and this page:\n{research_lines(research, page_url, topic)}\n"
         f"H1: {scraped.get('h1') or '(none)'}\n"
         f"Section headings: {headings or '(none)'}\n"
         f"Page copy:\n{(scraped.get('text') or scraped.get('error') or '(could not read the page)')[:3200]}\n"
         f"{short_note}\n"
-        f"Search Console queries that match THIS page. Do not write for a query that was left out:\n{query_block}\n"
-        f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} position={gsc.get('position')}\n\n"
         f"Analytics for the property, last stored window. Use a figure only if it is written here:\n{_analytics_block(analytics)}\n\n"
-        f"{specificity_instruction(specificity)}\n\n"
-        f"Competitor pages. Do not copy their titles, and do not change this page's topic to sound different from them:\n{_rival_block(rivals)}\n"
+        f"{specificity_instruction(specificity)}\n"
     )
+    if kind == "home":
+        brief += (
+            "\nThis is the HOMEPAGE. The business concept chooses the keyword, not the current title. "
+            "Lead with the best keyword. Put one alternative keyword in the description. "
+            "Start with a city only when that best keyword contains the city.\n"
+        )
     if kind == "case_study":
         brief += (
             "\nThis page is a CASE STUDY about work the site owner did for a client. "
@@ -459,7 +741,6 @@ def write_title_description(
     evidence_text = " ".join(
         str(part) for part in (scraped.get("title"), scraped.get("description"), scraped.get("h1"), headings, scraped.get("text")) if part
     )
-    places = list(((site or {}).get("business") or {}).get("places") or [])
 
     def checks(t: str, d: str) -> list[str]:
         found = _issues(t, d, current, page_bits, taken, rivals)
@@ -472,6 +753,17 @@ def write_title_description(
                 found.append(f"“{claim['claim']}” is not on this page. Remove it unless the page says it.")
         if kind == "case_study":
             found.extend(page_quality.case_study_problems(t, d, scraped, brand))
+        if current.strip() and offers and not (_content_tokens(t) & _content_tokens(" ".join(offers))):
+            found.append("The title left the business concept. Use the best keyword from the offers, not the current title.")
+        for place in places:
+            name = str(place or "").strip()
+            if name and name.lower() not in (keyword or "").lower() and t.split("|")[0].strip().lower().startswith(name.lower()):
+                found.append(f"Do not start the title with {name}. The best keyword does not lead with that city.")
+                break
+        if meet.get("title") and not meets_competitor(t, meet, keyword):
+            found.insert(0, (
+                f"The title does not meet “{meet.get('title')}”. Put “{keyword}” near the front and add a fact only this page can say."
+            ))
         return found[:8]
 
     text, model, role = _ask(brief + "\nWrite the listing for this page only.")
@@ -490,8 +782,27 @@ def write_title_description(
         if len(retry_issues) <= len(issues) and retry_title and retry_desc:
             title, desc, reason = retry_title, retry_desc, retry_reason
             text, model, role = retry_text, retry_model, retry_role
+    current_desc = str(scraped.get("description") or "")
+    if current.strip() and not listing_is_stronger(
+        title, desc, current, current_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
+    ):
+        title, desc, reason = stronger_listing(
+            keyword=keyword,
+            alternatives=options,
+            offers=offers,
+            places=places,
+            current_title=current,
+            current_desc=current_desc,
+            headings=str(headings or ""),
+            text=str(scraped.get("text") or ""),
+            brand=brand,
+        )
     if not reason:
-        reason = "Written from this page’s heading, the rest of the site, and the search it can win."
+        reason = "Written from the business concept, the best keyword, and the competitor this page has to meet."
+    if meet.get("title") and keyword:
+        meeting = f"Written to meet {meet['title'][:90]} on “{keyword}”."
+        if meeting.lower() not in reason.lower():
+            reason = f"{meeting} {reason}".strip()
     validation = page_quality.validate_claims(title, desc, evidence=evidence_text, places=places)
     from app.cms_connectors import build_webpage_json_ld
     from app.page_scrape import suggest_images
