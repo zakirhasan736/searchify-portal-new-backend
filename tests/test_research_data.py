@@ -107,7 +107,8 @@ def test_backlinks_stored_only_never_calls_dataforseo(offline, monkeypatch):
     monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("stored_only must not call Searchify SEO"))
     monkeypatch.setattr(research, "_record", lambda *a, **k: None)
     out = research.backlinks(None, FakeUser(), site="https://example.com", stored_only=True)
-    assert out == {"host": "example.com", "state": "none", "cached": True}
+    assert out["host"] == "example.com" and out["state"] == "none" and out["cached"] is True
+    assert out["concepts"] == []
 
     class Row:
         payload = {"host": "example.com", "summary": {"referringDomains": 42}, "fetchedAt": "2026-10-01T00:00:00"}
@@ -162,3 +163,39 @@ def test_audit_report_surfaces_score_and_critical_from_empty_titles(offline, mon
     assert keys["broken_links"]["severity"] == "Critical"
     assert keys["sitemap"]["severity"] == "Warning"
     assert report["criticalCount"] >= 2
+
+
+def test_audit_report_reads_schema_faq_and_video_from_the_page(offline, monkeypatch):
+    summary = {
+        "page_metrics": {"onpage_score": 70, "checks": {}},
+        "crawl_status": {"pages_crawled": 1, "max_crawl_pages": 10},
+        "domain_info": {"name": "acme.ca", "checks": {"ssl": True, "sitemap": True, "robots_txt": True, "test_https_redirect": True}},
+    }
+
+    def fake_call(method, path, payload=None, timeout=60):
+        if path.endswith("/on_page/pages"):
+            return [{"items": [{
+                "resource_type": "html",
+                "url": "https://acme.ca/watch",
+                "status_code": 200,
+                "checks": {"has_micromarkup": False, "no_image_alt": True, "low_readability_rate": True},
+                "meta": {
+                    "title": "Watch the webinar",
+                    "description": "A short video.",
+                    "social_media_tags": {},
+                    "htags": {"h2": ["What is included?", "How long is the video?"]},
+                },
+            }]}], 0.01
+        if "links" in path:
+            return [{"items": []}], 0.01
+        return [{}], 0.0
+
+    monkeypatch.setattr(research, "_call", fake_call)
+    report = research._audit_report("task-2", summary)
+    keys = {issue["key"]: issue for issue in report["issues"]}
+    assert keys["missing_json_ld"]["area"] == "Schema"
+    assert keys["faq_without_schema"]["area"] == "FAQ"
+    assert keys["video_without_details"]["area"] == "Video"
+    assert keys["no_image_alt"]["area"] == "Images"
+    assert keys["low_readability_rate"]["area"] == "Paragraphs"
+    assert keys["missing_open_graph"]["steps"]

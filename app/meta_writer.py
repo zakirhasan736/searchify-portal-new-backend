@@ -35,29 +35,32 @@ FILLER = (
 )
 
 SYSTEM = (
-    "You are a senior SEO copywriter. You write the Google title and meta description for one specific page "
-    "after reading the whole website, the owner's brief, and the competitor listings that rank for the same search. "
-    "Work in this order before you write: (1) name the one search this page should win; "
-    "(2) note what the competitor titles all say, so you can say something they do not; "
-    "(3) pick the strongest proof on this page or the site (a real fact such as same-day, free quote, a named area, a product range); "
-    "(4) write a listing a searcher would click over the competitors. "
-    "A strong listing puts the target search near the front, names the real offer and the place or audience, "
-    "and gives one concrete reason to click. "
-    "Every page on the site needs a different title: never reuse the angle of another page on the same site. "
+    "You are a senior SEO copywriter. You write the Google title and meta description for one specific page. "
+    "The page topic is the concept. The best keyword is the search this page can honestly win. "
+    "Work in this order: (1) read the page topic in the brief and stay on that concept — do not switch to another service from the business brief or from a popular site-wide query; "
+    "(2) put the best keyword, in those words, near the front of the title; "
+    "(3) add one concrete fact from this page (a place, an offer, a proof) so the listing is specific; "
+    "(4) look at competitor titles only to avoid copying them. Do not change the topic just to sound different. "
+    "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
+    "Every page on the site needs its own topic: never reuse another page's title. "
     "It does not sound like an agency slogan. "
     "Do not invent reviews, years in business, prices, awards, or certifications. "
     "Do not copy a competitor title. "
     "Do not use filler such as welcome, trusted, discover, unlock, elevate, seamless, leading, or one-stop. "
-    "Title: 50–60 characters, the offer first, the brand only at the end if it still fits. "
-    "Description: 140–155 characters. It must not repeat the title. Say who it is for, one fact from the page, and the next step in plain language. "
-    "If the page is not about the first Search Console query, use the query this page can honestly match. "
-    "Search Console and Analytics are evidence for why the listing should change. "
+    "Title: 50–60 characters. Keyword and topic first. Brand only at the end if it still fits. "
+    "Description: 140–155 characters. It must not repeat the title word for word. "
+    "Say who the page is for, the same topic in a full sentence, one fact from the page, and a plain next step. "
+    "The same title and description are the Open Graph title, the Open Graph description, and the WebPage schema name and description. "
+    "Read the current title, meta description, Open Graph, and JSON-LD. Stay on that page's concept. "
+    "A one-word H1 such as Home is not the topic — use the schema name, the Open Graph title, or the real heading. "
+    "Search Console, Analytics, and the stored Searchify SEO keywords, competitors, AI visibility, and backlinks explain which search this page can win. "
+    "Do not invent search volume, positions, or mentions that are not in the brief. "
     "Do not put click counts, session counts, or bounce rates inside the title or description. "
     "Return exactly four lines:\n"
     "TITLE: ...\n"
     "DESCRIPTION: ...\n"
-    "TARGET: the search this listing is written to win\n"
-    "REASON: one sentence: the page detail you used and how it beats the competitor listings."
+    "TARGET: the best keyword this listing is written to win\n"
+    "REASON: one sentence naming the page topic and the keyword you used."
 )
 
 
@@ -127,8 +130,8 @@ def _issues(
     for phrase in FILLER:
         if phrase in blob:
             issues.append(f"Remove the filler phrase “{phrase.strip()}”.")
-    if current_title and _overlap(title, current_title) >= 0.72:
-        issues.append("The title is too close to the current title. Change the angle, not just a word.")
+    if current_title and _overlap(title, current_title) >= 0.9:
+        issues.append("The title is the same as the current title. Keep the topic, and make the keyword clearer.")
     if title and desc and _overlap(title, desc) >= 0.7:
         issues.append("The description repeats the title. Add a fact and a next step instead.")
     page_words = _tokens(page_bits)
@@ -138,6 +141,96 @@ def _issues(
     if title.lower().startswith(("home", "welcome", "untitled")):
         issues.append("Do not start the title with Home or Welcome.")
     return issues[:6]
+
+
+_TOPIC_STOP = {
+    "the", "and", "for", "with", "your", "from", "this", "that", "page", "home",
+    "our", "you", "are", "was", "has", "have", "its", "into", "about", "www",
+}
+
+
+def _content_tokens(value: str) -> set[str]:
+    return {part for part in _tokens(value) if part not in _TOPIC_STOP}
+
+
+_WEAK_TOPIC = {"home", "welcome", "untitled", "homepage", "index"}
+
+
+def _meaningful_topic(value: str) -> str:
+    text = _clean(str(value or "").split("|")[0], 80)
+    words = _content_tokens(text)
+    if not words or words <= _WEAK_TOPIC:
+        return ""
+    return text
+
+
+def page_topic(scraped: dict | None) -> str:
+    """The concept of this page. A bare H1 such as Home is skipped in favour of schema, Open Graph, or the title."""
+    data = scraped or {}
+    headings = data.get("headings")
+    first_heading = ""
+    if isinstance(headings, list) and headings:
+        first_heading = str(headings[0])
+    elif isinstance(headings, str):
+        first_heading = headings
+    for candidate in (data.get("h1"), data.get("schemaName"), data.get("ogTitle"), first_heading, data.get("title")):
+        found = _meaningful_topic(str(candidate or ""))
+        if found:
+            return found
+    return _clean(str(data.get("title") or data.get("h1") or ""), 80)
+
+
+def _keyword_fit(query: str, topic: str, page_bits: str) -> float:
+    words = _content_tokens(query)
+    if not words:
+        return 0.0
+    topic_words = _content_tokens(topic)
+    page_words = _content_tokens(page_bits)
+    topic_hit = len(words & topic_words) / len(words) if topic_words else 0.0
+    page_hit = len(words & page_words) / len(words) if page_words else 0.0
+    return topic_hit * 2 + page_hit
+
+
+def matching_queries(queries: list[str], topic: str, page_bits: str) -> list[str]:
+    """Keep Search Console queries that belong to this page. Drop site-wide queries about a different topic."""
+    scored: list[tuple[float, str]] = []
+    topic_words = _content_tokens(topic)
+    for query in queries:
+        text = str(query).strip()
+        score = _keyword_fit(text, topic, page_bits)
+        shared = _content_tokens(text) & topic_words
+        if score >= 0.5 or (shared and len(_content_tokens(text)) <= 5):
+            scored.append((score, text))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    kept: list[str] = []
+    for _score, text in scored:
+        if text.lower() not in {item.lower() for item in kept}:
+            kept.append(text)
+        if len(kept) >= 5:
+            break
+    return kept
+
+
+def best_keyword(queries: list[str], topic: str) -> str:
+    if queries:
+        return queries[0]
+    return topic
+
+
+def topic_issues(title: str, desc: str, topic: str, keyword: str) -> list[str]:
+    """Reject a listing that left the page concept or dropped the keyword."""
+    issues = []
+    title_words = _content_tokens(title)
+    topic_words = _content_tokens(topic)
+    if topic_words and len(title_words & topic_words) < min(2, len(topic_words)):
+        issues.append(f"The title left the page topic “{topic}”. The concept of this page must stay in the title.")
+    keyword_words = _content_tokens(keyword)
+    if len(keyword_words) >= 2 and len(title_words & keyword_words) < max(1, (len(keyword_words) + 1) // 2):
+        issues.append(f"The title misses the keyword “{keyword}”. Use those words near the front.")
+    desc_words = _content_tokens(desc)
+    if topic_words and desc_words and not (desc_words & topic_words):
+        issues.append(f"The description is about a different topic than “{topic}”.")
+    return issues
 
 
 def specificity_instruction(level: str) -> str:
@@ -253,6 +346,7 @@ def write_title_description(
     site: dict | None = None,
     taken: list[str] | None = None,
     kind: str = "",
+    research: dict | None = None,
 ) -> dict:
     scraped = page if page and not page.get("error") and page.get("url") else scrape_page(url)
     kind = kind or page_quality.page_type(url, ((site or {}).get("page") or {}).get("role") or "", scraped)
@@ -263,13 +357,48 @@ def write_title_description(
     gsc = gsc or {}
     queries = [q for q in (queries or []) if str(q).strip()][:8]
     rivals = competitors or []
-    query_block = "\n".join(f"- {q}" for q in queries) or "(No Search Console queries yet.)"
-    page_bits = " ".join(
-        part for part in (scraped.get("h1"), headings, scraped.get("title"), scraped.get("text")) if part
+    page_only = " ".join(
+        part for part in (
+            scraped.get("h1"), headings, scraped.get("title"), scraped.get("description"),
+            scraped.get("ogTitle"), scraped.get("ogDescription"), scraped.get("schemaName"),
+            scraped.get("schemaDescription"), scraped.get("text"),
+        ) if part
     )
+    page_bits = page_only
     if site and site.get("business"):
         business = site["business"]
         page_bits += " " + " ".join(map(str, [*(business.get("offers") or []), *(business.get("places") or [])]))
+    topic = page_topic(scraped)
+    from app.listing_research import keyword_candidates, ranked_on_url, research_lines
+
+    page_url = scraped.get("url") or url
+    ranked_rows = ((research or {}).get("keywords") or {}).get("ranked") or []
+    on_page = ranked_on_url(ranked_rows, page_url)
+    extra_terms = keyword_candidates(research, page_url, topic)
+    if on_page:
+        keyword = str(on_page[0].get("keyword") or "").strip() or topic
+        matched = matching_queries([keyword, *extra_terms, *queries], topic, page_only)
+        if keyword.lower() not in {item.lower() for item in matched}:
+            matched = [keyword, *matched][:5]
+    else:
+        matched = matching_queries([*extra_terms, *queries], topic, page_only)
+        keyword = best_keyword(matched, topic)
+    query_block = "\n".join(f"- {q}" for q in matched) or "(No Search Console query matches this page. Use the page topic as the keyword.)"
+    schema_types = ", ".join(scraped.get("schemaTypes") or []) or "(none found)"
+    current_listing = (
+        f"Current meta title: {scraped.get('title') or '(none)'}\n"
+        f"Current meta description: {scraped.get('description') or '(none)'}\n"
+        f"Current Open Graph title: {scraped.get('ogTitle') or '(none)'}\n"
+        f"Current Open Graph description: {scraped.get('ogDescription') or '(none)'}\n"
+        f"Current JSON-LD type: {schema_types}\n"
+        f"Current JSON-LD name: {scraped.get('schemaName') or '(none)'}\n"
+        f"Current JSON-LD description: {scraped.get('schemaDescription') or '(none)'}\n"
+        f"Canonical: {scraped.get('canonical') or '(same as this page, or not set)'}\n"
+        f"Navigation labels: {', '.join(scraped.get('nav') or []) or '(none read)'}\n"
+        f"FAQ questions on the page: {', '.join(scraped.get('faqs') or []) or '(none)'}\n"
+        f"Videos on the page: {', '.join(scraped.get('videos') or []) or '(none)'}\n"
+        f"Reviews in schema: {scraped.get('reviewRating') or '(no rating)'} from {scraped.get('reviewCount') or '(no count)'} reviews"
+    )
 
     empty = {
         "title": _clean(scraped.get("title") or "", 60),
@@ -287,6 +416,12 @@ def write_title_description(
     if not openai_configured():
         return empty
 
+    short_note = ""
+    if len(str(scraped.get("text") or "").split()) < 120:
+        short_note = (
+            "The body copy on this page is short. Write from the whole-site understanding, this page's title, heading, Open Graph, and schema. "
+            "Do not invent a service that is not in the site offers.\n"
+        )
     brief = (
         f"Business: {profile.get('business') or ''}\n"
         f"Services: {profile.get('services') or ''}\n"
@@ -297,17 +432,19 @@ def write_title_description(
         f"Do not say: {profile.get('restrictions') or profile.get('rules') or 'invented awards, prices, or results'}\n\n"
         f"What the whole site says:\n{_site_block(site)}\n\n"
         f"Page: {scraped.get('url') or url}\n"
-        f"Current title: {scraped.get('title') or '(none)'}\n"
-        f"Current description: {scraped.get('description') or '(none)'}\n"
+        f"PAGE TOPIC (the concept — the title and description must be about this, not another service): {topic or '(use the page heading)'}\n"
+        f"BEST KEYWORD (use these words near the front of the title): {keyword or topic or '(use the page topic)'}\n"
+        f"What this page already publishes:\n{current_listing}\n"
+        f"Stored Searchify SEO research for this business and this page:\n{research_lines(research, page_url, topic)}\n"
         f"H1: {scraped.get('h1') or '(none)'}\n"
         f"Section headings: {headings or '(none)'}\n"
-        f"Page copy:\n{(scraped.get('text') or scraped.get('error') or '(could not read the page)')[:3200]}\n\n"
-        f"Search Console queries for the site. Pick the one this page can honestly match:\n{query_block}\n"
+        f"Page copy:\n{(scraped.get('text') or scraped.get('error') or '(could not read the page)')[:3200]}\n"
+        f"{short_note}\n"
+        f"Search Console queries that match THIS page. Do not write for a query that was left out:\n{query_block}\n"
         f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} position={gsc.get('position')}\n\n"
         f"Analytics for the property, last stored window. Use a figure only if it is written here:\n{_analytics_block(analytics)}\n\n"
         f"{specificity_instruction(specificity)}\n\n"
-        f"Competitor pages for this page's search. Beat them: be more specific, give a clearer reason to click. "
-        f"Do not copy them. Ignore any with a different intent:\n{_rival_block(rivals)}\n"
+        f"Competitor pages. Do not copy their titles, and do not change this page's topic to sound different from them:\n{_rival_block(rivals)}\n"
     )
     if kind == "case_study":
         brief += (
@@ -326,6 +463,7 @@ def write_title_description(
 
     def checks(t: str, d: str) -> list[str]:
         found = _issues(t, d, current, page_bits, taken, rivals)
+        found.extend(topic_issues(t, d, topic, keyword))
         claims = page_quality.validate_claims(t, d, evidence=evidence_text, places=places)
         for claim in claims["claims"]:
             if claim["status"] == "contradicted":
@@ -345,7 +483,7 @@ def write_title_description(
             + "\nThe first draft failed these checks:\n- "
             + "\n- ".join(issues)
             + f"\n\nRejected title: {title or '(empty)'}\nRejected description: {desc or '(empty)'}\n"
-            + "Write a new listing that fixes every check. Keep a real detail from the page copy."
+            + "Write a new listing that fixes every check. Keep the page topic and put the best keyword near the front of the title."
         )
         retry_title, retry_desc, retry_reason = _parse_meta(retry_text)
         retry_issues = checks(retry_title, retry_desc)
@@ -355,14 +493,38 @@ def write_title_description(
     if not reason:
         reason = "Written from this page’s heading, the rest of the site, and the search it can win."
     validation = page_quality.validate_claims(title, desc, evidence=evidence_text, places=places)
+    from app.cms_connectors import build_webpage_json_ld
+    from app.page_scrape import suggest_images
+
+    images = suggest_images(scraped.get("images"), topic, page_url)
+    share = str(scraped.get("ogImage") or "").strip() or next((row["src"] for row in images if row.get("src")), "")
+    package = build_webpage_json_ld(
+        meta_title=title,
+        meta_description=desc,
+        page_url=page_url,
+        site_name=brand,
+    ) if title or desc else {}
+    if share and package:
+        package["image"] = share
     return {
         "pageType": kind,
         "validation": validation,
         "openIssues": checks(title, desc) if title else ["The writer returned no title."],
         "title": title,
         "metaDescription": desc,
+        "openGraphTitle": title,
+        "openGraphDescription": desc,
+        "shareImage": share,
+        "images": images,
+        "canonical": scraped.get("canonical") or "",
+        "nav": scraped.get("nav") or [],
+        "faqs": scraped.get("faqs") or [],
+        "videos": scraped.get("videos") or [],
+        "reviewRating": scraped.get("reviewRating") or "",
+        "reviewCount": scraped.get("reviewCount") or "",
+        "jsonLd": package,
         "reason": reason,
-        "target": _parse_target(text) or ((site or {}).get("page") or {}).get("target") or "",
+        "target": _parse_target(text) or keyword or ((site or {}).get("page") or {}).get("target") or "",
         "model": model,
         "role": role,
         "draftBody": text,

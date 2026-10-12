@@ -50,7 +50,15 @@ def content_status(page: dict | None) -> tuple[str, str]:
     if page.get("canonicalElsewhere"):
         return "non_canonical", f"The page's canonical points to {page.get('canonical')}, so Google lists that URL instead."
     words = int(page.get("words") or 0)
+    has_listing = bool(
+        str(page.get("title") or "").strip()
+        or str(page.get("h1") or "").strip()
+        or str(page.get("schemaName") or "").strip()
+        or str(page.get("ogTitle") or "").strip()
+    )
     if words < THIN_WORDS:
+        if has_listing and words >= 8:
+            return "ok", ""
         return "thin", f"The page has {words} words of readable copy. A listing written from that would be a guess."
     return "ok", ""
 

@@ -27,6 +27,7 @@ from urllib.robotparser import RobotFileParser
 import httpx
 
 from app.openai_client import chat_text, openai_configured
+from app.page_scrape import is_video_src, summarize_json_ld
 
 AGENT = "SearchifyBot/1.0 (+https://searchify.nextcreavo.com)"
 SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "template"}
@@ -88,7 +89,20 @@ class PageReader(HTMLParser):
         self.text: list[str] = []
         self.links: list[str] = []
         self.description = ""
+        self.og_title = ""
         self.og_description = ""
+        self.og_type = ""
+        self.og_image = ""
+        self.images: list[dict] = []
+        self.nav: list[str] = []
+        self.faqs: list[str] = []
+        self.videos: list[str] = []
+        self.nav_depth = 0
+        self.in_nav_link = False
+        self.nav_buf: list[str] = []
+        self.json_ld: list[str] = []
+        self.in_jsonld = False
+        self.json_buf: list[str] = []
         self.canonical = ""
         self.noindex = False
         self.skip = 0
@@ -99,34 +113,77 @@ class PageReader(HTMLParser):
     def handle_starttag(self, tag, attrs):
         tag = (tag or "").lower()
         attr = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "script" and "ld+json" in attr.get("type", "").lower() and len(self.json_ld) < 6:
+            self.in_jsonld = True
+            self.json_buf = []
+            return
         if tag in SKIP_TAGS:
             self.skip += 1
             return
+        if self.in_jsonld:
+            return
+        if tag == "nav":
+            self.nav_depth += 1
+        if tag == "a" and self.nav_depth and len(self.nav) < 12:
+            self.in_nav_link = True
+            self.nav_buf = []
+        if tag in {"iframe", "video", "source"}:
+            src = attr.get("src") or ""
+            if is_video_src(src) and src not in self.videos and len(self.videos) < 6:
+                self.videos.append(src[:300])
         if tag in CHROME_TAGS:
             self.chrome += 1
         if tag == "a" and attr.get("href"):
             self.links.append(attr["href"])
         if tag == "meta":
             name = (attr.get("name") or attr.get("property") or "").lower()
+            content = attr.get("content", "")
             if name == "description" and not self.description:
-                self.description = attr.get("content", "")
+                self.description = content
+            elif name == "og:title" and not self.og_title:
+                self.og_title = content
             elif name == "og:description" and not self.og_description:
-                self.og_description = attr.get("content", "")
+                self.og_description = content
+            elif name == "og:type" and not self.og_type:
+                self.og_type = content
+            elif name == "og:image" and not self.og_image:
+                self.og_image = content
+            elif name in {"og:video", "og:video:url"} and is_video_src(content) and content not in self.videos:
+                self.videos.append(content[:300])
             if name == "robots" and "noindex" in attr.get("content", "").lower():
                 self.noindex = True
         if tag == "link" and "canonical" in attr.get("rel", "").lower():
             self.canonical = attr.get("href", "")
+        if tag == "img" and len(self.images) < 8 and not self.skip:
+            src = attr.get("src") or attr.get("data-src") or ""
+            if src and not src.startswith("data:"):
+                self.images.append({"src": src[:300], "alt": (attr.get("alt") or "")[:160]})
         if tag in {"title", "h1", "h2", "h3"} and not self.skip:
             self.current = tag
             self.buffer = []
 
     def handle_endtag(self, tag):
         tag = (tag or "").lower()
+        if self.in_jsonld and tag != "script":
+            return
+        if tag == "script" and self.in_jsonld:
+            self.json_ld.append("".join(self.json_buf))
+            self.in_jsonld = False
+            self.json_buf = []
+            return
         if tag in SKIP_TAGS and self.skip:
             self.skip -= 1
             return
         if tag in CHROME_TAGS and self.chrome:
             self.chrome -= 1
+        if tag == "nav" and self.nav_depth:
+            self.nav_depth -= 1
+        if tag == "a" and self.in_nav_link:
+            label = " ".join(" ".join(self.nav_buf).split())
+            if label and label not in self.nav and len(self.nav) < 12:
+                self.nav.append(label[:80])
+            self.in_nav_link = False
+            self.nav_buf = []
         if tag == self.current:
             value = " ".join(" ".join(self.buffer).split())
             if value:
@@ -136,10 +193,20 @@ class PageReader(HTMLParser):
                     self.h1.append(value)
                 elif len(self.headings) < 14:
                     self.headings.append(value)
+                    if value.endswith("?") and value not in self.faqs and len(self.faqs) < 8:
+                        self.faqs.append(value[:180])
             self.current = ""
             self.buffer = []
 
     def handle_data(self, data):
+        if self.in_jsonld:
+            self.json_buf.append(data or "")
+            return
+        if self.in_nav_link:
+            chunk = " ".join((data or "").split())
+            if chunk:
+                self.nav_buf.append(chunk)
+            return
         if self.skip:
             return
         chunk = " ".join((data or "").split())
@@ -179,13 +246,24 @@ def read_page(client: httpx.Client, url: str) -> dict:
         pass
     text = " ".join(reader.text)
     title = " ".join(reader.title)[:200]
-    description = reader.description.strip()[:400]
+    description = (reader.description or reader.og_description).strip()[:400]
+    schema = summarize_json_ld(reader.json_ld)
     canonical = urljoin(final, reader.canonical) if reader.canonical else ""
+    faqs = list(dict.fromkeys([*(schema.get("faqs") or []), *reader.faqs]))[:8]
     return {
         **base,
         "title": title,
         "description": description,
+        "ogTitle": reader.og_title.strip()[:200],
         "ogDescription": reader.og_description.strip()[:400],
+        "ogType": reader.og_type.strip()[:40],
+        "ogImage": reader.og_image.strip()[:300],
+        "images": reader.images[:8],
+        "nav": reader.nav[:12],
+        "faqs": faqs,
+        "videos": reader.videos[:6],
+        "reviewRating": schema.get("reviewRating") or "",
+        "reviewCount": schema.get("reviewCount") or "",
         "h1": " | ".join(reader.h1)[:240],
         "headings": reader.headings[:14],
         "text": text[:4000],
@@ -193,9 +271,15 @@ def read_page(client: httpx.Client, url: str) -> dict:
         "canonical": canonical,
         "canonicalElsewhere": bool(canonical) and page_key(canonical) != page_key(final),
         "noindex": reader.noindex,
-        "contentHash": hashlib.sha256(f"{title}\n{description}\n{text}".encode()).hexdigest()[:32],
+        "contentHash": hashlib.sha256(
+            f"{title}\n{description}\n{reader.og_title}\n{schema.get('schemaName')}\n{text}".encode()
+        ).hexdigest()[:32],
         "links": reader.links[:400],
         "error": "",
+        **schema,
+        "faqs": faqs,
+        "reviewRating": schema.get("reviewRating") or "",
+        "reviewCount": schema.get("reviewCount") or "",
     }
 
 
@@ -360,8 +444,13 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
         return {}
     digest = []
     for page in pages[:45]:
+        schema = ", ".join(page.get("schemaTypes") or []) or "-"
         digest.append(
-            f"URL: {page['url']}\nTITLE: {page.get('title') or '-'}\nH1: {page.get('h1') or '-'}\n"
+            f"URL: {page['url']}\nTITLE: {page.get('title') or '-'}\n"
+            f"META DESCRIPTION: {page.get('description') or '-'}\n"
+            f"OPEN GRAPH: {page.get('ogTitle') or '-'} — {page.get('ogDescription') or '-'}\n"
+            f"JSON-LD: {schema}; name {page.get('schemaName') or '-'}\n"
+            f"H1: {page.get('h1') or '-'}\n"
             f"HEADINGS: {' | '.join(page.get('headings') or [])[:300] or '-'}\n"
             f"COPY: {(page.get('text') or '')[:420]}"
         )

@@ -16,6 +16,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app import config, llm_requests, locations, markets, quotas
+from app.concept_reads import backlink_concepts, business_offers, keyword_concepts, offer_fit, seed_phrase, visibility_reading
 from app.models import FeatureRecord, User
 
 log = logging.getLogger("searchify.research")
@@ -242,20 +243,35 @@ def _rank_key(row: dict) -> tuple:
     return (pos if isinstance(pos, int) else 10**6, -(vol if isinstance(vol, (int, float)) else -1))
 
 
-def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3) -> list[str]:
-    """Prefer tracked terms, then strongest ranking terms, for suggestion seeds."""
+def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3, offers: list[str] | None = None) -> list[str]:
+    """Seeds for paid keyword suggestions. Offers from the site read come first."""
     seeds: list[str] = []
+
+    def add(term: str) -> bool:
+        text = seed_phrase(term)
+        if text and text.lower() not in {item.lower() for item in seeds}:
+            seeds.append(text)
+        return len(seeds) >= limit
+
+    named = [offer for offer in (offers or []) if str(offer).strip()]
+    if named:
+        for offer in named:
+            if add(offer):
+                return seeds
+        for term in clean:
+            if offer_fit(term, named)[0] >= 0.34 and add(term):
+                return seeds
+        for row in sorted(ranked, key=_rank_key):
+            kw = (row.get("keyword") or "").strip()
+            if kw and offer_fit(kw, named)[0] >= 0.34 and add(kw):
+                return seeds
+        return seeds
     for term in clean:
-        if term and term not in seeds:
-            seeds.append(term)
-        if len(seeds) >= limit:
+        if add(term):
             return seeds
     for row in sorted(ranked, key=_rank_key):
-        kw = (row.get("keyword") or "").strip()
-        if kw and kw.lower() not in {s.lower() for s in seeds}:
-            seeds.append(kw)
-        if len(seeds) >= limit:
-            break
+        if add((row.get("keyword") or "").strip()):
+            return seeds
     return seeds
 
 
@@ -272,8 +288,10 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         clean = clean[:term_limit]
     title = f"Keywords {host} {place.iso or location} {language}"
     saved = None if force else cached(db, user.id, "dfs-keywords", title, WINDOWS["keywords"])
+    offers = business_offers(db, user.id, host)
     if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == 2:
-        return {**saved, "cached": True, "termsDropped": dropped}
+        concepts = keyword_concepts(saved, offers)
+        return {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped}
     quotas.check(db, user, "keywords")
     _budget(db, user, 5)
     cost = 0.0
@@ -362,7 +380,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             })
 
     ideas = []
-    seeds = _idea_seeds(clean, ranked, limit=3)
+    seeds = _idea_seeds(clean, ranked, limit=3, offers=offers)
     known = {t.lower() for t in clean} | set(by_term)
     idea_calls = 0
     for seed in seeds:
@@ -409,6 +427,9 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "source": "Searchify SEO",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
+    concepts = keyword_concepts(payload, offers)
+    payload["concepts"] = concepts["rows"]
+    payload["conceptNote"] = concepts["note"]
     _save(db, user.id, "dfs-keywords", title, payload)
     return {**payload, "cached": False, "termsDropped": dropped}
 
@@ -480,12 +501,20 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     if not host:
         raise ResearchError("Add the website address in setup first.", code="site_required")
     title = f"Backlinks {host}"
+    offers = business_offers(db, user.id, host)
+
+    def _with_link_concepts(body: dict, *, cached: bool) -> dict:
+        concepts = backlink_concepts(body, offers)
+        return {**body, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": cached}
+
     if stored_only:
         row = _record(db, user.id, "dfs-backlinks", title)
-        return {**dict(row.payload or {}), "cached": True} if row and row.payload else {"host": host, "state": "none", "cached": True}
+        if row and row.payload:
+            return _with_link_concepts(dict(row.payload), cached=True)
+        return {"host": host, "state": "none", "cached": True, "concepts": [], "conceptNote": "No referring domains are stored yet. Refresh live backlink data."}
     saved = None if force else cached(db, user.id, "dfs-backlinks", title, WINDOWS["backlinks"])
     if saved and saved.get("qualityVersion") == 2:
-        return {**saved, "cached": True}
+        return _with_link_concepts(saved, cached=True)
     quotas.check(db, user, "backlinks")
     _budget(db, user, 3)
     cost = 0.0
@@ -566,6 +595,9 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
         "source": "Searchify SEO Backlinks",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
+    concepts = backlink_concepts(payload, offers)
+    payload["concepts"] = concepts["rows"]
+    payload["conceptNote"] = concepts["note"]
     _save(db, user.id, "dfs-backlinks", title, payload)
     return {**payload, "cached": False}
 
@@ -679,7 +711,8 @@ def visibility(
         title = f"Visibility {host} {engine_label} {digest}"[:200]
         saved = None if force else cached(db, user.id, "dfs-visibility", title, WINDOWS["visibility"])
         if saved and saved.get("status", "ok") == "ok":
-            results.append({**saved, "cached": True})
+            reading = visibility_reading(saved, business_offers(db, user.id, host))
+            results.append({**saved, **reading, "cached": True})
         else:
             todo.append((text, engine_label, title, prompt.get("id")))
     allowed = quotas.left(db, user, "visibility")
@@ -739,6 +772,7 @@ def visibility(
             "location": {"requested": place.to_dict(), "applied": applied},
             "market": {"countryIso": place.iso, "language": place.language, "source": market.get("source"), "version": market.get("version"), "scope": "country" if applied.get("country") else "global"},
         }
+        row.update(visibility_reading(row, business_offers(db, user.id, host)))
         if row["status"] == "ok" or not previous.get("fetchedAt"):
             _save(db, user.id, "dfs-visibility", title, row)
         results.append({**row, "cached": False})
@@ -777,11 +811,114 @@ PAGE_CHECKS = {
     "large_page_size": ("Pages are very heavy", "Notice", "Reduce image and script weight on these pages.", False),
     "low_content_rate": ("Pages have very little text", "Notice", "Add useful text about the service, the place, and common questions.", False),
     "is_orphan_page": ("Pages have no internal links pointing to them", "Notice", "Link to these pages from related pages so visitors and Google can find them.", False),
-    "no_image_alt": ("Images have no alt text", "Notice", "Describe each image in a few words for screen readers and image search.", False),
+    "no_image_alt": ("Images have no alt text", "Warning", "Write a short description of what each image shows. That is the image SEO for the page.", False),
+    "no_image_title": ("Images have no title text", "Notice", "Add a short title on important images. The alt text is the part that matters most.", False),
     "https_to_http_links": ("Secure pages link to insecure pages", "Notice", "Change the links to https.", False),
     "seo_friendly_url": ("URLs are hard to read", "Notice", "Use short words in URLs when you next restructure. Redirect the old URL if you change it.", False),
+    "lorem_ipsum": ("Pages still contain placeholder paragraphs", "Warning", "Replace the placeholder text with a real paragraph about this page.", False),
+    "low_readability_rate": ("Paragraphs are hard to read", "Warning", "Break long paragraphs into shorter ones and use everyday words.", False),
+    "low_character_count": ("Paragraphs are too thin", "Notice", "Add a few sentences that explain the offer, who it is for, and the next step.", False),
+    "has_micromarkup_errors": ("The page schema has errors", "Warning", "Approve a title so Searchify can write a clean WebPage schema, or fix the existing schema.", True),
+    "has_render_blocking_resources": ("Scripts or styles slow the first view", "Warning", "Ask the site builder to load heavy scripts after the page. Searchify does not edit the theme files.", False),
+    "deprecated_html_tags": ("Pages use outdated formatting tags", "Notice", "Replace old formatting tags with normal headings and paragraphs.", False),
+    "duplicate_meta_tags": ("Pages repeat the same meta tags", "Warning", "Keep one title and one description. Searchify can draft the single listing.", True),
+    "duplicate_title_tag": ("Pages have more than one title tag", "Warning", "Keep one title tag. Searchify can draft the title to keep.", True),
+    "no_favicon": ("The site has no favicon", "Notice", "Add a small site icon in the WordPress customizer.", False),
 }
 SEVERITY_ORDER = {"Critical": 0, "Warning": 1, "Notice": 2}
+
+CHECK_GUIDE = {
+    "no_title": ("Meta", ["Open the page.", "Let Searchify draft the title, or type one that names the page in the first words.", "Approve it before it is published."]),
+    "no_description": ("Meta", ["Open the page.", "Let Searchify draft the description from the page, or write one sentence about who it is for and the next step.", "Approve it before it is published."]),
+    "title_too_long": ("Typography", ["Keep the title between 50 and 60 characters.", "Put the keyword and the page topic first.", "Let Searchify draft it if you would rather not edit by hand."]),
+    "title_too_short": ("Typography", ["Add the service or the place so the title is about 50 to 60 characters.", "Let Searchify draft it from the page."]),
+    "irrelevant_title": ("Meta", ["Read the heading on the page.", "The title should say that same thing.", "Let Searchify draft a title that stays on the page topic."]),
+    "no_h1_tag": ("Typography", ["In WordPress, set one heading at the top of the page.", "That heading should name the subject in plain words."]),
+    "no_image_alt": ("Images", ["Open the page in WordPress.", "Select each image and fill in the alt text with what the picture shows.", "Update the page. Searchify does not replace the image file."]),
+    "no_image_title": ("Images", ["On the important photos, add a short image title.", "The alt text is the part visitors and Google use."]),
+    "lorem_ipsum": ("Paragraphs", ["Find the placeholder paragraph.", "Replace it with a real explanation of this page.", "Update the page."]),
+    "low_readability_rate": ("Paragraphs", ["Split any paragraph longer than four lines.", "Use the same words you would say to a customer."]),
+    "low_character_count": ("Paragraphs", ["Add a short paragraph: what this page offers, who it is for, and what to do next."]),
+    "low_content_rate": ("Paragraphs", ["Add useful sentences about the service, the place, and one common question."]),
+    "has_micromarkup_errors": ("Schema", ["Approve the title and description.", "On publish, leave Open Graph and JSON-LD turned on so Searchify writes a clean page schema."]),
+    "missing_open_graph": ("Social", ["Approve the title and description.", "On publish, leave Open Graph turned on. The social title and description use that same listing."]),
+    "missing_json_ld": ("Schema", ["Approve the title and description.", "On publish, leave JSON-LD turned on. Searchify writes a WebPage schema from that listing."]),
+    "faq_without_schema": ("FAQ", ["Keep the questions visible on the page as real headings.", "Answer each one in the paragraph under it.", "Approving the page schema does not invent answers that are not written on the page."]),
+    "video_without_details": ("Video", ["Give the video page a title that says what the video is about.", "Add one paragraph that describes the video.", "Add the video on the page itself. Searchify does not upload the file."]),
+    "missing_share_image": ("Social", ["Choose one clear image that represents the page.", "Set it as the social share image in your SEO plugin.", "Searchify does not create the image."]),
+}
+
+
+def _guide(key: str, fix: str) -> tuple[str, list[str]]:
+    area, steps = CHECK_GUIDE.get(key, ("Page", []))
+    if not steps:
+        steps = [fix, "Do this on the page, then crawl the site again to confirm it is gone."]
+    return area, steps
+
+
+def _social_value(social: dict, *names: str) -> str:
+    for name in names:
+        value = social.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _listing_gaps(items: list[dict]) -> list[dict]:
+    """Open Graph, schema, FAQ, and video gaps read from the pages already crawled."""
+    missing_og, missing_schema, missing_image, faq_pages, video_pages = [], [], [], [], []
+    for item in items:
+        if item.get("resource_type") not in (None, "", "html"):
+            continue
+        meta = item.get("meta") or {}
+        checks = item.get("checks") or {}
+        social = meta.get("social_media_tags") if isinstance(meta.get("social_media_tags"), dict) else {}
+        title = str(meta.get("title") or "").strip()
+        if title and not (_social_value(social, "og:title", "og_title") and _social_value(social, "og:description", "og_description")):
+            missing_og.append(item)
+        if title and not _social_value(social, "og:image", "og_image"):
+            missing_image.append(item)
+        if checks.get("has_micromarkup") is False:
+            missing_schema.append(item)
+        headings = []
+        htags = meta.get("htags") if isinstance(meta.get("htags"), dict) else {}
+        for level in ("h2", "h3"):
+            values = htags.get(level) or []
+            if isinstance(values, list):
+                headings.extend(str(value) for value in values)
+        if sum(1 for heading in headings if heading.strip().endswith("?")) >= 2 and checks.get("has_micromarkup") is not True:
+            faq_pages.append(item)
+        if re.search(r"\b(video|webinar|watch)\b", title, re.I) and "video" not in " ".join(social.keys()).lower():
+            video_pages.append(item)
+    specs = [
+        ("missing_open_graph", "Pages are missing Open Graph titles for social shares", "Warning",
+         "Publish the approved title with Open Graph turned on.", True, missing_og),
+        ("missing_json_ld", "Pages have no JSON-LD schema", "Warning",
+         "Publish the approved title with JSON-LD turned on.", True, missing_schema),
+        ("missing_share_image", "Pages have no social share image", "Notice",
+         "Set a share image in the SEO plugin. Searchify does not create the picture.", False, missing_image),
+        ("faq_without_schema", "Question headings are not backed by FAQ schema", "Notice",
+         "Write the answer under each question on the page. Searchify does not invent FAQ answers.", False, faq_pages),
+        ("video_without_details", "Video pages are missing video details for search and social", "Notice",
+         "Describe the video in the title and the first paragraph, and keep the video on the page.", False, video_pages),
+    ]
+    issues = []
+    for key, name, severity, fix, meta, pages in specs:
+        if not pages:
+            continue
+        area, steps = _guide(key, fix)
+        issues.append({
+            "key": key,
+            "name": name,
+            "severity": severity,
+            "fix": fix,
+            "meta": meta,
+            "area": area,
+            "steps": steps,
+            "count": len(pages),
+            "pages": [_page_snippet(page) for page in pages[:25]],
+        })
+    return issues
 
 
 def _audit_target(site: str) -> tuple[str, str]:
@@ -864,17 +1001,21 @@ def _audit_report(task_id: str, summary: dict) -> dict:
             hit = _fetch_checked_pages(task_id, key)
         if not hit and not count_hint:
             continue
+        area, steps = _guide(key, fix)
         issues.append({
             "key": key,
             "name": name,
             "severity": severity,
             "fix": fix,
             "meta": meta,
+            "area": area,
+            "steps": steps,
             "count": max(len(hit), count_hint) or len(hit),
             "pages": [_page_snippet(i) for i in hit[:25]] or (
                 [{"url": "", "status": None, "title": "", "description": ""}] if count_hint else []
             ),
         })
+    issues.extend(_listing_gaps(items))
     if broken:
         issues.append({
             "key": "broken_links",
@@ -882,6 +1023,8 @@ def _audit_report(task_id: str, summary: dict) -> dict:
             "severity": "Critical",
             "fix": "Update or remove each broken link. Redirect the dead URL if other sites link to it.",
             "meta": False,
+            "area": "Links",
+            "steps": ["Open the page that contains the link.", "Point it at a live page, or remove it.", "If other sites link to the dead address, add a redirect."],
             "count": len(broken),
             "pages": [{"url": b["from"], "status": b["status"], "title": f"Links to {b['to']}", "description": ""} for b in broken[:25]],
         })
@@ -896,7 +1039,8 @@ def _audit_report(task_id: str, summary: dict) -> dict:
     ]
     for key, name, severity, fix in site_checks:
         if key in checks and checks.get(key) is False:
-            issues.append({"key": key, "name": name, "severity": severity, "fix": fix, "meta": False, "count": 1,
+            issues.append({"key": key, "name": name, "severity": severity, "fix": fix, "meta": False, "area": "Technical",
+                           "steps": [fix, "This is a site setting. Crawl again after it is in place."], "count": 1,
                            "pages": [{"url": f"https://{domain.get('name') or ''}/", "status": None, "title": "", "description": ""}]})
 
     issues.sort(key=lambda row: (SEVERITY_ORDER.get(row["severity"], 3), -row["count"]))

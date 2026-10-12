@@ -1170,6 +1170,37 @@ OPEN_OR_DONE = [
 ]
 
 
+def _refresh_live_listings(db: Session, user_id: int, scan: dict) -> None:
+    """Copy the latest scraped title and description onto open drafts so Current matches the live page."""
+    from app.site_scan import page_key
+
+    pages = {page_key(page.get("url") or ""): page for page in (scan.get("pages") or [])}
+    if not pages:
+        return
+    rows = (
+        db.query(SiteChange)
+        .filter(
+            SiteChange.customer_id == user_id,
+            SiteChange.status.in_(["proposed", "awaiting_approval", "approved", "needs_review", "failed"]),
+        )
+        .all()
+    )
+    for row in rows:
+        page = pages.get(page_key(row.target_url or ""))
+        if not page:
+            continue
+        proposed = dict(row.proposed or {})
+        if page.get("title"):
+            proposed["beforeTitle"] = page.get("title") or ""
+        if page.get("description"):
+            proposed["beforeDescription"] = page.get("description") or ""
+        if page.get("ogTitle"):
+            proposed["beforeOpenGraphTitle"] = page.get("ogTitle") or ""
+        if page.get("ogDescription"):
+            proposed["beforeOpenGraphDescription"] = page.get("ogDescription") or ""
+        row.proposed = proposed
+
+
 def _open_urls(db: Session, user_id: int) -> set[str]:
     """Page keys that already have a draft, a decision, or a published change."""
     from app.site_scan import page_key
@@ -1414,7 +1445,12 @@ def propose_from_gsc(
         try:
             from app import dataforseo
 
-            seed = query_terms[0] if query_terms else f"{services.split(',')[0]} {areas}".strip()
+            seed = ""
+            offers = (scan.get("business") or {}).get("offers") or []
+            if offers:
+                seed = str(offers[0]).strip()
+            if not seed:
+                seed = query_terms[0] if query_terms else f"{services.split(',')[0]} {areas}".strip()
             where, language = _market_location(profile)
             if where and quotas.left(db, user, "competitors") != 0:
                 fallback_rivals = dataforseo.competitor_serp(seed, location_name=where, language_code=language or "en")
@@ -1461,6 +1497,10 @@ def propose_from_gsc(
     if not openai_configured():
         raise HTTPException(status_code=503, detail="The title writer is not configured, so no drafts were written.")
 
+    from app.listing_research import load_stored
+
+    stored_research = load_stored(db, user.id)
+
     jobs, skipped = [], []
     for url in batch:
         page, site_ctx, rivals = _site_context(scan, url)
@@ -1501,6 +1541,7 @@ def propose_from_gsc(
                 site=job["site"],
                 taken=taken,
                 kind=job["kind"],
+                research=stored_research,
             )
         except Exception as exc:  # noqa: BLE001
             return {"aiError": str(exc)[:200]}
@@ -1544,6 +1585,22 @@ def propose_from_gsc(
                 "pageRole": info.get("role") or "",
                 "beforeTitle": scraped.get("title") or "",
                 "beforeDescription": scraped.get("description") or "",
+                "beforeOpenGraphTitle": scraped.get("ogTitle") or "",
+                "beforeOpenGraphDescription": scraped.get("ogDescription") or "",
+                "beforeSchemaTypes": scraped.get("schemaTypes") or [],
+                "beforeSchemaName": scraped.get("schemaName") or "",
+                "beforeSchemaDescription": scraped.get("schemaDescription") or "",
+                "openGraphTitle": drafted.get("openGraphTitle") or drafted.get("title") or "",
+                "openGraphDescription": drafted.get("openGraphDescription") or drafted.get("metaDescription") or "",
+                "shareImage": drafted.get("shareImage") or "",
+                "images": drafted.get("images") or [],
+                "canonical": (scraped.get("canonical") or drafted.get("canonical") or ""),
+                "nav": scraped.get("nav") or drafted.get("nav") or [],
+                "faqs": scraped.get("faqs") or drafted.get("faqs") or [],
+                "videos": scraped.get("videos") or drafted.get("videos") or [],
+                "reviewRating": scraped.get("reviewRating") or drafted.get("reviewRating") or "",
+                "reviewCount": scraped.get("reviewCount") or drafted.get("reviewCount") or "",
+                "jsonLd": drafted.get("jsonLd") or {},
                 "pageH1": scraped.get("h1") or "",
                 "evidence": job["gsc"],
                 "changeType": "meta",
@@ -1556,7 +1613,7 @@ def propose_from_gsc(
                 ],
                 "analytics": bool((job["analytics"] or {}).get("connected")),
                 "specificity": drafted.get("specificity") or body.breadth or "balanced",
-                "writer": "site-scan+brief+competitors+gsc+analytics",
+                "writer": "site-scan+schema+open-graph+searchify-seo+gsc+analytics",
                 "profileHints": {k: profile.get(k) or "" for k in ("business", "services", "areas", "goal", "restrictions")},
                 "pageType": drafted.get("pageType") or job["kind"],
                 "contentStatus": job["content"],
@@ -1579,9 +1636,18 @@ def propose_from_gsc(
         created.append(_change_row(change))
         open_urls.add(page_key(url))
 
-    if skipped and scan:
-        known = {item["url"] for item in skipped}
-        scan["skipped"] = [*skipped, *[s for s in scan.get("skipped") or [] if s.get("url") not in known]][:60]
+    if scan:
+        drafted_urls = {page_key(item.get("targetUrl") or "") for item in created}
+        fresh_skips = []
+        seen_skips = set()
+        for item in [*skipped, *(scan.get("skipped") or [])]:
+            url = item.get("url") or ""
+            if not url or url in seen_skips or page_key(url) in drafted_urls:
+                continue
+            seen_skips.add(url)
+            fresh_skips.append(item)
+        scan["skipped"] = fresh_skips[:60]
+        _refresh_live_listings(db, user.id, scan)
         from app.site_scan import host_of as _host
 
         _upsert_feature(db, user.id, "site-scan", _scan_title(_host(homepage)), scan)
@@ -1962,7 +2028,12 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
         try:
             from app import dataforseo
 
-            seed = query_terms[0] if query_terms else ""
+            seed = ""
+            page_topic_seed = str((page or {}).get("h1") or (page or {}).get("schemaName") or (page or {}).get("ogTitle") or "").split("|")[0].strip()
+            if page_topic_seed:
+                seed = page_topic_seed
+            elif query_terms:
+                seed = query_terms[0]
             where, language = _market_location(_brief_profile(profile, (scan or {}).get("brief")))
             if seed and where and quotas.left(db, user, "competitors") != 0:
                 competitors = dataforseo.competitor_serp(seed, location_name=where, language_code=language or "en")
@@ -1977,6 +2048,7 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
         if host_of(c.target_url or "") == host_of(row.target_url or "")
     ]
     try:
+        from app.listing_research import load_stored
         from app.meta_writer import write_title_description
 
         page_analytics = _analytics_for_page(db, user.id, row.target_url or "")
@@ -1991,6 +2063,7 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             page=page,
             site=site_ctx,
             taken=[t for t in taken if t][:20],
+            research=load_stored(db, user.id),
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)[:200]) from exc
@@ -2006,6 +2079,28 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
         {k: r.get(k) for k in ("title", "url", "description", "source")} for r in (drafted.get("competitors") or competitors)[:6]
     ]
     proposed["target"] = drafted.get("target") or proposed.get("target") or ""
+    proposed["openGraphTitle"] = drafted.get("openGraphTitle") or drafted.get("title") or ""
+    proposed["openGraphDescription"] = drafted.get("openGraphDescription") or drafted.get("metaDescription") or ""
+    proposed["shareImage"] = drafted.get("shareImage") or proposed.get("shareImage") or ""
+    proposed["images"] = drafted.get("images") or []
+    scraped_now = drafted.get("scraped") or {}
+    proposed["canonical"] = (scraped_now.get("canonical") or drafted.get("canonical") or proposed.get("canonical") or "")
+    proposed["nav"] = scraped_now.get("nav") or drafted.get("nav") or []
+    proposed["faqs"] = scraped_now.get("faqs") or drafted.get("faqs") or []
+    proposed["videos"] = scraped_now.get("videos") or drafted.get("videos") or []
+    proposed["reviewRating"] = scraped_now.get("reviewRating") or drafted.get("reviewRating") or ""
+    proposed["reviewCount"] = scraped_now.get("reviewCount") or drafted.get("reviewCount") or ""
+    proposed["jsonLd"] = drafted.get("jsonLd") or {}
+    if scraped_now.get("ogTitle"):
+        proposed["beforeOpenGraphTitle"] = proposed.get("beforeOpenGraphTitle") or scraped_now.get("ogTitle")
+    if scraped_now.get("ogDescription"):
+        proposed["beforeOpenGraphDescription"] = proposed.get("beforeOpenGraphDescription") or scraped_now.get("ogDescription")
+    if scraped_now.get("schemaTypes"):
+        proposed["beforeSchemaTypes"] = proposed.get("beforeSchemaTypes") or scraped_now.get("schemaTypes")
+    if scraped_now.get("schemaName"):
+        proposed["beforeSchemaName"] = proposed.get("beforeSchemaName") or scraped_now.get("schemaName")
+    if scraped_now.get("schemaDescription"):
+        proposed["beforeSchemaDescription"] = proposed.get("beforeSchemaDescription") or scraped_now.get("schemaDescription")
     proposed["analytics"] = bool((drafted.get("analytics") or {}).get("connected"))
     proposed["specificity"] = drafted.get("specificity") or body.breadth or "balanced"
     scraped = drafted.get("scraped") or {}

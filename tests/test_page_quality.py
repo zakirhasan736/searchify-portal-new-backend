@@ -22,6 +22,10 @@ def test_page_types():
         ({"noindex": True, "words": 900}, "noindex"),
         ({"canonicalElsewhere": True, "canonical": "https://a.com/x", "words": 900}, "non_canonical"),
         ({"words": 40}, "thin"),
+        ({"words": 40, "title": "Calgary Web Design"}, "ok"),
+        ({"words": 79, "h1": "Home", "title": "Sovereign Standard"}, "ok"),
+        ({"words": 17, "title": "SEO"}, "ok"),
+        ({"words": 4, "title": "SEO"}, "thin"),
         ({"words": 600}, "ok"),
     ],
 )
