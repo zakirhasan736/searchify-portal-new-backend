@@ -199,3 +199,59 @@ def test_audit_report_reads_schema_faq_and_video_from_the_page(offline, monkeypa
     assert keys["no_image_alt"]["area"] == "Images"
     assert keys["low_readability_rate"]["area"] == "Paragraphs"
     assert keys["missing_open_graph"]["steps"]
+
+
+def test_audit_report_names_low_content_heading_order_and_render(offline, monkeypatch):
+    summary = {
+        "page_metrics": {"onpage_score": 80, "checks": {}},
+        "crawl_status": {"pages_crawled": 2, "max_crawl_pages": 10},
+        "domain_info": {"name": "acme.ca", "checks": {"ssl": True, "sitemap": True, "robots_txt": True, "test_https_redirect": True}},
+    }
+
+    def fake_call(method, path, payload=None, timeout=60):
+        if path.endswith("/on_page/pages"):
+            return [{"items": [
+                {
+                    "resource_type": "html",
+                    "url": "https://acme.ca/",
+                    "status_code": 200,
+                    "checks": {},
+                    "meta": {
+                        "title": "Sovereign Standard",
+                        "content": {"plain_text_word_count": 79},
+                        "scripts_count": 14,
+                        "htags": {"h1": ["Home"], "h3": ["Projects"]},
+                    },
+                },
+                {
+                    "resource_type": "html",
+                    "url": "https://acme.ca/web-design",
+                    "status_code": 200,
+                    "checks": {},
+                    "meta": {
+                        "title": "Web design",
+                        "content": {"plain_text_word_count": 420},
+                        "scripts_count": 2,
+                        "htags": {"h1": ["Web design"], "h2": ["What is included"]},
+                    },
+                },
+            ]}], 0.01
+        if "links" in path:
+            return [{"items": []}], 0.01
+        return [{}], 0.0
+
+    monkeypatch.setattr(research, "_call", fake_call)
+    report = research._audit_report("task-3", summary)
+    keys = {issue["key"]: issue for issue in report["issues"]}
+    low = keys["low_content_rate"]
+    assert low["pages"][0]["url"] == "https://acme.ca/"
+    assert "79 words" in low["pages"][0]["detail"]
+    assert low["steps"]
+    assert "h1" in keys["heading_order"]["pages"][0]["detail"].lower() or "H1" in keys["heading_order"]["pages"][0]["detail"]
+    assert "H3" in keys["heading_order"]["pages"][0]["detail"]
+    assert "79 words" in keys["paragraph_content"]["pages"][0]["detail"]
+    render = {page["url"]: page["detail"] for page in keys["render_mode"]["pages"]}
+    assert "client-rendered" in render["https://acme.ca/"]
+    assert "Server-rendered" in render["https://acme.ca/web-design"]
+    assert keys["render_mode"]["severity"] == "Warning"
+    assert "https://acme.ca/web-design" not in {page["url"] for page in low["pages"]}

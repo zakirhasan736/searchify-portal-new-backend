@@ -839,7 +839,10 @@ CHECK_GUIDE = {
     "lorem_ipsum": ("Paragraphs", ["Find the placeholder paragraph.", "Replace it with a real explanation of this page.", "Update the page."]),
     "low_readability_rate": ("Paragraphs", ["Split any paragraph longer than four lines.", "Use the same words you would say to a customer."]),
     "low_character_count": ("Paragraphs", ["Add a short paragraph: what this page offers, who it is for, and what to do next."]),
-    "low_content_rate": ("Paragraphs", ["Add useful sentences about the service, the place, and one common question."]),
+    "low_content_rate": ("Paragraphs", ["Open the page named in this list.", "Read the word count beside it.", "Add a paragraph about what this page offers, who it is for, and the next step.", "Update the page, then crawl again. Searchify does not write the body copy."]),
+    "paragraph_content": ("Paragraphs", ["Open the page named beside the word count.", "Replace a thin or hard-to-read paragraph with a few plain sentences.", "Say what the page offers, who it is for, and what to do next.", "Searchify does not rewrite the paragraph for you."]),
+    "heading_order": ("Typography", ["Open the page.", "Keep one H1 that names the subject.", "Put H2 sections under that H1. Do not jump from H1 to H3.", "Update the page. Searchify does not edit the theme headings."]),
+    "render_mode": ("Render", ["This crawl reads the first HTML, before JavaScript runs.", "Server-rendered means the paragraph is already in that HTML.", "Client-rendered means the first HTML is thin and scripts are expected to fill the page. Many crawlers still read the thin HTML.", "Ask the site builder to put the main paragraph in the server HTML. Searchify does not change the theme."]),
     "has_micromarkup_errors": ("Schema", ["Approve the title and description.", "On publish, leave Open Graph and JSON-LD turned on so Searchify writes a clean page schema."]),
     "missing_open_graph": ("Social", ["Approve the title and description.", "On publish, leave Open Graph turned on. The social title and description use that same listing."]),
     "missing_json_ld": ("Schema", ["Approve the title and description.", "On publish, leave JSON-LD turned on. Searchify writes a WebPage schema from that listing."]),
@@ -936,14 +939,177 @@ def _audit_limit(user: User) -> int:
     return AUDIT_PAGES.get(plan, AUDIT_PAGES["starter"])
 
 
-def _page_snippet(item: dict) -> dict:
+def _page_snippet(item: dict, *, detail: str = "") -> dict:
     meta = item.get("meta") or {}
-    return {
+    row = {
         "url": item.get("url") or "",
         "status": item.get("status_code"),
         "title": str(meta.get("title") or "")[:200],
         "description": str(meta.get("description") or "")[:300],
     }
+    if detail:
+        row["detail"] = detail[:400]
+    return row
+
+
+def _word_count(item: dict) -> int | None:
+    content = (item.get("meta") or {}).get("content")
+    if not isinstance(content, dict):
+        return None
+    raw = content.get("plain_text_word_count")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return max(0, int(raw))
+
+
+def _script_count(item: dict) -> int | None:
+    raw = (item.get("meta") or {}).get("scripts_count")
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return max(0, int(raw))
+
+
+def _heading_levels(item: dict) -> dict[str, list[str]]:
+    htags = (item.get("meta") or {}).get("htags")
+    levels: dict[str, list[str]] = {}
+    if not isinstance(htags, dict):
+        return levels
+    for level in ("h1", "h2", "h3", "h4", "h5", "h6"):
+        values = htags.get(level) or []
+        if isinstance(values, str):
+            values = [values]
+        if not isinstance(values, list):
+            continue
+        texts = [str(value).strip() for value in values if str(value).strip()]
+        if texts:
+            levels[level] = texts
+    return levels
+
+
+def _heading_problem(levels: dict[str, list[str]]) -> str:
+    present = [level for level in ("h1", "h2", "h3", "h4", "h5", "h6") if levels.get(level)]
+    if not present:
+        return "No headings were found in the first HTML."
+    notes = []
+    h1 = levels.get("h1") or []
+    if not h1:
+        notes.append("There is no H1. Use one H1 that names the page, then H2 under it.")
+    elif len(h1) > 1:
+        notes.append(f"There are {len(h1)} H1 headings. Keep one H1.")
+    order = [int(level[1]) for level in present]
+    for earlier, later in zip(order, order[1:]):
+        if later - earlier > 1:
+            notes.append(f"The outline jumps from H{earlier} to H{later}. Add the missing level.")
+    if not notes:
+        return ""
+    sequence = " → ".join(level.upper() for level in present)
+    return f"Heading order is {sequence}. " + " ".join(notes)
+
+
+def _render_sentence(words: int | None, scripts: int | None) -> tuple[str, str]:
+    """(mode, sentence). mode is ssr, csr, thin, or unknown."""
+    if words is None:
+        return "unknown", ""
+    if words >= 120:
+        return "ssr", f"Server-rendered. The first HTML already has {words} words, so the paragraph is in the response before JavaScript."
+    if isinstance(scripts, int) and scripts >= 8:
+        return "csr", (
+            f"Likely client-rendered. The first HTML has {words} words and {scripts} scripts. "
+            "Visitors may see more after JavaScript. This crawl reads the server HTML."
+        )
+    return "thin", f"The server HTML has {words} words and few scripts, so this is thin copy, not a JavaScript-only page."
+
+
+def _content_issue(key: str, name: str, severity: str, fix: str, pages: list[dict]) -> dict:
+    area, steps = _guide(key, fix)
+    return {
+        "key": key,
+        "name": name,
+        "severity": severity,
+        "fix": fix,
+        "meta": False,
+        "area": area,
+        "steps": steps,
+        "count": len(pages),
+        "pages": pages[:25],
+    }
+
+
+def _content_findings(items: list[dict]) -> list[dict]:
+    """Page-specific low copy, heading order, paragraphs, and server versus client render."""
+    low_pages, heading_pages, paragraph_pages, render_pages = [], [], [], []
+    csr = False
+    for item in items:
+        if item.get("resource_type") not in (None, "", "html"):
+            continue
+        url = item.get("url") or ""
+        if not url:
+            continue
+        checks = item.get("checks") or {}
+        words = _word_count(item)
+        scripts = _script_count(item)
+        mode, render = _render_sentence(words, scripts)
+        low_flag = _check_true(checks, "low_content_rate") or _check_true(checks, "low_character_count")
+        if words is not None and words < 120 or low_flag:
+            count = f"{words} words" if words is not None else "a low amount of text"
+            low_pages.append(_page_snippet(
+                item,
+                detail=f"This page has {count} in the first HTML. Add a paragraph about the offer, who it is for, and the next step.",
+            ))
+        problem = _heading_problem(_heading_levels(item))
+        unknown_outline = problem.startswith("No headings") and words is None and not low_flag
+        if problem and not unknown_outline:
+            heading_pages.append(_page_snippet(item, detail=problem))
+        paragraph_flag = _check_true(checks, "low_readability_rate") or _check_true(checks, "low_character_count") or _check_true(checks, "lorem_ipsum")
+        if paragraph_flag or (words is not None and words < 120):
+            if words is not None:
+                sentence = f"Readable copy on this page is {words} words."
+            else:
+                sentence = "The paragraphs on this page were flagged as thin or hard to read."
+            if _check_true(checks, "low_readability_rate"):
+                sentence += " The sentences are hard to read."
+            if _check_true(checks, "lorem_ipsum"):
+                sentence += " Placeholder text is still on the page."
+            paragraph_pages.append(_page_snippet(item, detail=sentence))
+        if render:
+            if mode == "csr":
+                csr = True
+            render_pages.append(_page_snippet(item, detail=render))
+    findings = []
+    if low_pages:
+        severe = any("has 0 words" in (page.get("detail") or "") or re.search(r"has ([0-9]|[1-3][0-9]) words", page.get("detail") or "") for page in low_pages)
+        findings.append(_content_issue(
+            "low_content_rate",
+            "Pages with low content",
+            "Warning" if severe else "Notice",
+            "Add a real paragraph on each page named here. Searchify does not write the body copy.",
+            low_pages,
+        ))
+    if heading_pages:
+        findings.append(_content_issue(
+            "heading_order",
+            "Heading order is broken",
+            "Warning",
+            "Use one H1, then H2, and do not skip a level.",
+            heading_pages,
+        ))
+    if paragraph_pages:
+        findings.append(_content_issue(
+            "paragraph_content",
+            "Paragraphs need a clearer page explanation",
+            "Notice",
+            "Rewrite the thin paragraph on each page named here.",
+            paragraph_pages,
+        ))
+    if render_pages:
+        findings.append(_content_issue(
+            "render_mode",
+            "Server and client render",
+            "Warning" if csr else "Notice",
+            "Read each page's render note. Text that exists only after JavaScript can be missed.",
+            render_pages,
+        ))
+    return findings
 
 
 def _check_true(checks: dict, key: str) -> bool:
@@ -994,6 +1160,8 @@ def _audit_report(task_id: str, summary: dict) -> dict:
     metric_checks = metrics.get("checks") if isinstance(metrics.get("checks"), dict) else {}
     issues = []
     for key, (name, severity, fix, meta) in PAGE_CHECKS.items():
+        if key in {"low_content_rate", "low_character_count"}:
+            continue
         hit = _pages_with_check(items, key)
         counted = metric_checks.get(key)
         count_hint = int(counted) if isinstance(counted, (int, float)) and counted else 0
@@ -1016,6 +1184,7 @@ def _audit_report(task_id: str, summary: dict) -> dict:
             ),
         })
     issues.extend(_listing_gaps(items))
+    issues.extend(_content_findings(items))
     if broken:
         issues.append({
             "key": "broken_links",
