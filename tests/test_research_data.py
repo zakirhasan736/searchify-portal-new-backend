@@ -103,6 +103,17 @@ def test_backlinks_include_lost_links_dedupe_and_keep_nulls(offline, monkeypatch
     assert out["qualityVersion"] == 2
 
 
+def test_keywords_stored_only_never_calls_dataforseo(monkeypatch):
+    monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("stored_only must not call Searchify SEO"))
+    monkeypatch.setattr(research, "_stored_keywords", lambda *a, **k: {"host": "example.com", "ideas": [{"keyword": "roof repair"}], "ranked": []})
+    out = research.keywords(None, FakeUser(), site="https://www.example.com", terms=[], stored_only=True)
+    assert out["ideas"][0]["keyword"] == "roof repair" and out["cached"] is True and out["storedOnly"] is True
+
+    monkeypatch.setattr(research, "_stored_keywords", lambda *a, **k: None)
+    empty = research.keywords(None, FakeUser(), site="https://example.com", terms=[], stored_only=True)
+    assert empty["state"] == "none" and empty["ideas"] == [] and empty["cached"] is True
+
+
 def test_backlinks_stored_only_never_calls_dataforseo(offline, monkeypatch):
     monkeypatch.setattr(research, "_call", lambda *a, **k: pytest.fail("stored_only must not call Searchify SEO"))
     monkeypatch.setattr(research, "_record", lambda *a, **k: None)

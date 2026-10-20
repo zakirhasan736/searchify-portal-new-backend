@@ -275,10 +275,32 @@ def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3, offers: li
     return seeds
 
 
-def keywords(db: Session, user: User, *, site: str, terms: list[str], country: str = "", reach: str = "", force: bool = False) -> dict:
+def _stored_keywords(db: Session, user_id: int, host: str) -> dict | None:
+    if db is None:
+        return None
+    rows = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "dfs-keywords")
+        .order_by(FeatureRecord.id.desc())
+        .limit(20)
+        .all()
+    )
+    for row in rows:
+        payload = dict(row.payload or {})
+        if host_of(str(payload.get("host") or "")) == host:
+            return payload
+    return None
+
+
+def keywords(db: Session, user: User, *, site: str, terms: list[str], country: str = "", reach: str = "", force: bool = False, stored_only: bool = False) -> dict:
     host = host_of(site)
     if not host:
         raise ResearchError("Add the website address in setup first.", code="site_required")
+    if stored_only:
+        saved = _stored_keywords(db, user.id, host)
+        if not saved:
+            return {"host": host, "state": "none", "ideas": [], "ranked": [], "cached": True, "storedOnly": True}
+        return {**saved, "cached": True, "storedOnly": True}
     place, market = _place_for(db, user, site=site, country=country, reach=reach, tool="keywords")
     location, language = place.country, place.language or market.get("language") or "en"
     clean = [t.strip()[:80] for t in dict.fromkeys(t.strip().lower() for t in terms or [] if t and t.strip())][:50]
@@ -1185,6 +1207,8 @@ def _audit_report(task_id: str, summary: dict) -> dict:
         })
     issues.extend(_listing_gaps(items))
     issues.extend(_content_findings(items))
+    from app.page_weight import weight_issues
+    issues.extend(weight_issues(items))
     if broken:
         issues.append({
             "key": "broken_links",

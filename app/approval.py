@@ -68,6 +68,34 @@ def stamp_approval(row: SiteChange, user) -> None:
     row.updated_at = datetime.utcnow()
 
 
+def sync_listing_package(proposed: dict, *, page_url: str = "") -> dict:
+    """Keep Open Graph and JSON-LD on the same words as the meta title and description."""
+    title = str(proposed.get("title") or "").strip()
+    desc = str(proposed.get("metaDescription") or "").strip()
+    proposed["openGraphTitle"] = title
+    proposed["openGraphDescription"] = desc
+    try:
+        from app.cms_connectors import build_webpage_json_ld
+
+        package = build_webpage_json_ld(
+            meta_title=title,
+            meta_description=desc,
+            page_url=str(proposed.get("targetUrl") or page_url or ""),
+            site_name=str((proposed.get("profileHints") or {}).get("business") or ""),
+        )
+    except Exception:  # noqa: BLE001
+        package = {}
+    if package:
+        existing = proposed.get("jsonLd") if isinstance(proposed.get("jsonLd"), dict) else {}
+        share = str(proposed.get("shareImage") or "").strip()
+        if share:
+            package["image"] = share
+        elif existing.get("image"):
+            package["image"] = existing["image"]
+        proposed["jsonLd"] = {**existing, **package}
+    return proposed
+
+
 def apply_edit(row: SiteChange, *, title: str | None, description: str | None) -> bool:
     """Save an edit. Returns True if an approval was withdrawn because the text changed."""
     if row.status not in EDITABLE:
@@ -77,6 +105,7 @@ def apply_edit(row: SiteChange, *, title: str | None, description: str | None) -
         proposed["title"] = re.sub(r"\s+", " ", title).strip()[:120]
     if description is not None:
         proposed["metaDescription"] = re.sub(r"\s+", " ", description).strip()[:320]
+    sync_listing_package(proposed, page_url=row.target_url or "")
     withdrawn = False
     if proposed.get("approvedHash") and content_hash(proposed.get("title"), proposed.get("metaDescription")) != proposed["approvedHash"]:
         for key in ("approvedHash", "approvedTitle", "approvedDescription"):

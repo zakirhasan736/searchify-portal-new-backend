@@ -17,6 +17,7 @@ class KeywordsBody(BaseModel):
     country: str = ""
     reach: str = ""
     force: bool = False
+    stored_only: bool = False
 
 
 class BacklinksBody(BaseModel):
@@ -67,7 +68,17 @@ def research_status(user: User = Depends(get_current_user)):
 
 @router.post("/keywords")
 def research_keywords(body: KeywordsBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return _run(research.keywords, db, user, site=body.site, terms=body.terms, country=body.country, reach=body.reach, force=body.force)
+    return _run(
+        research.keywords,
+        db,
+        user,
+        site=body.site,
+        terms=body.terms,
+        country=body.country,
+        reach=body.reach,
+        force=body.force,
+        stored_only=body.stored_only,
+    )
 
 
 @router.post("/backlinks")

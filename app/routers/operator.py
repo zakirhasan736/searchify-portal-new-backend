@@ -720,6 +720,9 @@ def _create_change(db: Session, user: User, body: ChangeBody) -> SiteChange:
     db.add(Job(customer_id=user.id, kind="site_change", status="queued", detail={"opportunity": body.opportunity[:120]}))
     db.commit()
     db.refresh(change)
+    if change.status == "awaiting_approval":
+        from app.push_alerts import notify_waiting
+        notify_waiting(db, user.id, change)
     return change
 
 
@@ -768,6 +771,73 @@ def _clip(value, limit: int = 280) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _sum_daily_window(rows: list[dict], start: int, end: int) -> dict:
+    slice_rows = rows[start:end]
+    clicks = sum(int(row.get("clicks") or 0) for row in slice_rows)
+    impressions = sum(int(row.get("impressions") or 0) for row in slice_rows)
+    weighted = sum(float(row.get("position") or 0) * int(row.get("impressions") or 0) for row in slice_rows)
+    return {
+        "clicks": clicks,
+        "impressions": impressions,
+        "position": round(weighted / impressions, 1) if impressions else None,
+        "days": len(slice_rows),
+    }
+
+
+def _assistant_performance(db: Session, user: User) -> list[str]:
+    """Stored Search Console movement the assistant can quote honestly."""
+    row = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "organic-search")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    payload = dict((row.payload if row else {}) or {})
+    nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
+    daily = payload.get("daily") or nested.get("daily") or []
+    if not isinstance(daily, list) or len(daily) < 8:
+        return ["Search Console daily: not enough stored days yet (need about 14 for a week comparison)."]
+    rows = []
+    for item in daily:
+        if not isinstance(item, (list, tuple)) or not item:
+            continue
+        try:
+            clicks = int(float(str(item[1]).replace(",", "").replace("—", "0") or 0))
+            impressions = int(float(str(item[2]).replace(",", "").replace("—", "0") or 0)) if len(item) > 2 else 0
+            position = float(str(item[4]).replace(",", "") or 0) if len(item) > 4 else 0.0
+        except (TypeError, ValueError):
+            continue
+        date = str(item[0] or "")
+        if date:
+            rows.append({"date": date, "clicks": clicks, "impressions": impressions, "position": position})
+    rows.sort(key=lambda item: item["date"])
+    if len(rows) < 8:
+        return ["Search Console daily: not enough stored days yet (need about 14 for a week comparison)."]
+    latest = _sum_daily_window(rows, -7, None)
+    earlier = _sum_daily_window(rows, -14, -7) if len(rows) >= 14 else None
+    lines = [
+        f"Latest 7 stored days: {latest['clicks']} clicks, {latest['impressions']} impressions"
+        + (f", average position {latest['position']}" if latest["position"] is not None else "")
+        + "."
+    ]
+    if earlier:
+        click_delta = latest["clicks"] - earlier["clicks"]
+        reach_delta = latest["impressions"] - earlier["impressions"]
+        click_word = "up" if click_delta > 0 else "down" if click_delta < 0 else "unchanged"
+        reach_word = "up" if reach_delta > 0 else "down" if reach_delta < 0 else "unchanged"
+        lines.append(
+            f"Prior 7 days: {earlier['clicks']} clicks, {earlier['impressions']} impressions"
+            + (f", average position {earlier['position']}" if earlier["position"] is not None else "")
+            + "."
+        )
+        lines.append(
+            f"Movement vs prior week: clicks {click_word} by {abs(click_delta)}, "
+            f"impressions (reach) {reach_word} by {abs(reach_delta)}. "
+            "These are stored Search Console windows, not live-today numbers."
+        )
+    return lines
+
+
 def _assistant_status(db: Session, user: User) -> list[str]:
     google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     sites = (
@@ -791,6 +861,7 @@ def _assistant_status(db: Session, user: User) -> list[str]:
         f"Search Console: {gsc}",
         f"Analytics: {analytics}",
         f"Open suggestions stored: {open_count}",
+        *_assistant_performance(db, user),
     ]
 
 
@@ -801,6 +872,47 @@ def _assistant_fallback(question: str, profile: dict, queue: list[dict], status:
     target = pending[0] if pending else first
     lower = question.lower()
     joined = " ".join(status or [])
+    if any(word in lower for word in ("skip", "next card", "arrow", "cycle without")):
+        return (
+            "You can move without approving or rejecting. On the review card use Previous or Skip, "
+            "or press the left and right arrow keys when you are not typing in a field. "
+            "Reject also opens the next waiting card when one is left."
+        )
+    if any(word in lower for word in ("regenerate", "rewrite", "generate again", "stronger listing", "new draft")):
+        return (
+            "Open the approval card and tap Regenerate listing package. "
+            "That replaces the draft with a fresh title, description, Open Graph, and JSON-LD on the same words. "
+            "Nothing is published until you approve. Skip if you want to move on without deciding."
+        )
+    if any(word in lower for word in ("weaker", "stronger", "current better", "live title", "prefer the current")):
+        return (
+            "Keep the live title when it is already stronger. Skip or reject that card. "
+            "Load Keywords, then regenerate so the package beats the live listing on a real keyword — "
+            "with Open Graph and JSON-LD matching the same words. Skip if you are done with that card."
+        )
+    if any(word in lower for word in ("williams", "sonoma", "wrong competitor", "cooking class", "kitchen store")):
+        return (
+            "The “Written to meet …” line should only name a competitor that sells the same kind of thing on the same keyword. "
+            "A kitchen store or nearby Places listing is not a web-design rival. Skip the card and regenerate so the reason stays honest."
+        )
+    if "month" in lower or "content plan" in lower:
+        return (
+            "Month lists stored keyword ideas that Search Console does not already cover, with draft status and a date you choose. "
+            "A date does not publish. Copy the monthly email from that page — a click drop stays in the text when the latest 14 days are lower."
+        )
+    if any(word in lower for word in ("phone", "pwa", "home screen", "push alert")):
+        return (
+            "The phone report uses the same login: this week beside last week, waiting approvals, and open issues. "
+            "Add it to the home screen if you like. A push tap opens a card and never publishes."
+        )
+    if any(word in lower for word in ("click", "impression", "reach", "traffic", "increased", "decreased", "this week", "today")):
+        perf = [line for line in (status or []) if line.startswith("Latest 7") or line.startswith("Prior 7") or line.startswith("Movement")]
+        if perf:
+            return " ".join(perf) + " Open the phone report or Month if you want the same numbers on screen."
+        return (
+            "I do not have enough stored Search Console days yet to say whether clicks or reach rose. "
+            "Sync Google on Connections, wait for about 14 daily rows, then ask again."
+        )
     if any(word in lower for word in ("cost", "price", "how much", "cheap")):
         return (
             "Happy to demystify that. Writing a title and description is the light part of the cost — "
@@ -952,28 +1064,39 @@ def ask_assistant(body: AssistantBody, db: Session = Depends(get_db), user: User
         role = "Searchify" if turn.role == "assistant" else "Operator"
         lines.append(f"{role}: {_clip(turn.text, 500)}")
     system = (
-        "You are Searchify assistance — a modern, elegant, open-minded guide in a real conversation with the person using this workspace. "
-        "Be warm, charming, and lightly witty without being cute or salesy. Sound like a sharp, kind colleague who notices what they need before they ask. "
-        "Use plain, conversational English. Prefer short, flowing sentences. Avoid stiff corporate tone, jargon piles, and robotic lists. "
-        "If asked who you are, say you are Searchify assistance. Never name a model, GPT, OpenAI, Luna, Terra, Sol, Astra, or 4o. "
-        "Answer their question first, clearly and honestly. Then offer one suggestive next step or one natural follow-up question — never more than one. "
-        "Invite; don’t command. Prefer phrasing like “You might try…”, “A gentle next step…”, “Want me to walk you through…?” "
-        "Usually three to six sentences. Use a short numbered list only when they ask what to do next. No headings, no markdown bold. "
-        "Stay curious and open-minded: if their goal is unusual, explore it with them instead of shutting it down. If something is missing, say so kindly and name what would unlock it. "
-        "The working style in the message changes wording, not publishing. Exact-match stays on the phrase already on the page. Balanced uses the closest honest query. Broader discovery may use one nearby angle the page already supports. "
-        "Review every change means they press Generate, then approve or dismiss each card. Prepare drafts automatically fills empty cards when they open the overview. Neither choice publishes. "
-        "Help them use the product with confidence: connect WordPress, choose Search Console and Analytics, sync, press Generate, then dismiss or approve each card. "
-        "Notice what they are trying to finish, name why that step helps in one plain sentence, then say how to do it. "
-        "You cannot sign in to Google or WordPress for them, and you cannot publish. Offer the page when useful: Connections, Manage workspace, Keywords, Backlinks, AI visibility, Subscription, or contact. "
-        "A lost backlink is a review cue, not a disavow. Do not invent ranks, volumes, scores, or link counts. "
-        "Each website can use its own Google account. Overview and Settings follow the selected website. Keywords, Backlinks, AI visibility, and the completion log can stay on one website for that page only. "
-        "A title suggestion reads the live page, competitor listings, Search Console, and Analytics. The output is one title and one description. It does not publish. "
-        "If they ask cost, say this and do not invent another price: one page is under a cent, five pages about 3 cents, ten pages about 6 cents. A rewritten page costs about twice. That is the writing step only. "
+        "You are Searchify assistance — the SEO guy inside this workspace. "
+        "Persona: a friendly, modern, communicative specialist with 10+ years in Google SEO, technical SEO, Open Graph, and search-engine listings. "
+        "You have hands-on experience optimizing WordPress, Webflow, Shopify, and custom-built websites. "
+        "You are super smart and super friendly: warm, clear, suggestive, and easy to talk to — like a sharp colleague sitting next to the user, not a stiff chatbot. "
+        "Talk in a natural conversation. Notice what they need next. Offer one helpful suggestion without lecturing. "
+        "If asked who you are, say you are Searchify assistance, their SEO guide in this product. "
+        "Never name a model, GPT, OpenAI, Luna, Terra, Sol, Astra, DataForSEO, or 4o. "
+        "Say “Searchify SEO research” when you mean paid keyword, competitor, or backlink lookups. "
+        "Answer the question first in one or two short sentences. Then give one concrete next step (name the page when useful). "
+        "Usually two to five sentences. No headings, no markdown bold, no emoji. Prefer “You can…” or “I’d try…” over “You must…”. "
+        "Stay professional: honest about weak drafts, wrong competitors, or missing Google data. Never invent ranks, volumes, scores, or link counts. "
+        "North star: Connect Google + the site. Searchify writes the strongest listing package it can defend (keyword, meta title, meta description, Open Graph, JSON-LD). The human approves. Next week they check whether Search Console showed and clicked more. "
+        "You are the control panel for that loop — clicks and reach, the approval queue, regenerate, skip — not a chat that invents titles. "
+        "DataForSEO powers Searchify SEO research (keywords, competitors, content drafts). JEV is Searchify’s own Judge/Evaluate/Verify score on the draft — not a separate vendor. Both show on the approval card. "
+        "Be honest when a draft is weak: if the live title is already better, say keep the live one, skip the card, or regenerate on the card after Google and Keywords are loaded. "
+        "Regenerate on an approval card replaces the draft with a new listing package: the same words for title, description, Open Graph, and JSON-LD. It does not publish. "
+        "A “Written to meet …” line only counts when that competitor sells the same kind of thing on the same keyword. "
+        "A kitchen store, cookware shop, or unrelated Places listing is never a web-design or marketing competitor — say so if they ask. "
+        "On an approval card they can use Previous, Skip, or the arrow keys to move without approving or rejecting. Rejecting also opens the next waiting card when one exists. "
+        "Help with the real loop: Connections → sync Search Console → Keywords / Read the site → drafts in the queue → regenerate until the package beats live → approve only what is stronger → WordPress / CMS publish is a later step. "
+        "You understand meta title, meta description, Open Graph, JSON-LD, keywords, backlinks, AI visibility, and site audits, and you explain them in plain language. "
+        "Month and Phone report show movement and the content plan; a date on the month plan does not publish. Push alerts open a card and never publish. "
+        "Image and script-weight cards can be approved without changing the live site until a plugin write exists. "
+        "You cannot sign in to Google or WordPress/Webflow/Shopify for them, and you cannot publish from this chat. "
+        "Never claim rankings or promise positions. Always talk about movement from stored Search Console clicks and impressions. "
+        "When they ask about clicks, reach, impressions, traffic, or whether numbers increased, answer only from the Search Console lines in Workspace status. "
+        "Say the latest 7 days beside the prior 7 days, and whether clicks or impressions went up or down. "
+        "If status says there are not enough stored days, say that honestly. Do not invent a today-only number. "
+        "Offer the right page when useful: Connections, Manage workspace, Keywords, Queue, Month, Phone report, Results, Backlinks, AI visibility, Subscription, or contact. "
         "Use the workspace status and the queue in the message. Name the page when you refer to a card. "
-        "Do not say you approved or published anything. Approval happens on the card, not in this chat. "
-        "If a card is marked setup brief only, say that it is not from Search Console yet. "
-        "When the queue already has those pages, suggest dismissing a card before writing that page again. "
-        "End most replies feeling open — as if the conversation can continue easily."
+        "If a card is setup brief only, say it is not from Search Console yet. "
+        "If they ask cost, say only this: one page is under a cent, five pages about 3 cents, ten pages about 6 cents; a rewrite is about twice — writing cost only. "
+        "End most replies like a conversation that can continue — invite one natural follow-up."
     )
     try:
         text, model, _role = chat_text(
@@ -1349,6 +1472,77 @@ def _site_context(scan: dict, url: str) -> tuple[dict | None, dict, list[dict]]:
     return pages.get(key), {"business": scan.get("business") or {}, "page": info, "siblings": siblings}, rivals
 
 
+class WeightBody(BaseModel):
+    kind: str = "assets"
+    url: str = ""
+    images_bytes: int = 0
+    scripts_bytes: int = 0
+    css_bytes: int = 0
+
+
+@router.post("/changes/from-weight")
+def create_weight_change(body: WeightBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Queue a smaller image or a script/CSS weight card. Neither one is published."""
+    url = body.url.strip()
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="This finding has no page URL yet.")
+    kind = "image" if body.kind == "image" else "assets"
+    prepared: dict = {}
+    if kind == "image":
+        from app.page_scrape import scrape_page
+        from app.page_weight import smaller_image
+
+        scraped = scrape_page(url)
+        sources = [str(row.get("src") or "") for row in (scraped.get("images") or [])]
+        if scraped.get("ogImage"):
+            sources.insert(0, str(scraped["ogImage"]))
+        prepared = smaller_image(url, sources)
+        change_type = "image"
+        opportunity = f"Smaller image for {url}"
+        title = "Smaller image ready" if prepared.get("smallerImage") else "Image weight recorded"
+        description = str(prepared.get("note") or "The image weight is recorded on this card.")
+    else:
+        from app.page_weight import kb
+
+        bits = []
+        if body.scripts_bytes >= 300_000:
+            bits.append(f"scripts {kb(body.scripts_bytes)}")
+        if body.css_bytes >= 150_000:
+            bits.append(f"CSS {kb(body.css_bytes)}")
+        change_type = "performance"
+        opportunity = f"Heavy scripts or CSS on {url}"
+        title = "Heavy scripts or CSS"
+        description = (
+            f"This page is carrying {' and '.join(bits) or 'heavy files'}. "
+            "Approving records the request. Theme files are not edited."
+        )
+    change = SiteChange(
+        customer_id=user.id,
+        source="audit",
+        opportunity=opportunity[:500],
+        target_url=url,
+        change_type=change_type,
+        proposed={
+            "title": title,
+            "metaDescription": description[:320],
+            "changeType": change_type,
+            "targetUrl": url,
+            "imagesBytes": max(0, int(body.images_bytes or 0)),
+            "scriptsBytes": max(0, int(body.scripts_bytes or 0)),
+            "cssBytes": max(0, int(body.css_bytes or 0)),
+            **prepared,
+        },
+        status="awaiting_approval",
+    )
+    db.add(change)
+    db.commit()
+    db.refresh(change)
+    from app.push_alerts import notify_waiting
+    notify_waiting(db, user.id, change)
+    _sync_operator_features(db, user)
+    return _change_row(change)
+
+
 @router.post("/changes/from-gsc")
 def propose_from_gsc(
     body: FromGscBody | None = Body(default=None),
@@ -1542,6 +1736,7 @@ def propose_from_gsc(
                 taken=taken,
                 kind=job["kind"],
                 research=stored_research,
+                # Searchify SEO content generation runs on single-card regenerate (thread-safe session).
             )
         except Exception as exc:  # noqa: BLE001
             return {"aiError": str(exc)[:200]}
@@ -1558,7 +1753,7 @@ def propose_from_gsc(
                 results[index] = draft(jobs[index], taken=[t for t in earlier if t])
                 rewrites += 1
 
-    created, failed = [], []
+    created, failed, waiting_rows = [], [], []
     db.execute(sql_text("SELECT pg_advisory_xact_lock(:k)"), {"k": 7_300_000 + user.id})
     open_urls = _open_urls(db, user.id)
     for job, drafted in zip(jobs, results):
@@ -1609,11 +1804,16 @@ def propose_from_gsc(
                 "model": drafted.get("model") or "",
                 "role": drafted.get("role") or "",
                 "competitors": [
-                    {k: r.get(k) for k in ("title", "url", "description", "source")} for r in (job["rivals"] or [])[:6]
+                    {k: r.get(k) for k in ("title", "url", "description", "source")}
+                    for r in (drafted.get("competitors") or job["rivals"] or [])[:6]
                 ],
+                "meetCompetitor": drafted.get("meetCompetitor") or {},
+                "beatsLive": bool(drafted.get("beatsLive")),
+                "jev": drafted.get("jev") or {},
+                "analysis": drafted.get("analysis") or {},
                 "analytics": bool((job["analytics"] or {}).get("connected")),
                 "specificity": drafted.get("specificity") or body.breadth or "balanced",
-                "writer": "site-scan+schema+open-graph+searchify-seo+gsc+analytics",
+                "writer": "site-scan+schema+open-graph+searchify-seo+gsc+analytics+jev",
                 "profileHints": {k: profile.get(k) or "" for k in ("business", "services", "areas", "goal", "restrictions")},
                 "pageType": drafted.get("pageType") or job["kind"],
                 "contentStatus": job["content"],
@@ -1634,6 +1834,7 @@ def propose_from_gsc(
         db.add(change)
         db.flush()
         created.append(_change_row(change))
+        waiting_rows.append(change)
         open_urls.add(page_key(url))
 
     if scan:
@@ -1652,6 +1853,10 @@ def propose_from_gsc(
 
         _upsert_feature(db, user.id, "site-scan", _scan_title(_host(homepage)), scan)
     db.commit()
+    if waiting_rows:
+        from app.push_alerts import notify_waiting
+        for change in waiting_rows:
+            notify_waiting(db, user.id, change)
     if created:
         _sync_operator_features(db, user)
     summary = _scan_summary(scan, open_urls) if scan else None
@@ -1721,6 +1926,9 @@ def change_from_draft(body: FromDraftBody, db: Session = Depends(get_db), user: 
     db.add(change)
     db.commit()
     db.refresh(change)
+    if change.status == "awaiting_approval":
+        from app.push_alerts import notify_waiting
+        notify_waiting(db, user.id, change)
 
     result = {"ok": True, "change": _change_row(change), "executed": None}
     if body.execute and change.status == "approved":
@@ -1782,6 +1990,11 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
         approved = approval.check_publishable(row)
     except approval.ApprovalError as exc:
         raise _approval_http(exc) from exc
+    if (row.change_type or "") in {"image", "performance"}:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "not_published", "message": "This card keeps the smaller image or the script and CSS weight. Nothing was published to the site."},
+        )
 
     conn_id = body.cms_connection_id or row.cms_connection_id
     conn = db.get(CmsConnection, conn_id) if conn_id else None
@@ -1903,6 +2116,9 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
     )
     db.commit()
     db.refresh(row)
+    if row.status == "failed":
+        from app.push_alerts import notify_failed
+        notify_failed(db, user.id, row)
     _sync_operator_features(db, user)
     log.info("change_publish_finished", extra={"change_id": row.id, "status": row.status, "user_id": user.id})
     if not result.get("ok") or result.get("dryRun"):
@@ -2064,13 +2280,21 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             site=site_ctx,
             taken=[t for t in taken if t][:20],
             research=load_stored(db, user.id),
+            db=db,
+            user=user,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)[:200]) from exc
 
+    title = drafted.get("title") or ""
+    desc = drafted.get("metaDescription") or ""
     options = [
-        {"title": drafted.get("title") or "", "description": drafted.get("metaDescription") or "", "reason": drafted.get("reason") or ""},
+        {"title": title, "description": desc, "reason": drafted.get("reason") or ""},
     ]
+    # Apply the regenerated listing package to the card — title, description, OG, and JSON-LD stay aligned.
+    proposed["title"] = title
+    proposed["metaDescription"] = desc
+    proposed["reason"] = drafted.get("reason") or ""
     proposed["aiAlternatives"] = options
     proposed["model"] = drafted.get("model")
     proposed["role"] = drafted.get("role")
@@ -2078,9 +2302,13 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["competitors"] = [
         {k: r.get(k) for k in ("title", "url", "description", "source")} for r in (drafted.get("competitors") or competitors)[:6]
     ]
+    proposed["meetCompetitor"] = drafted.get("meetCompetitor") or {}
+    proposed["beatsLive"] = bool(drafted.get("beatsLive"))
+    proposed["jev"] = drafted.get("jev") or {}
+    proposed["analysis"] = drafted.get("analysis") or {}
     proposed["target"] = drafted.get("target") or proposed.get("target") or ""
-    proposed["openGraphTitle"] = drafted.get("openGraphTitle") or drafted.get("title") or ""
-    proposed["openGraphDescription"] = drafted.get("openGraphDescription") or drafted.get("metaDescription") or ""
+    proposed["openGraphTitle"] = drafted.get("openGraphTitle") or title
+    proposed["openGraphDescription"] = drafted.get("openGraphDescription") or desc
     proposed["shareImage"] = drafted.get("shareImage") or proposed.get("shareImage") or ""
     proposed["images"] = drafted.get("images") or []
     scraped_now = drafted.get("scraped") or {}
@@ -2091,23 +2319,46 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["reviewRating"] = scraped_now.get("reviewRating") or drafted.get("reviewRating") or ""
     proposed["reviewCount"] = scraped_now.get("reviewCount") or drafted.get("reviewCount") or ""
     proposed["jsonLd"] = drafted.get("jsonLd") or {}
+    proposed["validation"] = drafted.get("validation") or proposed.get("validation") or {"status": "unverified", "claims": []}
+    proposed["openIssues"] = drafted.get("openIssues") or []
+    proposed["writer"] = "site-scan+schema+open-graph+searchify-seo+gsc+analytics+jev"
+    proposed["pageType"] = drafted.get("pageType") or proposed.get("pageType") or ""
     if scraped_now.get("ogTitle"):
-        proposed["beforeOpenGraphTitle"] = proposed.get("beforeOpenGraphTitle") or scraped_now.get("ogTitle")
+        proposed["beforeOpenGraphTitle"] = scraped_now.get("ogTitle")
     if scraped_now.get("ogDescription"):
-        proposed["beforeOpenGraphDescription"] = proposed.get("beforeOpenGraphDescription") or scraped_now.get("ogDescription")
+        proposed["beforeOpenGraphDescription"] = scraped_now.get("ogDescription")
     if scraped_now.get("schemaTypes"):
-        proposed["beforeSchemaTypes"] = proposed.get("beforeSchemaTypes") or scraped_now.get("schemaTypes")
+        proposed["beforeSchemaTypes"] = scraped_now.get("schemaTypes")
     if scraped_now.get("schemaName"):
-        proposed["beforeSchemaName"] = proposed.get("beforeSchemaName") or scraped_now.get("schemaName")
+        proposed["beforeSchemaName"] = scraped_now.get("schemaName")
     if scraped_now.get("schemaDescription"):
-        proposed["beforeSchemaDescription"] = proposed.get("beforeSchemaDescription") or scraped_now.get("schemaDescription")
+        proposed["beforeSchemaDescription"] = scraped_now.get("schemaDescription")
     proposed["analytics"] = bool((drafted.get("analytics") or {}).get("connected"))
     proposed["specificity"] = drafted.get("specificity") or body.breadth or "balanced"
+    from app import page_quality as _pq
+
+    proposed["confidence"] = _pq.confidence(
+        content=proposed.get("contentStatus") or "ok",
+        gsc=proposed.get("evidence") or {},
+        rivals=proposed.get("competitors") or [],
+        validation=(proposed.get("validation") or {}).get("status") or "",
+        analytics=bool(proposed.get("analytics")),
+    )
     scraped = drafted.get("scraped") or {}
     if scraped.get("title"):
-        proposed["beforeTitle"] = proposed.get("beforeTitle") or scraped.get("title")
+        proposed["beforeTitle"] = scraped.get("title")
     if scraped.get("description"):
-        proposed["beforeDescription"] = proposed.get("beforeDescription") or scraped.get("description")
+        proposed["beforeDescription"] = scraped.get("description")
+    from app.approval import sync_listing_package
+
+    sync_listing_package(proposed, page_url=row.target_url or "")
+    # Regenerating replaces the draft; withdraw a prior approval so publish cannot ship stale text.
+    if proposed.get("approvedHash"):
+        for key in ("approvedHash", "approvedTitle", "approvedDescription"):
+            proposed.pop(key, None)
+        if row.status in {"approved", "failed"}:
+            row.status = "awaiting_approval"
+            row.approved_at = None
     row.proposed = proposed
     row.updated_at = datetime.utcnow()
     try:
@@ -2117,7 +2368,15 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     except Exception:  # noqa: BLE001
         pass
     db.commit()
-    return {"ok": True, "options": options, "model": drafted.get("model"), "change": _change_row(row)}
+    db.refresh(row)
+    return {
+        "ok": True,
+        "applied": True,
+        "beatsLive": bool(proposed.get("beatsLive")),
+        "options": options,
+        "model": drafted.get("model"),
+        "change": _change_row(row),
+    }
 
 
 @router.post("/changes/{change_id}/undo")
@@ -2257,6 +2516,9 @@ def queue_ai_visibility(body: VisibilityQueueBody, db: Session = Depends(get_db)
     db.add(change)
     db.commit()
     db.refresh(change)
+    if change.status == "awaiting_approval":
+        from app.push_alerts import notify_waiting
+        notify_waiting(db, user.id, change)
     _sync_operator_features(db, user)
     return {"ok": True, "change": _change_row(change)}
 

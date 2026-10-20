@@ -15,6 +15,7 @@ FEATURES = {
     "visibility": "AI visibility checks",
     "competitors": "Competitor lookups",
     "audits": "Site audits",
+    "content": "Searchify SEO meta drafts",
 }
 
 PLANS = {
@@ -22,19 +23,19 @@ PLANS = {
         "label": "Starter",
         "trackedKeywords": 10,
         "keywordIdeas": 10,
-        "monthly": {"keywords": 10, "backlinks": 5, "visibility": 20, "competitors": 10, "audits": 2},
+        "monthly": {"keywords": 10, "backlinks": 5, "visibility": 20, "competitors": 10, "audits": 2, "content": 30},
     },
     "growth": {
         "label": "Growth",
         "trackedKeywords": 50,
         "keywordIdeas": 25,
-        "monthly": {"keywords": 40, "backlinks": 20, "visibility": 100, "competitors": 40, "audits": 8},
+        "monthly": {"keywords": 40, "backlinks": 20, "visibility": 100, "competitors": 40, "audits": 8, "content": 120},
     },
     "agency": {
         "label": "Agency",
         "trackedKeywords": 200,
         "keywordIdeas": 50,
-        "monthly": {"keywords": 150, "backlinks": 60, "visibility": 400, "competitors": 150, "audits": 30},
+        "monthly": {"keywords": 150, "backlinks": 60, "visibility": 400, "competitors": 150, "audits": 30, "content": 400},
     },
 }
 SERVER_PLAN = {"starter": "starter", "growth": "growth", "agency": "agency", "scale": "agency", "custom": "agency"}

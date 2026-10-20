@@ -35,13 +35,15 @@ FILLER = (
 )
 
 SYSTEM = (
-    "You are a senior SEO copywriter. You write the Google title and meta description for one specific page. "
+    "You are a senior SEO copywriter competing with the best SEO tools. You write the Google title and meta description for one specific page. "
     "The page topic is the concept. The best keyword is the search this page can honestly win. "
     "Work in this order: (1) read the page topic in the brief and stay on that concept — do not switch to another service from the business brief or from a popular site-wide query; "
     "(2) put the best keyword, in those words, near the front of the title; "
-    "(3) add one concrete fact from this page (a place, an offer, a proof) so the listing is specific; "
-    "(4) meet the hardest competitor on that same search. Match the strength of their keyword. Add one fact only this business can say. Do not copy their title or their claims. "
+    "(3) add one concrete fact from this page (a place, an offer, a proof, a named project) so the listing is specific and not a paste of the H1; "
+    "(4) meet the hardest competitor on that same search. Match the strength of their keyword. Add one fact only this business can say. Do not copy their title or their claims; "
+    "(5) beat the live title: if the current listing already has the keyword, your draft must add a sharper proof or a second offer the live title misses. "
     "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
+    "Use Search Console queries, Analytics landing facts, site-audit notes, backlink anchors, and AI-visibility gaps only as evidence for which angle to win — never invent numbers. "
     "Every page on the site needs its own topic: never reuse another page's title. "
     "It does not sound like an agency slogan. "
     "Do not invent reviews, years in business, prices, awards, or certifications. "
@@ -53,7 +55,6 @@ SYSTEM = (
     "The same title and description are the Open Graph title, the Open Graph description, and the WebPage schema name and description. "
     "Read the current title, meta description, Open Graph, and JSON-LD. Stay on that page's concept. "
     "A one-word H1 such as Home is not the topic — use the schema name, the Open Graph title, or the real heading. "
-    "Search Console, Analytics, and the stored Searchify SEO keywords, competitors, AI visibility, and backlinks explain which search this page can win. "
     "Do not invent search volume, positions, or mentions that are not in the brief. "
     "Do not put click counts, session counts, or bounce rates inside the title or description. "
     "Return exactly four lines:\n"
@@ -275,17 +276,38 @@ def coverage_keywords(
     return [text for _score, text in ranked[:4]]
 
 
+def _rival_text(rival: dict) -> str:
+    return " ".join(str(rival.get(key) or "") for key in ("title", "h1", "description"))
+
+
+def rival_keyword_fit(rival: dict, keyword: str, offers: list[str] | None = None) -> int:
+    """How many keyword (or offer) words appear in the competitor listing. Zero means unrelated."""
+    target = _content_tokens(keyword)
+    if len(target) < 2:
+        target = _content_tokens(" ".join(str(item) for item in (offers or []) if str(item).strip()))
+    if not target:
+        return 0
+    words = _content_tokens(_rival_text(rival))
+    return len(words & target)
+
+
 def rival_to_meet(rivals: list[dict], keyword: str, offers: list[str]) -> dict:
-    """The listed competitor this listing has to be strong enough to stand next to."""
+    """The listed competitor this listing has to be strong enough to stand next to.
+
+    A Places store or an unrelated SERP result is never chosen just because it was first.
+    The competitor must share the keyword (or the business offer). Named rivals only break ties.
+    """
     pool = [rival for rival in rivals or [] if isinstance(rival, dict) and rival.get("title")]
-    named = [rival for rival in pool if "named" in str(rival.get("source") or "").lower()]
-    pool = named or pool
-    target = _content_tokens(keyword) or _content_tokens(" ".join(offers))
-    best, best_score = {}, -1
+    best, best_score = {}, 0
     for rival in pool:
-        score = len(_content_tokens(rival.get("title") or "") & target)
-        if named:
-            score += 2
+        fit = rival_keyword_fit(rival, keyword, offers)
+        if fit < 1:
+            continue
+        score = fit
+        if "named" in str(rival.get("source") or "").lower():
+            score += 1
+        if "google results" in str(rival.get("source") or "").lower():
+            score += 0.5
         if score > best_score:
             best, best_score = rival, score
     return best
@@ -303,19 +325,24 @@ def meets_competitor(title: str, rival: dict, keyword: str) -> bool:
     return True
 
 
-def conceptual_rivals(rivals: list[dict], offers: list[str]) -> list[dict]:
-    """Keep competitors that sell the same kind of thing. Drop unrelated search results."""
+def conceptual_rivals(rivals: list[dict], offers: list[str], keyword: str = "") -> list[dict]:
+    """Keep competitors that sell the same kind of thing. Drop unrelated search and Places results."""
     offer_blob = " ".join(str(item) for item in offers if str(item).strip())
-    if not offer_blob:
-        return list(rivals or [])[:6]
+    concept = offer_blob or keyword
+    concept_words = _content_tokens(concept)
     kept = []
     for rival in rivals or []:
-        if not isinstance(rival, dict):
+        if not isinstance(rival, dict) or not rival.get("title"):
             continue
-        text = " ".join(str(rival.get(key) or "") for key in ("title", "h1", "description"))
+        text = _rival_text(rival)
         words = _content_tokens(text)
-        shared = words & _content_tokens(offer_blob)
-        if shared or _keyword_fit(text, offer_blob, offer_blob) >= 0.34:
+        if not concept_words:
+            # No offer yet: only keep SERP rows that already share the page keyword.
+            if keyword and rival_keyword_fit(rival, keyword, offers) >= 1:
+                kept.append(rival)
+            continue
+        shared = words & concept_words
+        if shared or _keyword_fit(text, concept, concept) >= 0.34:
             kept.append(rival)
     return kept[:6]
 
@@ -448,11 +475,17 @@ def listing_is_stronger(
     offers: list[str] | None = None,
     rival: dict | None = None,
 ) -> bool:
-    """True when the draft leads with the business keyword and is not a copy of the current title."""
+    """True when the draft beats the live listing — not a paste of the page or a near-copy of the current title."""
     _ = brand
     if not (title and desc):
         return False
-    if (current_title or "").strip() and title.strip().lower() == current_title.strip().lower() and desc.strip().lower() == (current_desc or "").strip().lower():
+    current = (current_title or "").strip()
+    current_d = (current_desc or "").strip()
+    if current and title.strip().lower() == current.lower() and desc.strip().lower() == current_d.lower():
+        return False
+    if current and _overlap(title, current) >= 0.75:
+        return False
+    if current_d and _overlap(desc, current_d) >= 0.85:
         return False
     concept = " ".join(str(item) for item in (offers or []) if str(item).strip()) or keyword
     concept_words = _content_tokens(concept)
@@ -470,6 +503,18 @@ def listing_is_stronger(
             return False
     if rival and not meets_competitor(title, rival, keyword):
         return False
+    # Live title already targets this keyword: the draft must add a new offer word or a new fact.
+    current_words = _content_tokens(current)
+    if keyword_words and len(keyword_words) >= 2 and len(current_words & keyword_words) >= max(1, (len(keyword_words) + 1) // 2):
+        fresh = title_words - current_words - keyword_words
+        alt_hit = False
+        for offer in offers or []:
+            offer_words = _content_tokens(offer)
+            if offer_words and offer_words != keyword_words and (offer_words & title_words or offer_words & _content_tokens(desc)):
+                alt_hit = True
+                break
+        if not fresh and not alt_hit:
+            return False
     return True
 
 
@@ -603,6 +648,8 @@ def write_title_description(
     taken: list[str] | None = None,
     kind: str = "",
     research: dict | None = None,
+    db=None,
+    user=None,
 ) -> dict:
     scraped = page if page and not page.get("error") and page.get("url") else scrape_page(url)
     kind = kind or page_quality.page_type(url, ((site or {}).get("page") or {}).get("role") or "", scraped)
@@ -625,20 +672,14 @@ def write_title_description(
         business = site["business"]
         page_bits += " " + " ".join(map(str, [*(business.get("offers") or []), *(business.get("places") or [])]))
     topic = page_topic(scraped)
-    from app.listing_research import keyword_candidates, ranked_on_url, research_lines
+    from app.listing_research import (
+        best_keyword_from_research,
+        page_anchors,
+        research_lines,
+        visibility_gap,
+    )
 
     page_url = scraped.get("url") or url
-    ranked_rows = ((research or {}).get("keywords") or {}).get("ranked") or []
-    on_page = ranked_on_url(ranked_rows, page_url)
-    extra_terms = keyword_candidates(research, page_url, topic)
-    if on_page:
-        keyword = str(on_page[0].get("keyword") or "").strip() or topic
-        matched = matching_queries([keyword, *extra_terms, *queries], topic, page_only)
-        if keyword.lower() not in {item.lower() for item in matched}:
-            matched = [keyword, *matched][:5]
-    else:
-        matched = matching_queries([*extra_terms, *queries], topic, page_only)
-        keyword = best_keyword(matched, topic)
     business = ((site or {}).get("business") or {})
     offers = [str(item).strip() for item in (business.get("offers") or []) if str(item).strip()]
     if not offers and profile.get("services"):
@@ -646,17 +687,29 @@ def write_title_description(
     places = [str(item).strip() for item in (business.get("places") or []) if str(item).strip()]
     if not places and (profile.get("areas") or profile.get("locations")):
         places = [part.strip() for part in str(profile.get("areas") or profile.get("locations")).split(",") if part.strip()]
-    options = coverage_keywords(offers=offers, places=places, queries=[*matched, *queries], brand=brand, url=page_url)
-    if options:
+    research_best, research_alts = best_keyword_from_research(
+        research, url=page_url, topic=topic or " ".join(offers[:2]), offers=offers, queries=queries,
+    )
+    matched = matching_queries([research_best, *research_alts, *queries], topic or " ".join(offers), page_only)
+    if research_best and research_best.lower() not in {item.lower() for item in matched}:
+        matched = [research_best, *matched][:6]
+    keyword = research_best or best_keyword(matched, topic)
+    options = coverage_keywords(offers=offers, places=places, queries=[*matched, *research_alts, *queries], brand=brand, url=page_url)
+    # Prefer a stored Searchify SEO keyword when it already fits the offer; otherwise keep coverage order.
+    if research_best and offers and (_content_tokens(research_best) & _content_tokens(" ".join(offers))):
+        keyword = research_best
+        if research_best.lower() not in {item.lower() for item in options}:
+            options = [research_best, *options][:4]
+    elif options:
         keyword = options[0]
-        place_words = set()
-        for place in places:
-            place_words |= _content_tokens(place)
-        if not topic or _content_tokens(topic) <= place_words or brand_only_keyword(topic, brand, page_url):
-            topic = offers[0] if offers else keyword
-    rivals = conceptual_rivals(rivals, offers)
+    place_words = set()
+    for place in places:
+        place_words |= _content_tokens(place)
+    if not topic or _content_tokens(topic) <= place_words or brand_only_keyword(topic, brand, page_url):
+        topic = offers[0] if offers else keyword
+    rivals = conceptual_rivals(rivals, offers, keyword=keyword)
     meet = rival_to_meet(rivals, keyword, offers)
-    query_block = "\n".join(f"- {q}" for q in options or matched) or "(No Search Console query matches this business yet. Use the business offer as the keyword.)"
+    query_block = "\n".join(f"- {q}" for q in (options or matched or research_alts)) or "(No Search Console query matches this business yet. Use the business offer as the keyword.)"
     schema_types = ", ".join(scraped.get("schemaTypes") or []) or "(none found)"
     current_listing = (
         f"Current meta title: {scraped.get('title') or '(none)'}\n"
@@ -682,11 +735,83 @@ def write_title_description(
         "draftBody": "",
         "scraped": {**scraped, "headings": headings or ""},
         "competitors": rivals,
+        "meetCompetitor": {k: meet.get(k) for k in ("title", "url", "description", "source")} if meet else {},
+        "beatsLive": False,
+        "openIssues": ["OpenAI is not configured, so the live title was kept."],
         "queries": queries,
         "analytics": analytics or {},
         "target": "",
     }
+
+    def seo_content_draft() -> dict:
+        from app import dfs_meta
+
+        return dfs_meta.draft_from_research(
+            db,
+            user,
+            keyword=keyword or topic or "",
+            topic=topic or "",
+            offers=offers,
+            current_title=str(scraped.get("title") or ""),
+            current_desc=str(scraped.get("description") or ""),
+            page_text=str(scraped.get("text") or ""),
+            headings=str(headings or ""),
+            rival_title=str(meet.get("title") or ""),
+            anchors=page_anchors(research, page_url),
+            visibility_gap=visibility_gap(research),
+        )
+
     if not openai_configured():
+        seeded = seo_content_draft()
+        if seeded.get("title") and seeded.get("description"):
+            from app.jev import score_listing
+
+            seo_title = _clean(seeded["title"], 60)
+            seo_desc = _clean(seeded["description"], 155)
+            live_title = str(scraped.get("title") or "")
+            live_desc = str(scraped.get("description") or "")
+            beats = listing_is_stronger(
+                seo_title, seo_desc, live_title, live_desc, brand,
+                keyword=keyword, places=places, offers=offers, rival=meet,
+            )
+            target_kw = keyword or topic or ""
+            jev = score_listing(
+                title=seo_title,
+                description=seo_desc,
+                keyword=target_kw,
+                live_title=live_title,
+                live_description=live_desc,
+                beats_live=beats,
+                meet_competitor=str(meet.get("title") or ""),
+                open_issues=[],
+            )
+            return {
+                **empty,
+                "title": seo_title,
+                "metaDescription": seo_desc,
+                "openGraphTitle": seo_title,
+                "openGraphDescription": seo_desc,
+                "reason": f"Drafted with Searchify SEO content generation on “{keyword or topic}”. Compare it to the live title before approving.",
+                "model": "searchify-seo-content",
+                "role": "content",
+                "target": target_kw,
+                "beatsLive": beats,
+                "openIssues": [],
+                "jev": jev,
+                "analysis": {
+                    "sources": [
+                        "Live page (title, description, Open Graph, JSON-LD)",
+                        "Searchify SEO content generation",
+                        "Searchify SEO keyword and competitor research" if research else "",
+                        f"Competitor to meet: {meet.get('title')}" if meet.get("title") else "No same-keyword competitor stored",
+                        "JEV draft score",
+                    ],
+                    "keyword": target_kw,
+                    "beatsLive": beats,
+                    "meetCompetitor": str(meet.get("title") or ""),
+                    "contentWriter": True,
+                },
+            }
         return empty
 
     short_note = ""
@@ -709,9 +834,11 @@ def write_title_description(
         f"Use a different one in the description so the listing covers more than one search. "
         f"A city leads the title only when the best keyword itself contains that city:\n{query_block}\n"
         f"BEST KEYWORD: {keyword or topic or '(use the business offer)'}\n\n"
-        f"3. COMPETITOR TO MEET. This is the hard competitor. The title must be strong enough to stand on the same search. Use the best keyword, then a fact only this business can say. Do not copy their title:\n{meet.get('title') or '(none listed)'}\n"
+        f"3. COMPETITOR TO MEET. Only use a competitor that sells the same kind of thing on this keyword. "
+        f"Never meet a kitchen store, cookware shop, or unrelated Places listing for a web or marketing page. "
+        f"When a hard competitor is listed, the title must stand on the same search with the best keyword and a fact only this business can say. Do not copy their title:\n{meet.get('title') or '(none that share this keyword — write from the business offer and the live page)'}\n"
         f"Other competitors that sell the same kind of service:\n{_rival_block(rivals)}\n\n"
-        f"4. SEARCH CONSOLE AND RESEARCH, already matched to this business:\n{research_lines(research, page_url, topic)}\n"
+        f"4. SEARCH CONSOLE AND RESEARCH, already matched to this business:\n{research_lines(research, page_url, topic, offers)}\n"
         f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} position={gsc.get('position')}\n\n"
         f"5. CURRENT LISTING. This is what is live. Beat it. Do not copy it, and do not start with its city unless the best keyword contains that city:\n{current_listing}\n"
         f"Page: {scraped.get('url') or url}\n"
@@ -738,6 +865,7 @@ def write_title_description(
     if taken:
         brief += "\nTitles already written for other pages on this site (yours must differ):\n" + "\n".join(f"- {t}" for t in taken[:20]) + "\n"
     current = scraped.get("title") or ""
+    live_desc = str(scraped.get("description") or "")
     evidence_text = " ".join(
         str(part) for part in (scraped.get("title"), scraped.get("description"), scraped.get("h1"), headings, scraped.get("text")) if part
     )
@@ -755,6 +883,13 @@ def write_title_description(
             found.extend(page_quality.case_study_problems(t, d, scraped, brand))
         if current.strip() and offers and not (_content_tokens(t) & _content_tokens(" ".join(offers))):
             found.append("The title left the business concept. Use the best keyword from the offers, not the current title.")
+        if current.strip() and not listing_is_stronger(
+            t, d, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
+        ):
+            found.insert(0, (
+                "The draft is not stronger than the live title. Lead with the best keyword, keep a fact only this page can say, "
+                "and do not paste the current listing or the page headings."
+            ))
         for place in places:
             name = str(place or "").strip()
             if name and name.lower() not in (keyword or "").lower() and t.split("|")[0].strip().lower().startswith(name.lower()):
@@ -766,12 +901,21 @@ def write_title_description(
             ))
         return found[:8]
 
-    text, model, role = _ask(brief + "\nWrite the listing for this page only.")
+    seo_seed = seo_content_draft()
+    seed_note = ""
+    if seo_seed.get("title") and seo_seed.get("description"):
+        seed_note = (
+            "\nSearchify SEO content generation offered this draft to beat when it is stronger and on-keyword:\n"
+            f"TITLE: {seo_seed['title']}\nDESCRIPTION: {seo_seed['description']}\n"
+            "You may improve it. Keep the best keyword near the front. Do not invent facts.\n"
+        )
+    text, model, role = _ask(brief + seed_note + "\nWrite the listing for this page only.")
     title, desc, reason = _parse_meta(text)
     issues = checks(title, desc)
     if issues:
         retry_text, retry_model, retry_role = _ask(
             brief
+            + seed_note
             + "\nThe first draft failed these checks:\n- "
             + "\n- ".join(issues)
             + f"\n\nRejected title: {title or '(empty)'}\nRejected description: {desc or '(empty)'}\n"
@@ -782,9 +926,31 @@ def write_title_description(
         if len(retry_issues) <= len(issues) and retry_title and retry_desc:
             title, desc, reason = retry_title, retry_desc, retry_reason
             text, model, role = retry_text, retry_model, retry_role
-    current_desc = str(scraped.get("description") or "")
+            issues = retry_issues
+
+    def score_candidate(cand_title: str, cand_desc: str) -> tuple[int, int, int]:
+        """Lower is better: open issues, not-stronger flag, distance from ideal length."""
+        open_count = len(checks(cand_title, cand_desc))
+        weak = 0 if listing_is_stronger(
+            cand_title, cand_desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
+        ) else 1
+        length_penalty = abs(len(cand_title) - 55) + abs(len(cand_desc) - 148)
+        return (open_count, weak, length_penalty)
+
+    if seo_seed.get("title") and seo_seed.get("description"):
+        seo_title = _clean(seo_seed["title"], 60)
+        seo_desc = _clean(seo_seed["description"], 155)
+        if score_candidate(seo_title, seo_desc) < score_candidate(title, desc):
+            title, desc = seo_title, seo_desc
+            reason = (
+                f"Chose the Searchify SEO content draft on “{keyword or topic}” because it beat the first pass "
+                "on keyword fit and strength versus the live listing."
+            )
+            model, role = "searchify-seo-content", "content"
+            text = f"TITLE: {title}\nDESCRIPTION: {desc}\nREASON: {reason}"
+
     if current.strip() and not listing_is_stronger(
-        title, desc, current, current_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
+        title, desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
     ):
         title, desc, reason = stronger_listing(
             keyword=keyword,
@@ -792,17 +958,21 @@ def write_title_description(
             offers=offers,
             places=places,
             current_title=current,
-            current_desc=current_desc,
+            current_desc=live_desc,
             headings=str(headings or ""),
             text=str(scraped.get("text") or ""),
             brand=brand,
         )
     if not reason:
         reason = "Written from the business concept, the best keyword, and the competitor this page has to meet."
+    if keyword and "best keyword" not in reason.lower() and f"“{keyword}”" not in reason:
+        reason = f"Best keyword “{keyword}”. {reason}".strip()
     if meet.get("title") and keyword:
         meeting = f"Written to meet {meet['title'][:90]} on “{keyword}”."
         if meeting.lower() not in reason.lower():
             reason = f"{meeting} {reason}".strip()
+    if seo_seed and "searchify seo" not in reason.lower() and model != "searchify-seo-content":
+        reason = f"{reason} Compared with a Searchify SEO content draft.".strip()
     validation = page_quality.validate_claims(title, desc, evidence=evidence_text, places=places)
     from app.cms_connectors import build_webpage_json_ld
     from app.page_scrape import suggest_images
@@ -817,10 +987,49 @@ def write_title_description(
     ) if title or desc else {}
     if share and package:
         package["image"] = share
+    open_issues = checks(title, desc) if title else ["The writer returned no title."]
+    beats_live = bool(title and desc) and listing_is_stronger(
+        title, desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
+    )
+    target_kw = _parse_target(text) or keyword or ((site or {}).get("page") or {}).get("target") or ""
+    from app.jev import score_listing
+
+    jev = score_listing(
+        title=title,
+        description=desc,
+        keyword=target_kw or keyword,
+        live_title=current,
+        live_description=live_desc,
+        beats_live=beats_live,
+        meet_competitor=str(meet.get("title") or ""),
+        open_issues=open_issues,
+    )
+    analysis = {
+        "sources": [
+            part for part in (
+                "Live page (title, description, Open Graph, JSON-LD)",
+                "Business offers and places",
+                "Search Console queries and page clicks" if gsc else "",
+                "Searchify SEO keyword and competitor research" if research else "",
+                "Searchify SEO content generation" if (seo_seed and seo_seed.get("title")) or model == "searchify-seo-content" else "",
+                f"Competitor to meet: {meet.get('title')}" if meet.get("title") else "No same-keyword competitor stored",
+                "Analytics landing facts" if (analytics or {}).get("connected") else "",
+                "JEV draft score",
+            ) if part
+        ],
+        "keyword": target_kw or keyword or "",
+        "beatsLive": beats_live,
+        "meetCompetitor": str(meet.get("title") or ""),
+        "contentWriter": model == "searchify-seo-content" or bool(seo_seed and seo_seed.get("title")),
+    }
     return {
         "pageType": kind,
         "validation": validation,
-        "openIssues": checks(title, desc) if title else ["The writer returned no title."],
+        "openIssues": open_issues,
+        "beatsLive": beats_live,
+        "meetCompetitor": {k: meet.get(k) for k in ("title", "url", "description", "source")} if meet else {},
+        "jev": jev,
+        "analysis": analysis,
         "title": title,
         "metaDescription": desc,
         "openGraphTitle": title,
@@ -835,7 +1044,7 @@ def write_title_description(
         "reviewCount": scraped.get("reviewCount") or "",
         "jsonLd": package,
         "reason": reason,
-        "target": _parse_target(text) or keyword or ((site or {}).get("page") or {}).get("target") or "",
+        "target": target_kw,
         "model": model,
         "role": role,
         "draftBody": text,

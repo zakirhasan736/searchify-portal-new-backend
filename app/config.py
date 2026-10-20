@@ -57,6 +57,10 @@ GITHUB_OAUTH_REDIRECT_URI = (
 DATAFORSEO_LOGIN = (os.getenv("DATAFORSEO_LOGIN") or "").strip()
 DATAFORSEO_PASSWORD = (os.getenv("DATAFORSEO_PASSWORD") or "").strip()
 
+VAPID_PUBLIC_KEY = (os.getenv("VAPID_PUBLIC_KEY") or "").strip()
+VAPID_PRIVATE_KEY = (os.getenv("VAPID_PRIVATE_KEY") or "").strip()
+VAPID_SUBJECT = (os.getenv("VAPID_SUBJECT") or "mailto:alerts@searchify.local").strip()
+
 # Auto-sync connected Google data (hours between runs per account)
 GOOGLE_AUTO_SYNC_ENABLED = (os.getenv("GOOGLE_AUTO_SYNC_ENABLED") or "true").strip().lower() in {
     "1",

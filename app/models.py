@@ -264,3 +264,40 @@ class OpsNotice(Base):
     detail: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(40), default="open")  # open|acked|resolved
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PushSubscription(Base):
+    """Browser push endpoint for one signed-in user. A tap opens a card and does not publish."""
+
+    __tablename__ = "push_subscriptions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    endpoint: Mapped[str] = mapped_column(Text, unique=True)
+    p256dh: Mapped[str] = mapped_column(Text, default="")
+    auth: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PushVapid(Base):
+    """Stable web-push keys when they are not set in the environment."""
+
+    __tablename__ = "push_vapid"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_key: Mapped[str] = mapped_column(Text, default="")
+    private_key: Mapped[str] = mapped_column(Text, default="")
+
+
+class PushDelivery(Base):
+    """Stops the same waiting fix or the same week from being pushed twice."""
+
+    __tablename__ = "push_deliveries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    kind: Mapped[str] = mapped_column(String(40))
+    ref: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("customer_id", "kind", "ref"),)

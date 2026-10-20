@@ -223,6 +223,9 @@ def crawl_with_fix_draft(body: CrawlBody, db: Session = Depends(get_db), user: U
     db.add(change)
     db.commit()
     db.refresh(change)
+    if change.status == "awaiting_approval":
+        from app.push_alerts import notify_waiting
+        notify_waiting(db, user.id, change)
 
     return {
         "crawl": crawl_result,
