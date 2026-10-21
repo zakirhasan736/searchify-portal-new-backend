@@ -76,11 +76,13 @@ def score_listing(
     beats_live: bool = False,
     meet_competitor: str = "",
     open_issues: list | None = None,
+    hard_fail: bool = False,
 ) -> dict:
     """JEV for a Google listing package (title + description + OG/JSON-LD same words).
 
     Tuned for short SERP copy — not long articles. Still returns band auto|inbox|reject.
     Human approval remains required to publish; JEV only grades the draft.
+    Hard factual/relevance failures always force reject — heuristic score cannot override them.
     """
     title = (title or "").strip()
     description = (description or "").strip()
@@ -97,6 +99,7 @@ def score_listing(
                 "length_ok": False,
                 "not_live_paste": False,
                 "placeholders_ok": True,
+                "hard_fail": True,
             },
         }
 
@@ -110,6 +113,7 @@ def score_listing(
         beats_live=beats_live,
         meet_competitor=meet_competitor,
         open_issues=open_issues or [],
+        hard_fail=hard_fail,
     )
 
 
@@ -123,6 +127,7 @@ def _listing_heuristic(
     beats_live: bool,
     meet_competitor: str,
     open_issues: list,
+    hard_fail: bool = False,
 ) -> dict:
     title_len = len(title)
     desc_len = len(description)
@@ -175,12 +180,33 @@ def _listing_heuristic(
         reasons.append("Possible invented metrics")
     if not live_overlap and title.lower() != (live_title or "").lower():
         score += 4
+    # Hard factual/relevance failures cannot be rescued by length or keyword heuristics.
+    hard_markers = (
+        "left the page topic",
+        "different topic",
+        "portfolio client",
+        "invent",
+        "contradicts",
+        "is not on this page",
+        "generic template",
+        "misses the keyword",
+        "left the business concept",
+        "unverified hype",
+        "failed or returned",
+    )
+    detected_hard = hard_fail or any(
+        any(marker in str(issue).lower() for marker in hard_markers) for issue in open_issues
+    )
+    if detected_hard:
+        score = min(score, 35)
+        reasons.insert(0, "Hard validation failed — not a safe recommendation")
     score = max(0, min(100, score))
     if not reasons:
         reasons.append("Listing heuristic pass")
+    band = "reject" if detected_hard else _band(score)
     return {
         "score": score,
-        "band": _band(score),
+        "band": band,
         "reasons": reasons[:5],
         "checks": {
             "has_title": True,
@@ -190,6 +216,7 @@ def _listing_heuristic(
             "length_ok": length_ok,
             "not_live_paste": not live_overlap,
             "placeholders_ok": not fake,
+            "hard_fail": bool(detected_hard),
             "title_chars": title_len,
             "description_chars": desc_len,
             "meet_competitor": bool(meet_competitor),

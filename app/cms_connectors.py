@@ -145,6 +145,58 @@ def build_webpage_json_ld(
     return {k: v for k, v in graph.items() if v not in ("", None, {})}
 
 
+def build_listing_json_ld(
+    *,
+    meta_title: str,
+    meta_description: str,
+    page_url: str,
+    site_name: str = "",
+    schema_types: list | None = None,
+    share_image: str = "",
+) -> dict[str, Any]:
+    """Update WebPage listing fields while acknowledging other schema types already on the page.
+
+    Searchify drafts do not delete Organization, BreadcrumbList, or WebSite entities from the live
+    HTML. The published package updates WebPage name/description to match the approved listing.
+    """
+    webpage = build_webpage_json_ld(
+        meta_title=meta_title,
+        meta_description=meta_description,
+        page_url=page_url,
+        site_name=site_name,
+    )
+    if share_image.strip():
+        webpage["image"] = share_image.strip()
+    types = [str(t).strip() for t in (schema_types or []) if str(t).strip()]
+    others = [t for t in types if t.lower() not in {"webpage", "web page"}]
+    note = (
+        "Updated WebPage name and description to match this listing. "
+        + (
+            f"Live page also declares: {', '.join(others[:8])}. Those entities are preserved on-site; this draft does not remove them."
+            if others
+            else "No additional schema types were detected on the live page."
+        )
+    )
+    if not others:
+        webpage["_schemaNote"] = note
+        return webpage
+    nodes: list[dict[str, Any]] = [{k: v for k, v in webpage.items() if k != "@context"}]
+    if any(t.lower() in {"website"} for t in others) and site_name.strip():
+        nodes.append({
+            "@type": "WebSite",
+            "name": site_name.strip(),
+            "url": urljoin(page_url or "", "/") if page_url else "",
+        })
+    if any(t.lower() in {"organization", "localbusiness"} for t in others) and site_name.strip():
+        org_type = next((t for t in others if t.lower() in {"organization", "localbusiness"}), "Organization")
+        nodes.append({"@type": org_type, "name": site_name.strip()})
+    return {
+        "@context": "https://schema.org",
+        "@graph": nodes,
+        "_schemaNote": note,
+    }
+
+
 def _json_ld_html_block(payload: dict[str, Any]) -> str:
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     # Gutenberg custom HTML block so themes output the script in page content.

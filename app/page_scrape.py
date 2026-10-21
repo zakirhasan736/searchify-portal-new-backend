@@ -275,25 +275,41 @@ def scrape_page(url: str) -> dict:
 
 
 def suggest_images(images: list | None, topic: str, page_url: str) -> list[dict]:
-    """Alt text for the photos on the page. Existing alt is kept. Empty alt gets words from the page topic."""
+    """Alt text for the photos on the page. Existing alt is kept. Empty alt gets words from the page topic.
+
+    One recommendation per unique image URL — duplicates are collapsed.
+    """
     rows = []
+    seen: set[str] = set()
     subject = " ".join((topic or "This page").split())[:80]
     for img in images or []:
         raw = str((img or {}).get("src") or "").strip()
         if not raw or raw.startswith("data:"):
             continue
         src = raw if raw.startswith("http") else urljoin(page_url or "", raw)
+        key = src.split("?")[0].rstrip("/").lower()[:300]
+        if key in seen:
+            continue
+        seen.add(key)
         alt = " ".join(str((img or {}).get("alt") or "").split())[:160]
         stem = src.rstrip("/").split("/")[-1].split("?")[0].rsplit(".", 1)[0]
         name = " ".join(re.sub(r"[-_]+", " ", re.sub(r"\d+", " ", stem)).split())
         if len(name) < 3:
             name = ""
-        suggested = alt or (f"{subject} — {name}" if name else f"{subject} photo")
+        # Describe the image; do not keyword-stuff the page topic into every alt.
+        if alt:
+            suggested = alt
+        elif name:
+            suggested = f"{name}"[:140]
+        else:
+            suggested = f"{subject} image"[:140]
         rows.append({
             "src": src[:300],
+            "id": key,
             "currentAlt": alt,
             "suggestedAlt": suggested[:140],
             "needsAlt": not bool(alt),
+            "changed": not bool(alt),
         })
         if len(rows) >= 6:
             break

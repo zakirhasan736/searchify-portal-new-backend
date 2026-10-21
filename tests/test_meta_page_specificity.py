@@ -137,7 +137,7 @@ def test_stronger_listing_skips_portfolio_proof_on_homepage():
 
 
 def test_stronger_listing_may_mention_proof_on_case_study():
-    _, desc, _ = stronger_listing(
+    title, desc, _ = stronger_listing(
         keyword="case study",
         alternatives=["case study", "web design"],
         offers=["web design"],
@@ -149,8 +149,10 @@ def test_stronger_listing_may_mention_proof_on_case_study():
         brand="Agency Example",
         page_kind="case_study",
     )
-    # Proof injection is allowed on case studies; must not invent unrelated offers as the subject.
-    assert "huey" in desc.lower() or "including" in desc.lower() or "compare" in desc.lower()
+    # Fallback stays on the offer; must not invent service counts or template openers.
+    assert "5 core" not in f"{title} {desc}".lower()
+    assert "business owners can explore" not in desc.lower()
+    assert "web design" in desc.lower() or "case study" in title.lower()
 
 
 def test_parse_meta_handles_malformed_ai_output():

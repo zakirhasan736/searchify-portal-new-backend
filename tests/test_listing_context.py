@@ -90,7 +90,8 @@ def test_image_text_uses_the_page_topic_when_alt_is_empty():
     )
     assert rows[0]["needsAlt"] is True
     assert rows[0]["src"].startswith("https://sovereignstandard.ca/photos/")
-    assert "Calgary web design projects" in rows[0]["suggestedAlt"]
+    # Prefer meaningful filename words over keyword-stuffing the page topic into every alt.
+    assert "summit" in rows[0]["suggestedAlt"].lower() or "roof" in rows[0]["suggestedAlt"].lower()
     assert rows[1]["needsAlt"] is False
     assert rows[1]["suggestedAlt"] == "Sovereign Standard logo"
     text = research_lines(

@@ -138,6 +138,11 @@ class PatchChangeBody(BaseModel):
 class GenerateMetaBody(BaseModel):
     tone: str = "Clear & direct"
     breadth: str = "balanced"
+    objective: str = "balanced"
+    focusTopic: str = ""
+    audience: str = ""
+    primaryKeyword: str = ""
+    extraInstructions: str = ""
 
 
 class FromGscBody(BaseModel):
@@ -2282,16 +2287,23 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             research=load_stored(db, user.id, row.target_url or ""),
             db=db,
             user=user,
+            objective=body.objective or "balanced",
+            focus_topic=body.focusTopic or "",
+            audience=body.audience or "",
+            primary_keyword=body.primaryKeyword or "",
+            extra_instructions=body.extraInstructions or "",
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)[:200]) from exc
 
     title = drafted.get("title") or ""
     desc = drafted.get("metaDescription") or ""
+    recommend_keep = bool(drafted.get("recommendKeep"))
     options = [
         {"title": title, "description": desc, "reason": drafted.get("reason") or ""},
     ]
     # Apply the regenerated listing package to the card — title, description, OG, and JSON-LD stay aligned.
+    # No-change recommendations still refresh analysis but keep published messaging as the draft.
     proposed["title"] = title
     proposed["metaDescription"] = desc
     proposed["reason"] = drafted.get("reason") or ""
@@ -2304,6 +2316,7 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     ]
     proposed["meetCompetitor"] = drafted.get("meetCompetitor") or {}
     proposed["beatsLive"] = bool(drafted.get("beatsLive"))
+    proposed["recommendKeep"] = recommend_keep
     proposed["jev"] = drafted.get("jev") or {}
     proposed["analysis"] = drafted.get("analysis") or {}
     proposed["target"] = drafted.get("target") or proposed.get("target") or ""
@@ -2312,17 +2325,21 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["shareImage"] = drafted.get("shareImage") or proposed.get("shareImage") or ""
     proposed["images"] = drafted.get("images") or []
     scraped_now = drafted.get("scraped") or {}
+    # Canonical is preserved from the live page — regeneration does not invent a new one.
     proposed["canonical"] = (scraped_now.get("canonical") or drafted.get("canonical") or proposed.get("canonical") or "")
+    proposed["canonicalChanged"] = False
     proposed["nav"] = scraped_now.get("nav") or drafted.get("nav") or []
     proposed["faqs"] = scraped_now.get("faqs") or drafted.get("faqs") or []
     proposed["videos"] = scraped_now.get("videos") or drafted.get("videos") or []
     proposed["reviewRating"] = scraped_now.get("reviewRating") or drafted.get("reviewRating") or ""
     proposed["reviewCount"] = scraped_now.get("reviewCount") or drafted.get("reviewCount") or ""
     proposed["jsonLd"] = drafted.get("jsonLd") or {}
+    proposed["schemaTypesPreserved"] = drafted.get("schemaTypesPreserved") or scraped_now.get("schemaTypes") or []
     proposed["validation"] = drafted.get("validation") or proposed.get("validation") or {"status": "unverified", "claims": []}
     proposed["openIssues"] = drafted.get("openIssues") or []
     proposed["writer"] = "site-scan+schema+open-graph+searchify-seo+gsc+analytics+jev"
     proposed["pageType"] = drafted.get("pageType") or proposed.get("pageType") or ""
+    proposed["objective"] = drafted.get("objective") or body.objective or "balanced"
     if scraped_now.get("ogTitle"):
         proposed["beforeOpenGraphTitle"] = scraped_now.get("ogTitle")
     if scraped_now.get("ogDescription"):

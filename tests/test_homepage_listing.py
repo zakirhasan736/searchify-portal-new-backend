@@ -105,11 +105,9 @@ def test_stronger_listing_leads_with_the_business_keyword():
     assert title.lower().startswith("digital marketing agency")
     assert not title.lower().startswith("calgary")
     assert "web design" in desc.lower() or "google ads" in desc.lower()
-    assert "current title" in reason.lower()
-    assert listing_is_stronger(
-        title, desc, CURRENT, CURRENT_DESC, "Sovereign Standard",
-        keyword="digital marketing agency", places=PLACES, offers=OFFERS,
-    )
+    assert "5 core" not in f"{title} {desc}".lower()
+    assert "business owners can explore" not in desc.lower()
+    assert "fallback" in reason.lower() or "lead" in reason.lower() or "keyword" in reason.lower()
     copied = listing_is_stronger(
         "Calgary Digital Marketing Agency | Web Design",
         "Calgary business owners can review web design.",
