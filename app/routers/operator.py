@@ -791,6 +791,8 @@ def _sum_daily_window(rows: list[dict], start: int, end: int) -> dict:
 
 def _assistant_performance(db: Session, user: User) -> list[str]:
     """Stored Search Console movement the assistant can quote honestly."""
+    from app.provenance import is_live_payload
+
     row = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "organic-search")
@@ -798,6 +800,8 @@ def _assistant_performance(db: Session, user: User) -> list[str]:
         .first()
     )
     payload = dict((row.payload if row else {}) or {})
+    if payload and not is_live_payload(payload):
+        return ["Search Console daily: no live Google sync stored yet (prototype rows are ignored)."]
     nested = payload.get("payload") if isinstance(payload.get("payload"), dict) else {}
     daily = payload.get("daily") or nested.get("daily") or []
     if not isinstance(daily, list) or len(daily) < 8:
@@ -1228,13 +1232,18 @@ def _scan_fresh(scan: dict) -> bool:
 
 
 def _places_rows(db: Session, user_id: int) -> list:
+    from app.provenance import is_live_payload
+
     rec = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "local-competitors")
         .order_by(FeatureRecord.id.desc())
         .first()
     )
-    return list(((rec.payload if rec else {}) or {}).get("rows") or [])
+    payload = dict((rec.payload if rec else {}) or {})
+    if payload and not is_live_payload(payload):
+        return []
+    return list(payload.get("rows") or [])
 
 
 def _ensure_scan(db: Session, user: User, home: str, brief: dict | None, force: bool = False) -> tuple[dict, bool]:

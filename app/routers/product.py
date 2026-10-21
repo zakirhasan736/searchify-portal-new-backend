@@ -569,6 +569,8 @@ def run_report(report_id: int, db: Session = Depends(get_db), user: User = Depen
     row = db.get(ReportDefinition, report_id)
     if row is None or row.customer_id != user.id:
         raise HTTPException(404, "Report not found")
+    from app.provenance import is_live_payload
+
     recs = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind.in_(["organic-search", "traffic-analytics", "site-audit", "google-ads", "local-competitors"]))
@@ -577,7 +579,10 @@ def run_report(report_id: int, db: Session = Depends(get_db), user: User = Depen
     )
     latest: dict[str, dict] = {}
     for rec in recs:
-        latest.setdefault(rec.kind, rec.payload or {})
+        payload = rec.payload or {}
+        if not is_live_payload(payload):
+            continue
+        latest.setdefault(rec.kind, payload)
     pending = db.query(SiteChange).filter(SiteChange.customer_id == user.id, SiteChange.status.in_(["proposed", "awaiting_approval", "approved"])).count()
     published = db.query(SiteChange).filter(SiteChange.customer_id == user.id, SiteChange.status.in_(["applied", "monitoring", "closed"])).count()
     lines = [f"Searchify report · {row.name}", f"Generated {datetime.utcnow().isoformat(timespec='seconds')}Z", f"Recipients: {', '.join(row.recipients) or 'workspace only'}", f"Schedule: {row.schedule}", ""]

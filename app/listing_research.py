@@ -9,16 +9,18 @@ from app.site_scan import page_key
 
 
 def load_stored(db, user_id: int, site: str = "") -> dict:
-    """Load the latest stored research for this customer, scoped to ``site`` when given.
+    """Load the latest stored research for this customer, scoped to ``site``.
 
-    Without a site host, returns the newest row of each kind (legacy). With a site,
-    only rows whose payload ``host`` matches are used — preventing cross-site bleed
-    into meta prompts and keyword selection.
+    A site/host is required. Without one, returns empty buckets so research from
+    another domain cannot bleed into meta prompts or keyword selection.
     """
     from app.models import FeatureRecord
     from app.research import host_of
 
     want = host_of(site) if site else ""
+    empty = {"keywords": {}, "backlinks": {}, "visibility": [], "audit": {}, "host": want}
+    if not want:
+        return empty
 
     def latest(kind: str) -> dict:
         rows = (
@@ -30,12 +32,10 @@ def load_stored(db, user_id: int, site: str = "") -> dict:
         )
         for row in rows:
             payload = dict(row.payload or {})
-            if want and host_of(str(payload.get("host") or "")) != want:
+            if host_of(str(payload.get("host") or "")) != want:
                 continue
             return payload
-        if want:
-            return {}
-        return dict(rows[0].payload or {}) if rows else {}
+        return {}
 
     visibility_rows = (
         db.query(FeatureRecord)
@@ -47,7 +47,7 @@ def load_stored(db, user_id: int, site: str = "") -> dict:
     visibility = []
     for row in visibility_rows:
         payload = dict(row.payload or {})
-        if want and host_of(str(payload.get("host") or "")) != want:
+        if host_of(str(payload.get("host") or "")) != want:
             continue
         if payload.get("status") == "ok":
             visibility.append(payload)
@@ -205,20 +205,32 @@ def keyword_fits_page(
     for place in places or []:
         place_tokens |= _content_tokens(str(place))
     subject = " ".join(part for part in (topic, offer_blob) if part)
-    if not subject.strip() and not (page_text or "").strip():
-        return True
+    page_blob = " ".join(str(page_text or "").split())
+    # Unknown page context must not accept arbitrary research terms.
+    if not subject.strip() and not page_blob.strip():
+        return False
     term_core = _content_tokens(text) - place_tokens
-    subject_core = (_content_tokens(subject) | _content_tokens(page_text)) - place_tokens
+    subject_core = (_content_tokens(subject) | _content_tokens(page_blob)) - place_tokens
     if not term_core:
         return False
+    # Exact / near presence on the page is stronger than offer-label overlap alone.
+    lowered = page_blob.lower()
+    if text.lower() in lowered:
+        return True
     if term_core & subject_core:
         return True
     if term_core & _content_tokens(offer_blob):
         return True
-    return max(
-        _keyword_fit(" ".join(sorted(term_core)), " ".join(sorted(subject_core - _content_tokens(page_text))), page_text or topic),
-        _keyword_fit(" ".join(sorted(term_core)), offer_blob, page_text or offer_blob) if offer_blob else 0.0,
-    ) >= 0.5
+    # Soft fit: allow related phrasing when enough non-place tokens align with page evidence
+    # (e.g. "UI UX design" on a page that already discusses visual design — not generic invention).
+    page_fit = _keyword_fit(" ".join(sorted(term_core)), page_blob, page_blob) if page_blob else 0.0
+    topic_fit = _keyword_fit(
+        " ".join(sorted(term_core)),
+        " ".join(sorted(subject_core - _content_tokens(page_blob))),
+        page_blob or topic,
+    )
+    offer_fit = _keyword_fit(" ".join(sorted(term_core)), offer_blob, page_blob or offer_blob) if offer_blob else 0.0
+    return max(page_fit, topic_fit, offer_fit) >= 0.45
 
 
 def best_keyword_from_research(

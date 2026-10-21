@@ -96,10 +96,17 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
                 max_tokens=1200,
             )
             rows = _parse_table(text)
+            inferred = False
             if not rows:
-                rows = [[f"Cluster {i+1}", q, "Informational", "Medium"] for i, q in enumerate(query_seed[:8])]
+                # Honest GSC mirror — never invent cluster labels when the model returns nothing.
+                rows = [[q.split()[0].title() if q.split() else q, q, "Informational", "Medium"] for q in query_seed[:10]]
+                inferred = True
             payload = {
-                "summary": f"Topic clusters from live GSC queries ({model}).",
+                "summary": (
+                    f"Topic clusters from live GSC queries ({model})."
+                    if not inferred
+                    else f"GSC query heads only — model returned no parseable table ({model})."
+                ),
                 "columns": ["Cluster", "Sample queries", "Intent", "Priority"],
                 "rows": rows,
                 "kpis": [["Clusters", str(len(rows))], ["Seed queries", str(len(query_seed))]],
@@ -107,6 +114,10 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
                 "seedVersion": LIVE,
                 "model": model,
                 "role": role,
+                "measured": False,
+                "inferred": True,
+                "dataKind": "gsc_topic_expansion",
+                "provider": "openai+gsc",
             }
             _upsert(db, user_id, "topic-research", "Topic Research (GSC + Astra)", payload)
             _upsert(db, user_id, "topic-finder", "Topic Finder (GSC + Astra)", {**payload, "summary": "Topic ideas ranked from GSC query clusters."})
@@ -127,10 +138,17 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
                 max_tokens=1400,
             )
             rows = _parse_table(text)
+            model_empty = False
             if not rows:
-                rows = [[f"{q} guide", "How-to", q, "From GSC"] for q in query_seed[:15]]
+                # Mirror GSC only — do not invent “guide” variants as research keywords.
+                rows = [[q, "GSC seed", q, "Model returned no expansions"] for q in query_seed[:20]]
+                model_empty = True
             payload = {
-                "summary": f"Keyword ideas expanded from GSC with {model} (no third-party volume).",
+                "summary": (
+                    f"GSC queries only — model returned no parseable expansions ({model}). No invented volumes."
+                    if model_empty
+                    else f"Keyword ideas expanded from GSC with {model} (no third-party volume)."
+                ),
                 "columns": ["Keyword", "Angle", "Parent query", "Notes"],
                 "rows": rows,
                 "kpis": [["Ideas", str(len(rows))], ["From GSC", str(len(query_seed))]],
@@ -138,6 +156,11 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
                 "seedVersion": LIVE,
                 "model": model,
                 "role": role,
+                "measured": False,
+                "inferred": not model_empty,
+                "dataKind": "gsc_keyword_expansion" if not model_empty else "gsc_query_mirror",
+                "provider": "openai+gsc",
+                "metricsNote": "No search volume, difficulty, or CPC — GSC/OpenAI expansion only.",
             }
             _upsert(db, user_id, "generate-keywords", "Generate Keywords (GSC + OpenAI)", payload)
             done["keywords"] = True
@@ -157,30 +180,39 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
             )
             rows = _parse_table(text)
             if not rows:
-                rows = [[f"What is the best {q}?", q, "From GSC"] for q in query_seed[:12]]
-            payload = {
-                "summary": f"AI prompt suggestions from GSC ({model}). Not a live ChatGPT mention index.",
-                "columns": ["Prompt", "Related GSC query", "Why it matters"],
-                "rows": rows,
-                "source": "gsc_openai",
-                "seedVersion": LIVE,
-                "model": model,
-                "role": role,
-            }
-            _upsert(db, user_id, "prompt-research", "Prompt Research (GSC + OpenAI)", payload)
-            _upsert(
-                db,
-                user_id,
-                "prompt-tracking",
-                "Prompt Tracking (suggested set)",
-                {
-                    **payload,
-                    "summary": "Suggested prompt set to track over time (manual / future schedule).",
-                    "columns": ["Prompt", "Status", "Source"],
-                    "rows": [[r[0], "Queued", "GSC+OpenAI"] for r in rows],
-                },
-            )
-            done["prompts"] = True
+                # Skip inventing “What is the best …?” prompts when the model fails.
+                done["prompts"] = False
+                done["prompts_error"] = "Model returned no parseable prompt table"
+            else:
+                payload = {
+                    "summary": f"AI prompt suggestions from GSC ({model}). Not a live ChatGPT mention index.",
+                    "columns": ["Prompt", "Related GSC query", "Why it matters"],
+                    "rows": rows,
+                    "source": "gsc_openai",
+                    "seedVersion": LIVE,
+                    "model": model,
+                    "role": role,
+                    "measured": False,
+                    "inferred": True,
+                    "observed": False,
+                    "dataKind": "gsc_prompt_suggestions",
+                    "provider": "openai+gsc",
+                    "disclaimer": "Suggested prompts for future tracking — not measured AI-search citations.",
+                }
+                _upsert(db, user_id, "prompt-research", "Prompt Research (GSC + OpenAI)", payload)
+                _upsert(
+                    db,
+                    user_id,
+                    "prompt-tracking",
+                    "Prompt Tracking (suggested set)",
+                    {
+                        **payload,
+                        "summary": "Suggested prompt set to track over time (manual / future schedule).",
+                        "columns": ["Prompt", "Status", "Source"],
+                        "rows": [[r[0], "Queued", "GSC+OpenAI"] for r in rows],
+                    },
+                )
+                done["prompts"] = True
         except Exception as exc:  # noqa: BLE001
             done["prompts_error"] = str(exc)[:160]
 
@@ -206,7 +238,7 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
                 ["Pages used", str(len(pages[:10])), "GSC"],
             ]
             payload = {
-                "summary": "AI visibility narrative from owned GSC/GA4 data (no live mention index).",
+                "summary": "AI analysis narrative from owned GSC/GA4 data (no live mention index).",
                 "columns": ["Section", "Detail", "Source"],
                 "rows": narrative_rows,
                 "draft": text,
@@ -214,9 +246,17 @@ def enrich_from_google(db: Session, user_id: int) -> dict:
                 "seedVersion": LIVE,
                 "model": model,
                 "role": role,
+                "measured": False,
+                "inferred": True,
+                "observed": False,
+                "live": False,
+                "estimate": False,
+                "dataKind": "gsc_ga4_narrative",
+                "provider": "openai+gsc+ga4",
+                "disclaimer": "Narrative analysis of owned Google data — not a live ChatGPT/Gemini/Perplexity measurement.",
             }
+            # Never overwrite the operator AI-visibility measurement/estimate report with a GSC narrative.
             _upsert(db, user_id, "ai-analysis", "AI Analysis (owned data)", payload)
-            _upsert(db, user_id, "ai-visibility-report", "AI Visibility Report", {**payload, "summary": "Period-style narrative from owned Google data."})
             _upsert(db, user_id, "brand-narrative", "Brand Narrative", {**payload, "summary": "Narrative draft from GSC/GA4 facts."})
             done["narratives"] = True
         except Exception as exc:  # noqa: BLE001

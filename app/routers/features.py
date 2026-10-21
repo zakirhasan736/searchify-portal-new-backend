@@ -70,104 +70,19 @@ def row(record: FeatureRecord) -> dict:
 
 
 def ensure_screen_rows(db: Session, user: User) -> None:
-    records = db.query(FeatureRecord).filter(FeatureRecord.customer_id == user.id).all()
-    by_title = {(item.kind, item.title): item for item in records}
-    for kind, title, summary, columns, rows in list(SCREENS) + list(EXTRA):
-        site_cols, site_rows = expand_sites(columns, rows)
-        payload = {
-            "summary": summary,
-            "columns": site_cols,
-            "rows": site_rows,
-            "panels": PANELS.get(kind),
-            "seedVersion": SEED_VERSION,
-        }
-        record = by_title.get((kind, title))
-        if record is None:
-            db.add(
-                FeatureRecord(
-                    customer_id=user.id,
-                    kind=kind,
-                    title=title,
-                    payload=payload,
-                    status="stored",
-                )
-            )
-            continue
-        current = record.payload or {}
-        if current.get("seedVersion") == "google-live-v1" or str(current.get("source") or "").startswith("google"):
-            continue
-        current_rows = current.get("rows") or []
-        current_cols = current.get("columns") or []
-        missing_panels = bool(PANELS.get(kind)) and not current.get("panels")
-        stale_version = current.get("seedVersion") != SEED_VERSION
-        stale_dashboard = kind == "seo-dashboard" and not current.get("panels", {}).get("aiKpis")
-        stale_shape = current_cols != list(site_cols) or (current_rows and site_rows and len(current_rows[0]) != len(site_rows[0]))
-        if (
-            stale_version
-            or len(current_rows) < len(site_rows)
-            or len(current_cols) < len(site_cols)
-            or missing_panels
-            or stale_dashboard
-            or stale_shape
-        ):
-            record.payload = payload
-            flag_modified(record, "payload")
+    """Prototype seeder — disabled in production.
 
-    for kind, drafts in DRAFT_SEEDS.items():
-        for draft in drafts:
-            key = (kind, draft["title"])
-            if key in by_title:
-                continue
-            payload = dict(draft["payload"])
-            payload["seedVersion"] = SEED_VERSION
-            db.add(
-                FeatureRecord(
-                    customer_id=user.id,
-                    kind=kind,
-                    title=draft["title"],
-                    payload=payload,
-                    status=draft.get("status") or "waiting_for_writer",
-                )
-            )
-
-    # Prototype competitor + keyword lists for popups
-    demo_lists = [
-        (
-            "competitor-list",
-            "Core rivals",
-            {"name": "Core rivals", "location": "Worldwide", "domains": ["astra-rank.example", "rivalmetrics.example", "growthcheck.example"], "seedVersion": SEED_VERSION},
-        ),
-        (
-            "keyword-list",
-            "Brand terms",
-            {"list": "Brand terms", "limit": "12/100", "updated": "Prototype", "seedVersion": SEED_VERSION},
-        ),
-        (
-            "keyword-group",
-            "Content gaps group",
-            {"name": "Content gaps group", "keyword": ["seo audit tool", "serp tracker", "content optimizer", "local seo software"], "seedVersion": SEED_VERSION},
-        ),
-    ]
-    for kind, title, payload in demo_lists:
-        if (kind, title) not in by_title:
-            db.add(
-                FeatureRecord(
-                    customer_id=user.id,
-                    kind=kind,
-                    title=title,
-                    payload=payload,
-                    status="stored",
-                )
-            )
-
-    db.commit()
+    Demo catalog rows must never appear as customer SEO data. Workspace bootstrap
+    already deletes non-live seeds; this function is intentionally a no-op so a
+    future caller cannot reintroduce fake metrics, domains, or keyword lists.
+    """
+    _ = (db, user)
 
 
 def _is_live_payload(payload: dict | None) -> bool:
-    p = payload or {}
-    seed = str(p.get("seedVersion") or "")
-    source = str(p.get("source") or "")
-    return seed == "google-live-v1" or source.startswith("google") or source == "searchify_operator"
+    from app.provenance import is_live_payload
+
+    return is_live_payload(payload)
 
 
 @router.get("/features/{kind}")

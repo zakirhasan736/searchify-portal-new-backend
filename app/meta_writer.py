@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from datetime import datetime
 
 from app import page_quality
 from app.openai_client import chat_text, openai_configured
@@ -1131,8 +1132,16 @@ def write_title_description(
             "pageType": kind,
             "title": seo_title,
             "metaDescription": seo_desc,
-            "openGraphTitle": seo_title,
-            "openGraphDescription": seo_desc,
+            "openGraphTitle": (
+                _clean(str(scraped.get("ogTitle") or live_title or seo_title), 60)
+                if recommend_keep
+                else seo_title
+            ),
+            "openGraphDescription": (
+                _clean(str(scraped.get("ogDescription") or live_desc or seo_desc), 155)
+                if recommend_keep
+                else seo_desc
+            ),
             "shareImage": share,
             "images": images,
             "jsonLd": package,
@@ -1194,6 +1203,21 @@ def write_title_description(
             "The body copy on this page is short. Write from the whole-site understanding, this page's title, heading, Open Graph, and schema. "
             "Do not invent a service that is not in the site offers.\n"
         )
+    page_brief = (
+        f"PAGE BRIEF (evidence from the connected URL — do not invent beyond this):\n"
+        f"- URL: {scraped.get('url') or url}\n"
+        f"- Page type: {kind or 'page'}\n"
+        f"- Page topic: {topic or '(derive from H1 and offers on this page)'}\n"
+        f"- Search intent: {'commercial / transactional for service or product pages' if kind in {'service', 'product', 'category', 'location'} else 'navigational / brand for homepage' if kind == 'home' else 'informational or commercial as the copy supports'}\n"
+        f"- Verified brand: {brand or '(none found)'}\n"
+        f"- Offers confirmed on site: {', '.join(offers[:8]) or '(none)'}\n"
+        f"- Places named: {', '.join(places[:6]) or '(none)'}\n"
+        f"- Existing title: {scraped.get('title') or '(none)'}\n"
+        f"- Existing description: {scraped.get('description') or '(none)'}\n"
+        f"- Keyword evidence: {'insufficient — use page topic, do not invent research' if keyword_evidence_insufficient else (keyword or topic or 'page topic')}\n"
+        f"- Canonical: {scraped.get('canonical') or '(same as page or unset)'}\n"
+        f"- Schema types present: {schema_types}\n"
+    )
     brief = (
         f"Business: {profile.get('business') or ''}\n"
         f"Services: {profile.get('services') or ''}\n"
@@ -1202,6 +1226,7 @@ def write_title_description(
         f"Voice: {profile.get('voice') or 'specific and concrete'}\n"
         f"Only claim what is on the page or the site. Allowed notes: {profile.get('claims') or 'visible page facts only'}\n"
         f"Do not say: {profile.get('restrictions') or profile.get('rules') or 'invented awards, prices, or results'}\n\n"
+        f"{page_brief}\n"
         f"1. BUSINESS CONCEPT. Decide from this before you look at the current title:\n{_site_block(site)}\n"
         f"PAGE TOPIC inside that business: {topic or '(use the main offer)'}\n"
         f"2. KEYWORD COVERAGE. Best keyword first. Use the first one near the front of the title. "
@@ -1465,6 +1490,12 @@ def write_title_description(
         )
     )
     target_kw = _parse_target(text) or keyword or ((site or {}).get("page") or {}).get("target") or ""
+    # Preserve distinct social copy when recommending keep; otherwise align OG with the proposed listing.
+    if recommend_keep:
+        og_title = _clean(str(scraped.get("ogTitle") or current or title), 60)
+        og_desc = _clean(str(scraped.get("ogDescription") or live_desc or desc), 155)
+    else:
+        og_title, og_desc = title, desc
     from app.jev import score_listing
 
     jev = score_listing(
@@ -1513,6 +1544,13 @@ def write_title_description(
         "audience": (audience or "").strip()[:120],
         "beatsLive": beats_live,
         "recommendKeep": recommend_keep,
+        "pageType": kind,
+        "pageUrl": page_url,
+        "measured": False,
+        "inferred": True,
+        "dataKind": "listing_recommendation",
+        "provider": model or "openai",
+        "generatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "currentAssessment": current_assessment,
         "improvement": (
             "None — keep the published listing."
@@ -1543,8 +1581,8 @@ def write_title_description(
         "analysis": analysis,
         "title": title,
         "metaDescription": desc,
-        "openGraphTitle": title,
-        "openGraphDescription": desc,
+        "openGraphTitle": og_title,
+        "openGraphDescription": og_desc,
         "shareImage": share,
         "images": images,
         "canonical": scraped.get("canonical") or "",

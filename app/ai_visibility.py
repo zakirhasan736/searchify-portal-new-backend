@@ -18,6 +18,8 @@ from app.models import CmsConnection, FeatureRecord, User
 from app.openai_client import chat_text, openai_configured
 
 LIVE = "google-live-v1"
+# Distinct from Google-live sync so estimate reports are never mistaken for measured AI-search data.
+ESTIMATE = "operator-estimate-v1"
 
 ENGINES = [
     {"id": "chatgpt", "name": "ChatGPT"},
@@ -30,7 +32,7 @@ ENGINES = [
 ]
 
 
-def _latest_payload(db: Session, user_id: int, kind: str) -> dict:
+def _latest_payload(db: Session, user_id: int, kind: str, *, allow_estimate: bool = False) -> dict:
     row = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind)
@@ -42,9 +44,13 @@ def _latest_payload(db: Session, user_id: int, kind: str) -> dict:
     payload = dict(row.payload or {})
     seed = str(payload.get("seedVersion") or "")
     source = str(payload.get("source") or "")
-    if seed != LIVE and not source.startswith("google") and source != "searchify_operator":
-        return {}
-    return payload
+    if seed == LIVE or source.startswith("google"):
+        return payload
+    if source == "searchify_operator" and (allow_estimate or seed == ESTIMATE or payload.get("estimate")):
+        return payload
+    if allow_estimate and seed == ESTIMATE:
+        return payload
+    return {}
 
 
 def _upsert(db: Session, user_id: int, kind: str, title: str, payload: dict):
@@ -223,15 +229,20 @@ def _pack(profile: dict, prompts: list[str], engines: list, checks: list, *, mod
         ],
         "generatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "source": "searchify_operator",
-        "seedVersion": LIVE,
+        "seedVersion": ESTIMATE,
         "model": model,
         "live": False,
         "estimate": True,
         "observed": False,
+        "measured": False,
+        "inferred": True,
+        "dataKind": "ai_visibility_likelihood",
+        "provider": "searchify_operator",
         "method": "owned-data-likelihood",
         "disclaimer": (
             "These are likelihood estimates from your business profile and Search Console. "
-            "Engines were not queried live. Likely/Unlikely is not a confirmed mention or citation."
+            "Engines were not queried live. Likely/Unlikely is not a confirmed mention or citation. "
+            "This is not a ChatGPT, Gemini, Perplexity, Claude, Copilot, Grok, or AI Overviews crawl."
         ),
         "profile": {
             "business": profile.get("business") or "",
@@ -411,5 +422,35 @@ def _save(db: Session, user_id: int, report: dict):
 
 
 def latest_report(db: Session, user_id: int) -> dict:
-    payload = _latest_payload(db, user_id, "ai-visibility-report") or _latest_payload(db, user_id, "ai-visibility")
+    payload = (
+        _latest_payload(db, user_id, "ai-visibility-report", allow_estimate=True)
+        or _latest_payload(db, user_id, "ai-visibility", allow_estimate=True)
+    )
+    if not payload:
+        return {
+            "summary": "No AI visibility report yet.",
+            "status": "unavailable",
+            "live": False,
+            "estimate": False,
+            "observed": False,
+            "measured": False,
+            "dataKind": "ai_visibility_unavailable",
+            "disclaimer": "Run AI visibility after connecting Search Console. Likelihood reports are estimates, not live engine crawls.",
+        }
+    # Guard: never present a GSC narrative as a measured engine report.
+    if payload.get("dataKind") == "gsc_ga4_narrative" or (
+        payload.get("source") == "gsc_ga4_openai" and not payload.get("engines")
+    ):
+        return {
+            **payload,
+            "status": "unavailable",
+            "live": False,
+            "estimate": False,
+            "observed": False,
+            "measured": False,
+            "disclaimer": (
+                "Stored row is a GSC/GA4 narrative, not an AI-visibility measurement. "
+                "Run the operator AI visibility report for likelihood estimates, or connect a live mention-index provider for observed citations."
+            ),
+        }
     return payload
