@@ -68,7 +68,14 @@ def generate_meta_tags(text: str, *, creativity: float = 0.75) -> dict:
     description = " ".join(str(row.get("description") or "").split())
     if not title or not description:
         return {}
-    return {"title": title[:80], "description": description[:200], "cost": float(cost or 0), "source": "searchify-seo-content"}
+    return {
+        "title": title[:80],
+        "description": description[:200],
+        "cost": float(cost or 0),
+        "source": "searchify-seo-content",
+        "provider": "dataforseo",
+        "dataKind": "content_meta_tags",
+    }
 
 
 def draft_from_research(

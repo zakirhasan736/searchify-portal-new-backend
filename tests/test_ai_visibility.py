@@ -140,7 +140,9 @@ def test_visibility_sends_engine_specific_payloads(offline, monkeypatch):
     by_engine = {path.split("/")[2]: payload for path, payload in sent}
     assert "web_search_country_iso_code" not in by_engine["gemini"]
     assert "web_search" not in by_engine["perplexity"]
-    assert all(r["status"] == "ok" and r["mention"] is True and r["citation"] for r in out["results"])
+    assert all(r["status"] == "ok" and r["mention"] is True and r["citation"] is True for r in out["results"])
+    assert out.get("provider") == "dataforseo" and out.get("observed") is True
+    assert all(r.get("citationUrl") for r in out["results"])
 
 
 def test_visibility_keeps_last_good_answer_when_a_call_fails(offline, monkeypatch):

@@ -69,4 +69,6 @@ def test_research_lines_include_ideas_backlinks_and_visibility():
     assert "referring domains 12" in lines
     assert "portfolio web design" in lines
     assert "not mentioned" in lines
-    assert "AI visibility gap" in visibility_gap(stored)
+    gap = visibility_gap(stored)
+    assert "not named" in gap.lower()
+    assert "AI visibility" in gap

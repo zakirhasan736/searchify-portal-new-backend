@@ -130,7 +130,7 @@ def run_crawl(db: Session, user: User, link: str) -> dict:
         "kpis": [["Findings", str(len(findings))], ["Links", str(len(links))]],
         "crawl": payload,
         "source": "own_crawl",
-        "seedVersion": "google-live-v1",
+        "seedVersion": "own-crawl-v1",
         "url": final,
     }
     existing = (

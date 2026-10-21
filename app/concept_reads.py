@@ -152,7 +152,7 @@ def visibility_reading(row: dict | None, offers: list[str] | None) -> dict:
         if title:
             others.append(title[:120])
     mentioned = data.get("mention") is True
-    cited = bool(data.get("citation"))
+    cited = bool(data.get("citationUrl") or data.get("citation"))
     if data.get("status") == "empty" or (data.get("mention") is None and not data.get("snippet")):
         return {
             "concept": concept,

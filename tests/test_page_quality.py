@@ -12,6 +12,9 @@ def test_page_types():
     assert pq.page_type("https://a.com/blog/2024/05/tips") == "blog"
     assert pq.page_type("https://a.com/privacy-policy") == "legal"
     assert pq.page_type("https://a.com/plumbing", role="service") == "service"
+    assert pq.page_type("https://a.com/services/seo") == "service"
+    assert pq.page_type("https://a.com/products/oak-desk") == "product"
+    assert pq.page_type("https://a.com/locations/calgary") == "location"
 
 
 @pytest.mark.parametrize(
@@ -56,10 +59,76 @@ def test_case_study_owner_versus_client():
     assert good == []
 
 
+def test_homepage_rejects_case_study_bleed():
+    page_text = (
+        "Selected work. Case study: Huey Lam Suits — custom web design and development for a menswear brand. "
+        "We also offer SEO, Google Ads, branding and creative production in Calgary."
+    )
+    headings = "Selected Work | Web Design | SEO"
+    bad = pq.homepage_problems(
+        "Design and Web Development | Huey Lam Suits Case Study",
+        "For business owners, pair web design with SEO. View Huey Lam Suits work.",
+        brand="Sovereign Standard",
+        places=["Calgary"],
+        offers=["web design", "SEO", "Google Ads"],
+        page_text=page_text,
+        headings=headings,
+    )
+    assert bad
+    assert any("Huey" in issue or "case-study" in issue.lower() or "homepage" in issue.lower() for issue in bad)
+    good = pq.homepage_problems(
+        "Web Design & Development Agency in Calgary | Sovereign Standard",
+        "Sovereign Standard helps Calgary businesses grow with web design and development, SEO, Google Ads, branding, and creative services.",
+        brand="Sovereign Standard",
+        places=["Calgary"],
+        offers=["web design", "SEO", "Google Ads", "branding"],
+        page_text=page_text,
+        headings=headings,
+    )
+    assert good == []
+
+
+def test_service_page_rejects_unrelated_client():
+    page_text = "Our SEO service. See also Selected work: Acme Motors case study."
+    issues = pq.service_page_problems(
+        "SEO Services | Acme Motors Case Study",
+        "How we helped Acme Motors rank for local searches.",
+        topic="SEO services",
+        page_text=page_text,
+        headings="SEO Services | Selected Work",
+        brand="Agency Co",
+        offers=["SEO"],
+    )
+    assert issues
+
+
+def test_portfolio_client_names_need_local_context():
+    names = pq.portfolio_client_names(
+        "Selected work includes Huey Lam Suits and other projects.",
+        "Selected Work",
+        brand="Sovereign Standard",
+        places=["Calgary"],
+        offers=["web design"],
+    )
+    assert any("Huey" in name for name in names)
+    quiet = pq.portfolio_client_names(
+        "We offer Web Design and SEO for Calgary businesses.",
+        "Services",
+        brand="Sovereign Standard",
+        places=["Calgary"],
+        offers=["web design", "SEO"],
+    )
+    assert quiet == []
+
+
 def test_confidence_is_separate_from_validation():
     high = pq.confidence(content="ok", gsc={"impressions": 1200}, rivals=[{}], validation="unverified")
     low = pq.confidence(content="ok", gsc={"impressions": "—"}, rivals=[], validation="verified")
     assert high["level"] == "high" and low["level"] == "medium"
+    assert "Search Console for this URL" in low["missing"]
+    capped = pq.confidence(content="ok", gsc={"impressions": 1200}, rivals=[{}], analytics=True, validation="contradicted")
+    assert capped["level"] == "medium"
+    assert capped["validationStatus"] == "contradicted"
 
 
 HTML = """<html><head><title>Plumbing | Acme</title>

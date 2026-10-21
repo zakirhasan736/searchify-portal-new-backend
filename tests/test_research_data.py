@@ -46,6 +46,8 @@ def test_keywords_keep_location_language_nulls_and_dedupe(offline, monkeypatch):
     out = research.keywords(None, FakeUser(), site="acme.ca", terms=["Calgary Plumber", "calgary plumber", "unknown term"], country="Calgary, Alberta")
     assert out["location"] == "Canada" and out["language"] == "en" and out["place"]["city"] == "Calgary"
     assert all(p["location_name"] == "Canada" and p["language_code"] == "en" for _, p in offline)
+    assert out.get("provider") == "dataforseo"
+    assert "Search Console" in (out.get("metricsNote") or "")
     ranked = {r["keyword"]: r for r in out["ranked"]}
     assert len(out["ranked"]) == 2
     assert out["ranked"][0]["keyword"] == "calgary plumber" and out["ranked"][0]["position"] == 3

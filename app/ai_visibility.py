@@ -104,6 +104,22 @@ def _as_bool(value) -> bool:
     return str(value or "").strip().lower() in {"yes", "true", "1"}
 
 
+def _optional_bool(value):
+    """Preserve missing mention/citation as None (not estimated), never coerce to False."""
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"", "null", "none", "unknown", "n/a", "not estimated", "not_checked"}:
+        return None
+    if text in {"yes", "true", "1"}:
+        return True
+    if text in {"no", "false", "0"}:
+        return False
+    return None
+
+
 def _parse_json(text: str) -> dict:
     raw = (text or "").strip()
     if not raw:
@@ -169,8 +185,8 @@ def _fallback_report(profile: dict, prompts: list[str], site: str, reason: str) 
                     "why": error,
                     "steps": [
                         "Name the business, service, and city in the first 160 characters of the homepage.",
-                        "Add a short FAQ: who you are, where you work, what you sell.",
-                        "Publish, then sync Search Console so answer engines can recrawl the page.",
+                        "Describe who you are, where you work, and what you sell in plain language on the page.",
+                        "Publish, then sync Search Console. Recrawl helps discovery; it does not guarantee AI citations.",
                     ],
                     "targetUrl": site or "",
                     "titleDraft": f"{biz} | {profile.get('services') or 'Services'}",
@@ -183,9 +199,10 @@ def _fallback_report(profile: dict, prompts: list[str], site: str, reason: str) 
 
 
 def _pack(profile: dict, prompts: list[str], engines: list, checks: list, *, model: str, note: str) -> dict:
-    mentions = sum(1 for c in checks if c.get("mention"))
-    citations = sum(1 for c in checks if c.get("citation"))
-    errors = [c for c in checks if c.get("status") != "ok"]
+    mentions = sum(1 for c in checks if c.get("mention") is True)
+    citations = sum(1 for c in checks if c.get("citation") is True)
+    not_checked = sum(1 for c in checks if c.get("mention") is None or c.get("status") == "not_checked")
+    errors = [c for c in checks if c.get("status") not in {"ok", "not_checked"}]
     def est(value):
         return "Not estimated" if value is None else "Likely" if value else "Unlikely"
 
@@ -198,9 +215,10 @@ def _pack(profile: dict, prompts: list[str], engines: list, checks: list, *, mod
         "checks": checks,
         "prompts": prompts,
         "kpis": [
-            ["Estimated mentions", str(mentions)],
-            ["Estimated citations", str(citations)],
-            ["Issues", str(len(errors))],
+            ["Estimated mentions (likely)", str(mentions)],
+            ["Estimated citations (likely)", str(citations)],
+            ["Not estimated", str(not_checked)],
+            ["Estimated gaps", str(len(errors))],
             ["Engines", str(len(engines))],
         ],
         "generatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
@@ -209,7 +227,12 @@ def _pack(profile: dict, prompts: list[str], engines: list, checks: list, *, mod
         "model": model,
         "live": False,
         "estimate": True,
+        "observed": False,
         "method": "owned-data-likelihood",
+        "disclaimer": (
+            "These are likelihood estimates from your business profile and Search Console. "
+            "Engines were not queried live. Likely/Unlikely is not a confirmed mention or citation."
+        ),
         "profile": {
             "business": profile.get("business") or "",
             "services": profile.get("services") or "",
@@ -231,24 +254,34 @@ def _normalize_checks(raw_checks: list, prompts: list[str], profile: dict, site:
             continue
         idx = by_engine[match["name"]]
         by_engine[match["name"]] = idx + 1
-        mention = _as_bool(item.get("mention"))
-        citation = _as_bool(item.get("citation"))
-        status = str(item.get("status") or ("ok" if mention else "error")).lower()
-        if status not in {"ok", "gap", "error"}:
-            status = "error" if not mention else "ok"
+        mention = _optional_bool(item["mention"]) if "mention" in item else None
+        citation = _optional_bool(item["citation"]) if "citation" in item else None
+        raw_status = str(item.get("status") or "").lower()
+        if raw_status in {"ok", "gap", "error", "not_checked"}:
+            status = raw_status
+        elif mention is None:
+            status = "not_checked"
+        elif mention:
+            status = "ok"
+        else:
+            status = "error"
         solution = item.get("solution") if isinstance(item.get("solution"), dict) else {}
         steps = solution.get("steps") if isinstance(solution.get("steps"), list) else []
         steps = [str(s).strip() for s in steps if str(s).strip()][:6]
         if not steps:
             steps = [
                 f"State “{biz}” plus the service and city on the landing page H1 and title.",
-                "Add 3 FAQ answers that match the prompt in plain language.",
-                "Keep one canonical URL and resubmit it in Search Console.",
+                "Answer the prompt topics in plain language on the page (FAQ only if the page already uses Q&A).",
+                "Keep one canonical URL and resubmit it in Search Console. This does not guarantee AI citations.",
             ]
-        error = str(item.get("error") or "").strip() or (
-            f"{match['name']} does not mention {biz} for this prompt." if not mention else ""
-        )
-        suggestion = str(item.get("suggestion") or "").strip() or ("Keep this page current" if mention else "Fix entity copy")
+        if mention is None:
+            error = str(item.get("error") or "").strip() or f"Not estimated for {match['name']} — insufficient evidence."
+            suggestion = str(item.get("suggestion") or "").strip() or "Gather more evidence"
+        else:
+            error = str(item.get("error") or "").strip() or (
+                f"{match['name']} is unlikely to mention {biz} for this prompt (estimate)." if not mention else ""
+            )
+            suggestion = str(item.get("suggestion") or "").strip() or ("Keep this page current" if mention else "Fix entity copy")
         out.append(
             {
                 "id": str(item.get("id") or f"{match['id']}-{idx}"),
@@ -260,6 +293,8 @@ def _normalize_checks(raw_checks: list, prompts: list[str], profile: dict, site:
                 "error": error,
                 "suggestion": suggestion,
                 "excerpt": str(item.get("excerpt") or "")[:800],
+                "observed": False,
+                "estimate": True,
                 "solution": {
                     "title": str(solution.get("title") or suggestion)[:120],
                     "why": str(solution.get("why") or error)[:400],

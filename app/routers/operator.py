@@ -1693,7 +1693,7 @@ def propose_from_gsc(
 
     from app.listing_research import load_stored
 
-    stored_research = load_stored(db, user.id)
+    stored_research = load_stored(db, user.id, homepage or "")
 
     jobs, skipped = [], []
     for url in batch:
@@ -2279,7 +2279,7 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             page=page,
             site=site_ctx,
             taken=[t for t in taken if t][:20],
-            research=load_stored(db, user.id),
+            research=load_stored(db, user.id, row.target_url or ""),
             db=db,
             user=user,
         )
@@ -2337,14 +2337,16 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["specificity"] = drafted.get("specificity") or body.breadth or "balanced"
     from app import page_quality as _pq
 
+    scraped = drafted.get("scraped") or {}
+    content_state, _why = _pq.content_status(scraped if scraped else page)
+    proposed["contentStatus"] = content_state
     proposed["confidence"] = _pq.confidence(
-        content=proposed.get("contentStatus") or "ok",
+        content=content_state,
         gsc=proposed.get("evidence") or {},
         rivals=proposed.get("competitors") or [],
         validation=(proposed.get("validation") or {}).get("status") or "",
         analytics=bool(proposed.get("analytics")),
     )
-    scraped = drafted.get("scraped") or {}
     if scraped.get("title"):
         proposed["beforeTitle"] = scraped.get("title")
     if scraped.get("description"):

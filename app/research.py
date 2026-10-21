@@ -446,7 +446,14 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "seeds": seeds,
         "termLimit": term_limit,
         "qualityVersion": 2,
+        "provider": "dataforseo",
+        "dataKind": "keywords",
         "source": "Searchify SEO",
+        "metricsNote": (
+            "Volume, CPC, and difficulty are DataForSEO estimates. "
+            "Position is an estimated Google organic rank from DataForSEO Labs for this host — "
+            "not a Search Console impression or click. Missing values stay null (not zero)."
+        ),
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
     concepts = keyword_concepts(payload, offers)
@@ -601,19 +608,22 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
             "nofollowDomains": s.get("referring_domains_nofollow"),
             "brokenBacklinks": s.get("broken_backlinks"),
             "rank": s.get("rank"),
-            "rankScale": "Searchify SEO domain rank, 0 to 1000",
-            "counts": "Live referring domains from Searchify SEO backlinks summary",
+            "rankScale": "DataForSEO domain rank, 0 to 1000 (not Google PageRank)",
+            "counts": "Live referring-domain counts from the DataForSEO backlinks index",
         },
         "links": links,
         "linksNote": (
             "Best live link per referring domain first (strongest domain rank, dofollow preferred, spam score under 60). "
-            "Lost links are listed separately for review."
+            "Lost links are listed separately for review. Spam score is a provider signal requiring review, not a definitive spam judgment. "
+            "Anchor text alone does not prove relevance or authority."
         ),
         "linksShown": len(links),
         "referringDomainsListed": live_page.get("total_count"),
         "lostDomainsListed": lost_page.get("total_count"),
         "qualityVersion": 2,
         "market": {"scope": "domain", "countryFilter": False, "note": "Backlink counts are domain-wide, not filtered by the SEO target country."},
+        "provider": "dataforseo",
+        "dataKind": "backlinks",
         "source": "Searchify SEO Backlinks",
         "fetchedAt": datetime.utcnow().isoformat(timespec="seconds"),
     }
@@ -779,20 +789,27 @@ def visibility(
         first = (result or [{}])[0] or {}
         body, sources = _parse_answer(first)
         cited = [s["url"] for s in sources if host_of(s["url"]) == host]
+        mentioned = _mentions(body, names) if body else None
         row = {
             "id": prompt_id,
             "text": text,
             "engine": engine_label,
             "status": "ok" if body else "empty",
             "model": first.get("model_name") or model["name"],
-            "mention": _mentions(body, names) if body else None,
-            "citation": cited[0] if cited else "",
+            "mention": mentioned,
+            "citation": bool(cited),
+            "citationUrl": cited[0] if cited else "",
             "sources": sources[:12],
             "snippet": body[:1600],
             "fetchedAt": _now(),
             "country": applied["country"],
             "location": {"requested": place.to_dict(), "applied": applied},
             "market": {"countryIso": place.iso, "language": place.language, "source": market.get("source"), "version": market.get("version"), "scope": "country" if applied.get("country") else "global"},
+            "provider": "dataforseo",
+            "dataKind": "ai_visibility_live",
+            "observed": True,
+            "estimate": False,
+            "live": True,
         }
         row.update(visibility_reading(row, business_offers(db, user.id, host)))
         if row["status"] == "ok" or not previous.get("fetchedAt"):
@@ -806,7 +823,16 @@ def visibility(
         "location": place.to_dict(),
         "market": {"countryIso": place.iso, "language": place.language, "source": market.get("source"), "version": market.get("version")},
         "results": results,
+        "provider": "dataforseo",
+        "dataKind": "ai_visibility_live",
+        "observed": True,
+        "estimate": False,
+        "live": True,
         "source": "Searchify SEO AI",
+        "note": (
+            "These rows are live DataForSEO LLM response checks for the listed engines only. "
+            "They are not the operator likelihood estimate report."
+        ),
     }
 
 
@@ -1192,6 +1218,14 @@ def _audit_report(task_id: str, summary: dict) -> dict:
         if not hit and not count_hint:
             continue
         area, steps = _guide(key, fix)
+        pages = [_page_snippet(i) for i in hit[:25]]
+        # Prefer real page URLs. A summary metric alone must not invent blank URL rows.
+        if pages:
+            count = max(len(pages), count_hint) if count_hint else len(pages)
+        elif count_hint:
+            count = count_hint
+        else:
+            continue
         issues.append({
             "key": key,
             "name": name,
@@ -1200,10 +1234,10 @@ def _audit_report(task_id: str, summary: dict) -> dict:
             "meta": meta,
             "area": area,
             "steps": steps,
-            "count": max(len(hit), count_hint) or len(hit),
-            "pages": [_page_snippet(i) for i in hit[:25]] or (
-                [{"url": "", "status": None, "title": "", "description": ""}] if count_hint else []
-            ),
+            "count": count,
+            "pages": pages,
+            "urlsMissing": bool(count_hint and not pages),
+            "countSource": "pages" if pages else "summary_metric",
         })
     issues.extend(_listing_gaps(items))
     issues.extend(_content_findings(items))
@@ -1285,7 +1319,19 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
         crawl = (summary or {}).get("crawl_status") or {}
         if summary and summary.get("crawl_progress") == "finished":
             report = _audit_report(saved["taskId"], summary)
-            payload = {**saved, "state": "ready", "report": report, "fetchedAt": now.isoformat(timespec="seconds")}
+            payload = {
+                **saved,
+                "state": "ready",
+                "report": report,
+                "fetchedAt": now.isoformat(timespec="seconds"),
+                "provider": "dataforseo",
+                "dataKind": "on_page_audit",
+                "limitations": (
+                    "HTML crawl with JavaScript disabled. Core Web Vitals and real-user performance "
+                    "are not measured here — use PageSpeed / field data for that. "
+                    "Findings without page URLs are summary counts only."
+                ),
+            }
             _save(db, user.id, "dfs-audit", title, payload)
             return {**payload, "cached": False}
         payload = {**saved, "crawled": crawl.get("pages_crawled") or 0, "queued": crawl.get("pages_in_queue") or 0}
@@ -1336,7 +1382,12 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
         "queued": 0,
         "report": saved.get("report"),
         "fetchedAt": saved.get("fetchedAt"),
+        "provider": "dataforseo",
+        "dataKind": "on_page_audit",
         "source": "Searchify SEO On-Page",
+        "limitations": (
+            "HTML crawl with JavaScript disabled. Core Web Vitals are not measured from this crawl."
+        ),
     }
     _save(db, user.id, "dfs-audit", title, payload)
     return {**payload, "cached": False}

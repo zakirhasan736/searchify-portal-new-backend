@@ -37,14 +37,17 @@ FILLER = (
 SYSTEM = (
     "You are a senior SEO copywriter competing with the best SEO tools. You write the Google title and meta description for one specific page. "
     "The page topic is the concept. The best keyword is the search this page can honestly win. "
-    "Work in this order: (1) read the page topic in the brief and stay on that concept — do not switch to another service from the business brief or from a popular site-wide query; "
+    "Work in this order: (1) read the page topic and page type in the brief and stay on that concept — do not switch to another service, product, or case study from elsewhere on the site; "
     "(2) put the best keyword, in those words, near the front of the title; "
-    "(3) add one concrete fact from this page (a place, an offer, a proof, a named project) so the listing is specific and not a paste of the H1; "
+    "(3) add one concrete fact that belongs to THIS page only (a place, an offer, or a detail stated in the page copy) so the listing is specific and not a paste of the H1; "
     "(4) meet the hardest competitor on that same search. Match the strength of their keyword. Add one fact only this business can say. Do not copy their title or their claims; "
-    "(5) beat the live title: if the current listing already has the keyword, your draft must add a sharper proof or a second offer the live title misses. "
+    "(5) beat the live title when an improvement is justified: if the current listing already has the keyword, add a sharper offer or place the live title misses. "
+    "If the live title and description already accurately represent this page, keep that concept — do not invent a different subject just to sound new. "
     "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
     "Use Search Console queries, Analytics landing facts, site-audit notes, backlink anchors, and AI-visibility gaps only as evidence for which angle to win — never invent numbers. "
     "Every page on the site needs its own topic: never reuse another page's title. "
+    "Homepage and service pages describe the business offer. Never name a portfolio client, case-study project, or unrelated product on those pages. "
+    "Only a case-study or portfolio page may name the client or project that page is about. "
     "It does not sound like an agency slogan. "
     "Do not invent reviews, years in business, prices, awards, or certifications. "
     "Do not copy a competitor title. "
@@ -429,6 +432,7 @@ def stronger_listing(
     headings: str,
     text: str,
     brand: str,
+    page_kind: str = "",
 ) -> tuple[str, str, str]:
     """A listing led by the business keyword. The current title is not copied."""
     lead = _label_case((keyword or (offers[0] if offers else "") or _lead_phrase(current_title)).strip())
@@ -441,7 +445,9 @@ def stronger_listing(
             extras.append(label)
     tail = _title_tail(extras, lead)
     title = _clean(f"{lead} | {tail}" if tail else lead, 60)
-    proof = _proof_name(text, headings, brand, f"{current_title} {current_desc} {lead}")
+    # Homepage / service / product listings must not inject portfolio client names as "proof".
+    allow_proof = page_kind not in {"home", "service", "product", "category", "location"}
+    proof = _proof_name(text, headings, brand, f"{current_title} {current_desc} {lead}") if allow_proof else ""
     cover = extras[:3]
     if cover:
         listed = ", ".join(cover[:-1]) + (f" and {cover[-1]}" if len(cover) > 1 else cover[0])
@@ -456,7 +462,7 @@ def stronger_listing(
         sentence += f", including {proof}."
     else:
         sentence += "."
-    sentence += " See the work."
+    sentence += " See the work." if allow_proof else f" Learn more from {brand}." if brand else " Learn more."
     desc = _clean(sentence, 155)
     others = ", ".join(extras[:3]) or "the same offer"
     reason = f"The business concept chose “{lead}” ahead of the current title. The description also covers {others}."
@@ -687,16 +693,38 @@ def write_title_description(
     places = [str(item).strip() for item in (business.get("places") or []) if str(item).strip()]
     if not places and (profile.get("areas") or profile.get("locations")):
         places = [part.strip() for part in str(profile.get("areas") or profile.get("locations")).split(",") if part.strip()]
+    from app.listing_research import keyword_fits_page
+
     research_best, research_alts = best_keyword_from_research(
-        research, url=page_url, topic=topic or " ".join(offers[:2]), offers=offers, queries=queries,
+        research,
+        url=page_url,
+        topic=topic or " ".join(offers[:2]),
+        offers=offers,
+        queries=queries,
+        page_text=page_only,
+        places=places,
     )
+    # Drop stored research terms that fail page relevance (volume alone is never enough).
+    if research_best and not keyword_fits_page(
+        research_best, topic=topic or "", page_text=page_only, offers=offers, places=places,
+    ):
+        research_best = ""
+    research_alts = [
+        term for term in research_alts
+        if keyword_fits_page(term, topic=topic or "", page_text=page_only, offers=offers, places=places)
+    ]
     matched = matching_queries([research_best, *research_alts, *queries], topic or " ".join(offers), page_only)
     if research_best and research_best.lower() not in {item.lower() for item in matched}:
         matched = [research_best, *matched][:6]
     keyword = research_best or best_keyword(matched, topic)
     options = coverage_keywords(offers=offers, places=places, queries=[*matched, *research_alts, *queries], brand=brand, url=page_url)
-    # Prefer a stored Searchify SEO keyword when it already fits the offer; otherwise keep coverage order.
-    if research_best and offers and (_content_tokens(research_best) & _content_tokens(" ".join(offers))):
+    # Prefer a stored Searchify SEO keyword only when it fits the page and the offer.
+    if (
+        research_best
+        and offers
+        and (_content_tokens(research_best) & _content_tokens(" ".join(offers)))
+        and keyword_fits_page(research_best, topic=topic or "", page_text=page_only, offers=offers, places=places)
+    ):
         keyword = research_best
         if research_best.lower() not in {item.lower() for item in options}:
             options = [research_best, *options][:4]
@@ -770,6 +798,31 @@ def write_title_description(
             seo_desc = _clean(seeded["description"], 155)
             live_title = str(scraped.get("title") or "")
             live_desc = str(scraped.get("description") or "")
+            seed_issues = []
+            if kind == "home":
+                seed_issues = page_quality.homepage_problems(
+                    seo_title, seo_desc, brand=brand, places=places, offers=offers,
+                    page_text=str(scraped.get("text") or ""), headings=str(headings or ""),
+                )
+            elif kind in {"service", "product", "category", "location"}:
+                seed_issues = page_quality.service_page_problems(
+                    seo_title, seo_desc, topic=topic or keyword or "",
+                    page_text=str(scraped.get("text") or ""), headings=str(headings or ""),
+                    brand=brand, places=places, offers=offers,
+                )
+            if seed_issues:
+                seo_title, seo_desc, _ = stronger_listing(
+                    keyword=keyword,
+                    alternatives=options,
+                    offers=offers,
+                    places=places,
+                    current_title=live_title,
+                    current_desc=live_desc,
+                    headings=str(headings or ""),
+                    text="",
+                    brand=brand,
+                    page_kind=kind,
+                )
             beats = listing_is_stronger(
                 seo_title, seo_desc, live_title, live_desc, brand,
                 keyword=keyword, places=places, offers=offers, rival=meet,
@@ -783,7 +836,7 @@ def write_title_description(
                 live_description=live_desc,
                 beats_live=beats,
                 meet_competitor=str(meet.get("title") or ""),
-                open_issues=[],
+                open_issues=seed_issues,
             )
             return {
                 **empty,
@@ -796,7 +849,7 @@ def write_title_description(
                 "role": "content",
                 "target": target_kw,
                 "beatsLive": beats,
-                "openIssues": [],
+                "openIssues": seed_issues,
                 "jev": jev,
                 "analysis": {
                     "sources": [
@@ -849,12 +902,36 @@ def write_title_description(
         f"Analytics for the property, last stored window. Use a figure only if it is written here:\n{_analytics_block(analytics)}\n\n"
         f"{specificity_instruction(specificity)}\n"
     )
+    page_body = str(scraped.get("text") or "")
+    page_heads = str(headings or "")
+    portfolio_clients = page_quality.portfolio_client_names(
+        page_body, page_heads, brand=brand, places=places, offers=offers,
+    )
     if kind == "home":
         brief += (
-            "\nThis is the HOMEPAGE. The business concept chooses the keyword, not the current title. "
+            "\nThis is the HOMEPAGE. Describe the business offer and place — not a portfolio piece. "
+            "The business concept chooses the keyword, not the current title. "
             "Lead with the best keyword. Put one alternative keyword in the description. "
-            "Start with a city only when that best keyword contains the city.\n"
+            "Start with a city only when that best keyword contains the city. "
+            "Do not write a case-study title. Do not name any client project shown in selected work.\n"
         )
+        if portfolio_clients:
+            brief += (
+                "Portfolio clients visible on this homepage (do NOT use these names in the title or description): "
+                + ", ".join(portfolio_clients[:8])
+                + ".\n"
+            )
+    if kind in {"service", "product", "category", "location"}:
+        brief += (
+            f"\nThis is a {kind.upper()} page. Stay on this page's subject ({topic or keyword or 'the main offer'}). "
+            "Do not import a case study, portfolio client, or a different service from elsewhere on the site.\n"
+        )
+        if portfolio_clients:
+            brief += (
+                "Unrelated client names on or near this page (do NOT use unless this page is about them): "
+                + ", ".join(portfolio_clients[:8])
+                + ".\n"
+            )
     if kind == "case_study":
         brief += (
             "\nThis page is a CASE STUDY about work the site owner did for a client. "
@@ -879,7 +956,20 @@ def write_title_description(
                 found.append(f"“{claim['claim']}” contradicts the page, which says {claim.get('page')}. Use the page's figure or drop it.")
             elif claim["status"] == "unverified" and claim["kind"] in {"number", "promise"}:
                 found.append(f"“{claim['claim']}” is not on this page. Remove it unless the page says it.")
-        if kind == "case_study":
+        if kind == "home":
+            found.extend(
+                page_quality.homepage_problems(
+                    t, d, brand=brand, places=places, offers=offers, page_text=page_body, headings=page_heads,
+                )
+            )
+        elif kind in {"service", "product", "category", "location"}:
+            found.extend(
+                page_quality.service_page_problems(
+                    t, d, topic=topic or keyword or "", page_text=page_body, headings=page_heads,
+                    brand=brand, places=places, offers=offers,
+                )
+            )
+        elif kind == "case_study":
             found.extend(page_quality.case_study_problems(t, d, scraped, brand))
         if current.strip() and offers and not (_content_tokens(t) & _content_tokens(" ".join(offers))):
             found.append("The title left the business concept. Use the best keyword from the offers, not the current title.")
@@ -940,7 +1030,14 @@ def write_title_description(
     if seo_seed.get("title") and seo_seed.get("description"):
         seo_title = _clean(seo_seed["title"], 60)
         seo_desc = _clean(seo_seed["description"], 155)
-        if score_candidate(seo_title, seo_desc) < score_candidate(title, desc):
+        seo_bleed = any(
+            "portfolio client" in issue.lower()
+            or "unrelated client" in issue.lower()
+            or "case-study title" in issue.lower()
+            or "not a case study" in issue.lower()
+            for issue in checks(seo_title, seo_desc)
+        )
+        if not seo_bleed and score_candidate(seo_title, seo_desc) < score_candidate(title, desc):
             title, desc = seo_title, seo_desc
             reason = (
                 f"Chose the Searchify SEO content draft on “{keyword or topic}” because it beat the first pass "
@@ -952,7 +1049,7 @@ def write_title_description(
     if current.strip() and not listing_is_stronger(
         title, desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
     ):
-        title, desc, reason = stronger_listing(
+        alt_title, alt_desc, alt_reason = stronger_listing(
             keyword=keyword,
             alternatives=options,
             offers=offers,
@@ -962,7 +1059,50 @@ def write_title_description(
             headings=str(headings or ""),
             text=str(scraped.get("text") or ""),
             brand=brand,
+            page_kind=kind,
         )
+        if listing_is_stronger(
+            alt_title, alt_desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
+        ):
+            title, desc, reason = alt_title, alt_desc, alt_reason
+        else:
+            # Keep an already-accurate live listing rather than forcing a weaker rewrite.
+            title, desc = _clean(current, 60), _clean(live_desc, 155)
+            reason = (
+                "Recommend keeping the current title and description: no validated draft was clearly stronger for this page."
+            )
+    # Never ship a homepage/service listing that still names a portfolio client.
+    bleed = [
+        issue for issue in checks(title, desc)
+        if "portfolio client" in issue.lower()
+        or "unrelated client" in issue.lower()
+        or "case-study title" in issue.lower()
+        or "not a case study" in issue.lower()
+    ]
+    if bleed and kind in {"home", "service", "product", "category", "location"}:
+        import logging
+
+        logging.getLogger(__name__).info(
+            "meta_writer rejected page-mismatched draft for %s (%s): %s",
+            kind,
+            page_url,
+            "; ".join(bleed[:3]),
+        )
+        title, desc, reason = stronger_listing(
+            keyword=keyword,
+            alternatives=options,
+            offers=offers,
+            places=places,
+            current_title=current,
+            current_desc=live_desc,
+            headings=str(headings or ""),
+            text="",
+            brand=brand,
+            page_kind=kind,
+        )
+        reason = (
+            f"Safe page-specific fallback after rejecting a draft that mixed in another page's subject. {reason}"
+        ).strip()
     if not reason:
         reason = "Written from the business concept, the best keyword, and the competitor this page has to meet."
     if keyword and "best keyword" not in reason.lower() and f"“{keyword}”" not in reason:

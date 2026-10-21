@@ -1461,19 +1461,27 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
             db,
             user.id,
             "visibility-overview",
-            "Visibility Overview (Google)",
+            "Google Visibility Snapshot",
             {
-                "summary": "Search Console + GA4 visibility snapshot.",
+                "summary": (
+                    "Search Console + GA4 + PageSpeed snapshot for the connected property. "
+                    "This is not AI answer-engine visibility (use DataForSEO live checks or the AI Visibility estimate report)."
+                ),
                 "columns": ["Signal", "Value", "Source"],
                 "rows": [
                     ["GSC queries", str(len(queries)), "Search Console"],
-                    ["GSC top clicks", queries[0][1] if queries else "0", "Search Console"],
-                    ["GA4 sessions", str(report.get("sessions", "—")), "GA4"],
-                    ["GA4 users", str(report.get("users", "—")), "GA4"],
+                    ["GSC top clicks", queries[0][1] if queries else "—", "Search Console"],
+                    ["GA4 sessions", str(report.get("sessions") if report.get("sessions") is not None else "—"), "GA4"],
+                    ["GA4 users", str(report.get("users") if report.get("users") is not None else "—"), "GA4"],
                     ["Mobile perf", (mobile or {}).get("scores", {}).get("performance", "—"), "PageSpeed"],
                 ],
                 "panels": dash_panels,
                 "concept": "google-dash",
+                "provider": "google",
+                "dataKind": "google_visibility_snapshot",
+                "observed": True,
+                "estimate": False,
+                "aiVisibility": False,
                 "source": "google_composite",
                 "seedVersion": LIVE,
             },

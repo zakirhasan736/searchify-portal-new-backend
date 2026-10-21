@@ -14,6 +14,10 @@ THIN_WORDS = 120
 CASE_STUDY = re.compile(r"(case[-_ ]?stud|portfolio|our[-_ ]work|projects?/|success[-_ ]stor|client[-_ ]stor|testimonial)", re.I)
 BLOG = re.compile(r"(/blog/|/news/|/articles?/|/posts?/|/\d{4}/\d{2}/)", re.I)
 LEGAL = re.compile(r"(privacy|cookie|terms|disclaimer|refund|legal|gdpr|accessibility)", re.I)
+PRODUCT = re.compile(r"(/products?/|/shop/|/store/|/item/)", re.I)
+SERVICE = re.compile(r"(/services?/|/solutions?/|/offerings?/)", re.I)
+LOCATION = re.compile(r"(/locations?/|/areas?-we-serve|/near-me|/in-[a-z-]+)", re.I)
+CATEGORY = re.compile(r"(/categor(?:y|ies)/|/collections?/|/topics?/)", re.I)
 
 NUMBER_CLAIM = re.compile(
     r"(?<![\w.])(\$?\d[\d,]*(?:\.\d+)?\+?%?)(?:\s*(years?|yrs?|clients?|customers?|projects?|reviews?|stars?|locations?|cities|hours?|days?|minutes?|mins?))?",
@@ -25,6 +29,10 @@ SPECIAL = re.compile(r"\b(24/7|same[- ]day|next[- ]day|free (?:quote|estimate|co
 def page_type(url: str, role: str = "", page: dict | None = None) -> str:
     path = urlparse(url or "").path.strip("/").lower()
     blob = " ".join([path, (page or {}).get("h1") or "", (page or {}).get("title") or ""])
+    schema = " ".join(str(t) for t in ((page or {}).get("schemaTypes") or [])).lower()
+    role = (role or "").lower()
+    if role in {"home", "service", "product", "category", "location", "about", "contact", "blog", "legal", "case_study"}:
+        return "home" if role == "home" else role
     if not path:
         return "home"
     if CASE_STUDY.search(blob):
@@ -33,7 +41,14 @@ def page_type(url: str, role: str = "", page: dict | None = None) -> str:
         return "legal"
     if BLOG.search(f"/{path}/"):
         return "blog"
-    role = (role or "").lower()
+    if PRODUCT.search(f"/{path}/") or "product" in schema:
+        return "product"
+    if CATEGORY.search(f"/{path}/"):
+        return "category"
+    if SERVICE.search(f"/{path}/") or "service" in schema:
+        return "service"
+    if LOCATION.search(f"/{path}/"):
+        return "location"
     if role in {"service", "product", "category", "location", "about", "contact", "blog", "legal"}:
         return role
     return "other"
@@ -139,21 +154,151 @@ def case_study_problems(title: str, description: str, page: dict | None, brand: 
     return issues
 
 
+_CASE_STUDY_PHRASE = re.compile(r"\b(case[- ]?stud(?:y|ies)|portfolio piece|client stor(?:y|ies)|success stor(?:y|ies))\b", re.I)
+_PROPER_NAME = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b")
+_PORTFOLIO_CONTEXT = re.compile(
+    r"(case[- ]?stud|portfolio|our[- ]work|selected work|client|project|testimonial|success stor)",
+    re.I,
+)
+
+
+def _allowed_name_tokens(brand: str, places: list[str] | None, offers: list[str] | None) -> set[str]:
+    blob = " ".join(
+        str(part)
+        for part in (
+            brand,
+            *(places or []),
+            *(offers or []),
+            "Google Ads",
+            "Search Console",
+            "Digital Marketing",
+            "Web Design",
+            "Web Development",
+        )
+        if part
+    )
+    return {part for part in re.findall(r"[a-z0-9]+", blob.lower()) if len(part) > 2}
+
+
+def portfolio_client_names(page_text: str, headings: str = "", *, brand: str = "", places: list[str] | None = None, offers: list[str] | None = None) -> list[str]:
+    """Proper names that appear in portfolio/case-study context on the page — not the site owner."""
+    allowed = _allowed_name_tokens(brand, places, offers)
+    blob = f"{page_text or ''} {headings or ''}"
+    found: list[str] = []
+    for match in _PROPER_NAME.finditer(blob):
+        name = match.group(1)
+        words = {part for part in re.findall(r"[a-z0-9]+", name.lower()) if len(part) > 2}
+        if not words or words <= allowed:
+            continue
+        # Require local portfolio/case-study cues so ordinary Proper nouns on a
+        # service page are not treated as clients.
+        start = max(0, match.start() - 160)
+        end = min(len(blob), match.end() + 160)
+        if not _PORTFOLIO_CONTEXT.search(blob[start:end]):
+            continue
+        if name.lower() not in {item.lower() for item in found}:
+            found.append(name)
+        if len(found) >= 12:
+            break
+    return found
+
+
+def homepage_problems(
+    title: str,
+    description: str,
+    *,
+    brand: str = "",
+    places: list[str] | None = None,
+    offers: list[str] | None = None,
+    page_text: str = "",
+    headings: str = "",
+) -> list[str]:
+    """Homepage listings describe the business. They must not become a case-study card."""
+    draft = f"{title or ''} {description or ''}"
+    issues: list[str] = []
+    if _CASE_STUDY_PHRASE.search(draft):
+        issues.append("This is the homepage. Do not write a case-study title or description.")
+    clients = portfolio_client_names(page_text, headings, brand=brand, places=places, offers=offers)
+    draft_lower = draft.lower()
+    for name in clients:
+        if name.lower() in draft_lower:
+            issues.append(
+                f"Do not name the portfolio client “{name}” on the homepage listing. "
+                "Keep the listing about the business offer and place."
+            )
+            break
+    # Catch case-study shaped titles even when the client name was not scraped as such.
+    if re.search(r"\|\s*.+\s+case\s*stud", draft, re.I) or re.search(r"\bcase\s*stud(?:y|ies)\s*[:|]?", draft, re.I):
+        if "This is the homepage" not in " ".join(issues):
+            issues.append("This is the homepage. Do not write a case-study title or description.")
+    return issues
+
+
+def service_page_problems(
+    title: str,
+    description: str,
+    *,
+    topic: str,
+    page_text: str = "",
+    headings: str = "",
+    brand: str = "",
+    places: list[str] | None = None,
+    offers: list[str] | None = None,
+) -> list[str]:
+    """Service/product pages must stay on their own offer — not a sibling case study."""
+    draft = f"{title or ''} {description or ''}"
+    issues: list[str] = []
+    if _CASE_STUDY_PHRASE.search(draft) and not _CASE_STUDY_PHRASE.search(f"{topic} {page_text}"):
+        issues.append("This page is not a case study. Keep the listing on this page's service or product.")
+    clients = portfolio_client_names(page_text, headings, brand=brand, places=places, offers=offers)
+    draft_lower = draft.lower()
+    topic_lower = (topic or "").lower()
+    for name in clients:
+        if name.lower() in draft_lower and name.lower() not in topic_lower:
+            issues.append(f"Do not bring in the unrelated client “{name}”. Stay on this page's subject.")
+            break
+    return issues
+
+
 def confidence(*, content: str, gsc: dict | None, rivals: list | None, validation: str, analytics: bool = False) -> dict:
-    """How much evidence the draft rests on. Independent of whether the claims check out."""
-    score, basis = 0, []
+    """How much evidence the draft rests on.
+
+    Coverage (this score) is separate from claim validity. A draft can be high-coverage
+    and still contain an unverified claim — callers must surface ``validation`` separately.
+    Missing GSC/Analytics never counts as zero performance; it simply adds no evidence.
+    """
+    score, basis, missing = 0, [], []
     if content == "ok":
         score += 2
         basis.append("page copy")
+    else:
+        missing.append("readable page copy" if content != "ok" else "")
     gsc = gsc or {}
-    if str(gsc.get("impressions") or "").strip() not in {"", "—", "None"}:
+    impressions = gsc.get("impressions")
+    if impressions is not None and str(impressions).strip() not in {"", "—", "None", "null"}:
         score += 2
         basis.append("Search Console")
+    else:
+        missing.append("Search Console for this URL")
     if rivals:
         score += 1
         basis.append("competitor listings")
+    else:
+        missing.append("same-intent competitor listings")
     if analytics:
         score += 1
         basis.append("Analytics")
+    else:
+        missing.append("Analytics landing metrics")
+    # Do not inflate confidence when claims are contradicted — coverage stays, level capped.
     level = "high" if score >= 4 else "medium" if score >= 2 else "low"
-    return {"level": level, "basis": basis}
+    if validation == "contradicted" and level == "high":
+        level = "medium"
+        missing.append("claim validation passed")
+    return {
+        "level": level,
+        "basis": basis,
+        "missing": [item for item in missing if item],
+        "validationStatus": validation or "",
+        "note": "Confidence reflects evidence coverage, not predicted rankings or traffic.",
+    }
