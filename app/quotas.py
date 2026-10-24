@@ -68,8 +68,11 @@ def plan_for(db: Session, user: User) -> str | None:
     from app import site_profiles
 
     chosen = ((site_profiles.get_journey(db, user.id) or {}).get("state") or {}).get("planId")
+    aliases = {"solo": "starter", "pro": "growth", "premium": "agency", "scale": "agency"}
     if chosen in PLANS:
         return chosen
+    if chosen in aliases and aliases[chosen] in PLANS:
+        return aliases[chosen]
     return SERVER_PLAN.get((getattr(user, "plan", "") or "starter").lower(), "starter")
 
 

@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -141,8 +142,8 @@ def delete_feature(kind: str, record_id: int, db: Session = Depends(get_db), use
 
 @router.post("/auth/forgot-password")
 def forgot_password(body: ForgotBody, db: Session = Depends(get_db)):
-    login = body.username.strip()
-    user = db.query(User).filter((User.username == login) | (User.email == login)).one_or_none()
+    login = body.username.strip().lower()
+    user = db.query(User).filter((func.lower(User.username) == login) | (func.lower(User.email) == login)).one_or_none()
     if user is None:
         raise HTTPException(status_code=404, detail="No account uses that username")
     user.password_hash = hash_password(body.password)

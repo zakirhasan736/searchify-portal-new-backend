@@ -39,7 +39,11 @@ def make_token(user: User) -> str:
 
 
 def user_type(role: str) -> str:
-    return "admin" if role == "ROLE_ADMIN" else "client"
+    if role == "ROLE_ADMIN":
+        return "admin"
+    if role == "ROLE_PARTNER":
+        return "partner"
+    return "client"
 
 
 def get_current_user(
@@ -57,3 +61,17 @@ def get_current_user(
     if user is None:
         raise HTTPException(status_code=401, detail="Sign in required")
     return user
+
+
+def get_optional_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+    db: Session = Depends(get_db),
+) -> User | None:
+    if credentials is None:
+        return None
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        user_id = int(payload["sub"])
+    except (jwt.PyJWTError, KeyError, ValueError):
+        return None
+    return db.get(User, user_id)

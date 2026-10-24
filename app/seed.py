@@ -1,6 +1,8 @@
 from sqlalchemy.orm import Session
 
 from app.models import Domain, Project, Suggestion, Tag, User
+from app.routers.hq import ensure_hq_demo
+from app.routers.partners import ensure_partner_account
 from app.security import hash_password
 
 
@@ -68,6 +70,9 @@ def seed(db: Session) -> None:
             user.site_limit = 15
             db.add(user)
     db.commit()
+
+    ensure_partner_account(db)
+    ensure_hq_demo(db)
 
     if db.query(Domain).count() > 0:
         return
