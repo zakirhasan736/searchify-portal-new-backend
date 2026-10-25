@@ -413,6 +413,8 @@ def partner_book(db: Session) -> dict:
         {
             "id": person["id"],
             "name": person["name"],
+            "email": person["email"],
+            "handle": person["handle"],
             "type": person["type"],
             "rate": person["rate"],
             "founding": person["founding"],

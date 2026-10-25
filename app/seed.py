@@ -99,10 +99,32 @@ def ensure_admin_account(db: Session) -> None:
         db.add(user)
     else:
         user.role = "ROLE_ADMIN"
-        if not verify_password(password, user.password_hash):
-            user.password_hash = hash_password(password)
         db.add(user)
     db.commit()
+    db.refresh(user)
+    # Apply ADMIN_PASSWORD only when that value is new. A password the admin changed in HQ settings
+    # must survive restarts; changing ADMIN_PASSWORD in the env is the recovery path.
+    import hashlib
+
+    from app.models import FeatureRecord
+
+    marker = hashlib.sha256(f"{email}:{password}".encode()).hexdigest()
+    row = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "admin-env")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    applied = (row.payload or {}).get("applied") if row else None
+    if applied != marker:
+        if not verify_password(password, user.password_hash):
+            user.password_hash = hash_password(password)
+            db.add(user)
+        if row is None:
+            db.add(FeatureRecord(customer_id=user.id, kind="admin-env", title="Admin env password", payload={"applied": marker}, status="stored"))
+        else:
+            row.payload = {"applied": marker}
+        db.commit()
 
     if db.query(Domain).count() > 0:
         return
