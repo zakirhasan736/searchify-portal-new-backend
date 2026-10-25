@@ -522,30 +522,77 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
     return RedirectResponse(f"{dest}?{q}")
 
 
+def _workspace_site_for_match(db: Session, user_id: int) -> str:
+    """Best single website address for auto-matching GSC/GA4 after OAuth."""
+    from app import site_profiles
+
+    journey = site_profiles.get_journey(db, user_id) or {}
+    state = journey.get("state") or {}
+    sites = list(state.get("sites") or [])
+    active_id = state.get("activeId")
+    if active_id:
+        active = next((s for s in sites if str(s.get("id")) == str(active_id)), None)
+        site = ((active or {}).get("answers") or {}).get("site") or ""
+        if site:
+            return str(site).strip()
+    with_site = [s for s in sites if (s.get("answers") or {}).get("site")]
+    ready = [s for s in with_site if s.get("status") == "ready"]
+    pool = ready or with_site
+    if len(pool) == 1:
+        return str(pool[0]["answers"]["site"]).strip()
+    cms = (
+        db.query(CmsConnection)
+        .filter(CmsConnection.customer_id == user_id, CmsConnection.status == "connected")
+        .order_by(CmsConnection.id.desc())
+        .all()
+    )
+    if len(cms) == 1 and cms[0].site_url:
+        return str(cms[0].site_url).strip()
+    return ""
+
+
 def _auto_match_after_connect(db: Session, row: GoogleConnection) -> None:
-    """If the workspace has exactly one website and no property is chosen, pick the property only when the match is unambiguous."""
+    """If the workspace has one clear website and no property is chosen, pick only when the match is unambiguous."""
     if row.gsc_site_url and row.ga4_property_id:
         return
     try:
-        from app import site_profiles
-
-        journey = site_profiles.get_journey(db, row.customer_id) or {}
-        sites = [s for s in (journey.get("state") or {}).get("sites") or [] if s.get("status") == "ready" and (s.get("answers") or {}).get("site")]
-        if len(sites) != 1:
+        site = _workspace_site_for_match(db, row.customer_id)
+        if not site:
             return
-        site = sites[0]["answers"]["site"]
         token = row.access_token
         if not row.gsc_site_url:
             found = google_match.match_gsc(site, goauth.list_gsc_sites(token))
             if found["status"] == "matched":
                 row.gsc_site_url = found["selected"]
                 _stamp_validated(row, "gsc", found["selected"])
+                host = host_key(site)
+                if host:
+                    _save_binding(
+                        row,
+                        host,
+                        {
+                            "gscSiteUrl": row.gsc_site_url or "",
+                            "ga4PropertyId": row.ga4_property_id or "",
+                            "ga4PropertyName": row.ga4_property_name or "",
+                        },
+                    )
         if not row.ga4_property_id:
             found = google_match.match_ga4(site, _ga4_with_streams(token, goauth.list_ga4_properties(token)))
             if found["status"] == "matched":
                 row.ga4_property_id = found["selected"]
                 row.ga4_property_name = found.get("selectedName") or ""
                 _stamp_validated(row, "ga4", found["selected"])
+                host = host_key(site)
+                if host:
+                    _save_binding(
+                        row,
+                        host,
+                        {
+                            "gscSiteUrl": row.gsc_site_url or "",
+                            "ga4PropertyId": row.ga4_property_id or "",
+                            "ga4PropertyName": row.ga4_property_name or "",
+                        },
+                    )
         _remember_account(row)
         db.commit()
     except Exception as exc:  # noqa: BLE001
