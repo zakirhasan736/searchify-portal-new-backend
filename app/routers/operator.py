@@ -1437,6 +1437,10 @@ def _scan_fresh(scan: dict) -> bool:
     stamp = scan.get("scannedAt")
     if not stamp or not scan.get("pages") or scan.get("stale"):
         return False
+    from app.site_scan import READER_VERSION
+
+    if int(scan.get("readerVersion") or 1) < READER_VERSION:
+        return False  # read by an older site reader: re-read once for the full site concept
     try:
         age = datetime.utcnow() - datetime.fromisoformat(stamp)
     except ValueError:

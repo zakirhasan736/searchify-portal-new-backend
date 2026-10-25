@@ -410,6 +410,9 @@ def crawl(home: str, limit: int = 40) -> dict:
     return {"home": home, "host": home_host, "pages": pages, "failed": failed, "error": "" if pages else "No readable pages were found."}
 
 
+# 2: reads every offer + umbrella category, more copy per page, navigation.
+READER_VERSION = 2
+
 UNDERSTAND = (
     "You are an SEO strategist reading a whole website before writing any Google listing. "
     "Use only what the pages and the owner's brief say. Do not invent awards, prices, years, reviews, or locations. "
@@ -608,6 +611,8 @@ def scan_site(
         "scannedAt": datetime.utcnow().isoformat(timespec="seconds"),
         "pages": pages,
         "business": {k: v for k, v in understanding.items() if k != "pages"},
+        # Bump when the site reader changes so stored scans are re-read once (operator._scan_fresh).
+        "readerVersion": READER_VERSION,
         "pageMap": page_map,
         "competitors": competitors,
         "brief": brief,
