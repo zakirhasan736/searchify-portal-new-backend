@@ -73,26 +73,25 @@ def test_image_names_drop_camera_and_cms_noise():
     assert _image_name("https://a.example/2024-05-01-roof-repair-calgary.jpg") == "Roof repair calgary"
 
 
-def test_keyword_ideas_stay_on_the_business_offer(monkeypatch):
+def test_keyword_ideas_come_from_dataforseo_reading_the_site(monkeypatch):
     from app import research
 
+    sent = []
+
     def fake_call(method, path, payload, timeout=60):
-        if "keyword_suggestions" in path:
-            return [{
-                "seed_keyword": payload[0]["keyword"],
-                "seed_keyword_data": {"keyword_info": {"search_volume": 900}},
-                "items": [
-                    {"keyword": "web design calgary price", "keyword_info": {"search_volume": 300}},
-                    {"keyword": "web design jobs calgary", "keyword_info": {"search_volume": 5000}},
-                    {"keyword": "pizza near me", "keyword_info": {"search_volume": 90000}},
-                ],
-            }], 0.0
+        sent.append((path, payload[0]))
+        if "keywords_for_site" in path:
+            return [{"items": [
+                {"keyword": "drain cleaning austin", "keyword_info": {"search_volume": 900},
+                 "search_intent_info": {"main_intent": "commercial"}},
+                {"keyword": "how to unclog a drain", "keyword_info": {"search_volume": 4000},
+                 "search_intent_info": {"main_intent": "informational"}},
+            ]}], 0.0
         return [{"items": []}], 0.0
 
     monkeypatch.setattr(research, "_call", fake_call)
-    monkeypatch.setattr(research, "_place_for", lambda *a, **k: (research.locations.Location(country="Canada", iso="CA", language="en"), {}))
-    monkeypatch.setattr(research, "business_offers", lambda *a: ["web design"])
-    monkeypatch.setattr(research, "business_places", lambda *a: ["Calgary"])
+    monkeypatch.setattr(research, "_place_for", lambda *a, **k: (research.locations.Location(country="United States", iso="US", language="en"), {}))
+    monkeypatch.setattr(research, "business_offers", lambda *a: [])
     monkeypatch.setattr(research, "cached", lambda *a, **k: None)
     for name in ("_budget", "_spend", "_save"):
         monkeypatch.setattr(research, name, lambda *a, **k: None)
@@ -104,13 +103,15 @@ def test_keyword_ideas_stay_on_the_business_offer(monkeypatch):
     class U:
         id, role, plan = 1, "ROLE_CLIENT", "starter"
 
-    out = research.keywords(None, U(), site="https://acme.ca", terms=[])
-    words = [row["keyword"] for row in out["ideas"]]
-    assert out["seeds"][0] == "web design Calgary"
-    assert "web design Calgary" in words  # the seed itself is returned
-    assert "web design calgary price" in words
-    assert "web design jobs calgary" not in words  # job-seeker intent
-    assert "pizza near me" not in words  # off the business
+    out = research.keywords(None, U(), site="https://acmeplumbing.com", terms=[])
+    paths = [path for path, _ in sent]
+    assert "/dataforseo_labs/google/keywords_for_site/live" in paths
+    assert not any("keyword_suggestions" in path for path in paths)
+    body = next(b for p, b in sent if "keywords_for_site" in p)
+    assert body["target"] == "acmeplumbing.com" and "keyword" not in body  # the site, not a seed
+    assert [row["keyword"] for row in out["ideas"]] == ["drain cleaning austin", "how to unclog a drain"]  # DataForSEO relevance order
+    assert out["ideas"][0]["seed"] == "commercial"  # grouped by DataForSEO intent
+    assert out["seeds"] == []
 
 
 def test_audit_reports_description_length_with_page_detail(monkeypatch):

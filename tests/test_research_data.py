@@ -59,7 +59,10 @@ def test_keywords_keep_location_language_nulls_and_dedupe(offline, monkeypatch):
     assert tracked["unknown term"]["volume"] is None and tracked["unknown term"]["position"] is None
     assert tracked["unknown term"]["source"] == "Not in Searchify SEO keyword data"
     assert out["ideas"][0]["volume"] == 120
-    assert "keyword suggestions" in out["ideas"][0]["source"]
+    assert "keywords for site" in out["ideas"][0]["source"]
+    site_calls = [body for path, body in offline if "keywords_for_site" in path]
+    assert site_calls and site_calls[0]["target"] == "acme.ca"  # DataForSEO reads the site; no seed phrase
+    assert not any("keyword_suggestions" in path for path, _ in offline)
     assert out["qualityVersion"] == research.KEYWORDS_QUALITY
 
 

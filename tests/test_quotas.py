@@ -22,7 +22,7 @@ def fake_call(calls):
             return [{"items": []}], 0.01
         if "keyword_overview" in path:
             return [{"items": [{"keyword": t, "keyword_info": {"search_volume": 10}} for t in payload[0]["keywords"]]}], 0.01
-        if "keyword_suggestions" in path:
+        if "keywords_for_site" in path:
             return [{"items": [{"keyword": f"idea {i}", "keyword_info": {"search_volume": i}} for i in range(40)]}], 0.01
         raise AssertionError(path)
     return call

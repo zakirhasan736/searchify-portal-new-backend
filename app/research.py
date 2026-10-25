@@ -16,7 +16,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app import config, llm_requests, locations, markets, quotas
-from app.concept_reads import backlink_concepts, business_offers, business_places, keyword_concepts, offer_fit, seed_phrase, visibility_reading
+from app.concept_reads import backlink_concepts, business_offers, keyword_concepts, offer_fit, seed_phrase, visibility_reading
 from app.models import FeatureRecord, User
 
 log = logging.getLogger("searchify.research")
@@ -28,7 +28,7 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 # Bump when keyword seeding changes so suggestions built from old seeds refresh once.
-KEYWORDS_QUALITY = 3
+KEYWORDS_QUALITY = 4
 PROVIDER_ERRORS = {
     40104: "Searchify SEO is not fully set up yet. Ask an admin to finish Searchify SEO setup.",
     40200: "Searchify SEO research credit is empty. Top up Searchify SEO to run live research again.",
@@ -245,27 +245,15 @@ def _rank_key(row: dict) -> tuple:
     return (pos if isinstance(pos, int) else 10**6, -(vol if isinstance(vol, (int, float)) else -1))
 
 
-# Searches by job seekers, students or DIY researchers — not buyers of a service.
-_OFF_INTENT = re.compile(
-    r"\b(jobs?|careers?|salary|salaries|hiring|internship|course|courses|class|classes|certification|"
-    r"degree|tutorial|template|templates|free download|pdf|meaning|definition|wiki|reddit|diy)\b",
-    re.I,
-)
-
-
 def _idea_seeds(
     clean: list[str],
     ranked: list[dict],
     limit: int = 3,
     offers: list[str] | None = None,
-    places: list[str] | None = None,
 ) -> list[str]:
-    """Seeds for paid keyword suggestions. Offers from the site read come first.
-
-    For a local business the top offers are seeded with the served place first (“web design calgary”),
-    because DataForSEO keyword_suggestions only returns phrases containing the seed: a bare “seo” seed
-    returns worldwide terms like “seo tools” that this business cannot win.
-    """
+    """Starting phrases for DataForSEO keyword suggestions, taken only from this site's own data:
+    the offers its pages name (site read), the terms the owner tracks, and keywords it already ranks for.
+    Nothing is added or preset by Searchify."""
     seeds: list[str] = []
 
     def add(term: str) -> bool:
@@ -275,14 +263,7 @@ def _idea_seeds(
         return len(seeds) >= limit
 
     named = [offer for offer in (offers or []) if str(offer).strip()]
-    place = next((str(p).strip() for p in (places or []) if str(p).strip()), "")
     if named:
-        if place:
-            for offer in named[: max(1, limit - 1)]:
-                if place.lower() in offer.lower():
-                    continue
-                if add(f"{seed_phrase(offer)} {place}"):
-                    return seeds
         for offer in named:
             if add(offer):
                 return seeds
@@ -429,45 +410,44 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 "source": "Searchify SEO keyword overview + ranked keywords" if term.lower() in found or rank else "Not in Searchify SEO keyword data",
             })
 
+    # Keyword ideas come from DataForSEO reading this website itself (Keywords For Site): no seed
+    # phrases and nothing preset by Searchify. Ordered by relevance to the site's own content.
     ideas = []
-    seeds = _idea_seeds(clean, ranked, limit=3, offers=offers, places=business_places(db, user.id, host))
+    seeds: list[str] = []
     known = {t.lower() for t in clean} | set(by_term)
-    idea_calls = 0
-    for seed in seeds:
-        ideas_res, c = _call(
+    site_payload = {
+        "target": host,
+        "location_name": location,
+        "language_code": language,
+        "include_subdomains": True,
+        "limit": 200,
+        "filters": ["keyword_info.search_volume", ">", 0],
+        "order_by": ["relevance,desc"],
+    }
+    try:
+        site_res, c = _call("POST", "/dataforseo_labs/google/keywords_for_site/live", [site_payload])
+    except ResearchError:
+        # Some accounts reject filters/order_by on this endpoint; retry with the core fields.
+        site_res, c = _call(
             "POST",
-            "/dataforseo_labs/google/keyword_suggestions/live",
-            [{"keyword": seed, "location_name": location, "language_code": language, "limit": 40,
-              "order_by": ["keyword_info.search_volume,desc"]}],
+            "/dataforseo_labs/google/keywords_for_site/live",
+            [{k: v for k, v in site_payload.items() if k not in {"filters", "order_by"}}],
         )
-        cost += c
-        idea_calls += 1
-        first = (ideas_res or [{}])[0] or {}
-        # The seed itself ("web design calgary") is often the best search, and DataForSEO returns it
-        # separately as seed_keyword_data rather than in items.
-        seed_data = first.get("seed_keyword_data")
-        if isinstance(seed_data, dict):
-            seed_row = _kw_row({**seed_data, "keyword": seed_data.get("keyword") or first.get("seed_keyword") or seed})
-            seed_key = (seed_row.get("keyword") or "").lower()
-            if seed_key and seed_key not in known:
-                known.add(seed_key)
-                ideas.append({**seed_row, "source": f"Searchify SEO keyword suggestions · seed “{seed}”", "seed": seed})
-        for item in first.get("items") or []:
-            row = _kw_row(item)
-            key = (row.get("keyword") or "").lower()
-            if not key or key in known:
-                continue
-            # Prefer ideas with real demand; keep null-volume ideas only as filler.
-            known.add(key)
-            ideas.append({**row, "source": f"Searchify SEO keyword suggestions · seed “{seed}”", "seed": seed})
-    ideas.sort(key=lambda r: (-(r["volume"] if isinstance(r.get("volume"), (int, float)) else -1), r.get("keyword") or ""))
-    if offers:
-        # Keep suggestions that belong to what this business sells. Seeds are offers, but
-        # keyword_suggestions still returns tangents ("seo jobs", "web design course").
-        on_offer = [row for row in ideas if offer_fit(row.get("keyword") or "", offers)[0] >= 0.34]
-        on_offer = [row for row in on_offer if not _OFF_INTENT.search(row.get("keyword") or "")]
-        if on_offer:
-            ideas = on_offer
+    cost += c
+    idea_calls = 1
+    for item in ((site_res or [{}])[0] or {}).get("items") or []:
+        row = _kw_row(item)
+        key = (row.get("keyword") or "").lower()
+        if not key or key in known:
+            continue
+        known.add(key)
+        intent = row.get("intent") or ""
+        ideas.append({
+            **row,
+            "source": f"Searchify SEO keywords for site · DataForSEO read of {host}",
+            # Grouping comes from DataForSEO's own search-intent label, not a Searchify seed.
+            "seed": intent,
+        })
     paid_calls = 1 + bool(clean) + idea_calls
     _spend(db, user, paid_calls, cost)
     quotas.consume(db, user, "keywords")

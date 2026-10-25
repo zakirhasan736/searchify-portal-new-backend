@@ -9,7 +9,7 @@ from app.meta_writer import write_title_description
 
 HOME = {
     "url": "https://agency.example/",
-    "title": "Agency Example | Home",
+    "title": "Home | Agency Example",
     "description": "Welcome to Agency Example. We do websites and marketing.",
     "h1": "Calgary web design and SEO",
     "headings": "Web Design | SEO | Google Ads",
@@ -175,6 +175,8 @@ BRAND_FIRST_SITE = {"business": {"brand": "Sovereign Standard Inc.", "offers": [
 BRAND_FIRST_DRAFTS = (
     "TITLE: Calgary Web Design & SEO Agency | Sovereign Standard\n"
     "DESCRIPTION: Fast websites, SEO and Google Ads for Calgary businesses. Book a free consultation with Sovereign Standard.\n"
+    "TITLE: Sovereign Standard | Calgary Web Design & SEO Agency\n"
+    "DESCRIPTION: Fast websites, SEO and Google Ads for Calgary businesses. Book a free consultation with Sovereign Standard.\n"
 )
 
 
@@ -194,9 +196,11 @@ def test_brand_first_live_title_with_slogan_h1_still_gets_a_suggestion():
         patch("app.meta_writer.judge_listings", side_effect=judge),
     ):
         out = write_title_description(url=BRAND_FIRST["url"], profile={"business": "Sovereign Standard Inc."}, page=BRAND_FIRST, site=BRAND_FIRST_SITE, kind="home")
-    assert "Calgary Web Design & SEO Agency | Sovereign Standard" in seen
+    # The live title is brand-first, so only the brand-first draft follows the site's format.
+    assert "Sovereign Standard | Calgary Web Design & SEO Agency" in seen
+    assert "Calgary Web Design & SEO Agency | Sovereign Standard" not in seen
     assert out["recommendKeep"] is False
-    assert out["title"] == "Calgary Web Design & SEO Agency | Sovereign Standard"
+    assert out["title"] == "Sovereign Standard | Calgary Web Design & SEO Agency"
     assert "Digital Marketing Agency in Calgary" not in out["title"]
 
 
@@ -216,3 +220,23 @@ def test_judge_partial_scores_drop_only_unscored_drafts():
         out = listing_judge.judge_listings("evidence", rows)
     assert out is not None and out[0]["score"] == 80.5
     assert out[1]["accurate"] is False
+
+
+def test_title_format_follows_each_site():
+    from app.meta_writer import follows_format, title_format
+
+    start = title_format("Acme Plumbing | Drain Cleaning in Austin", "Acme Plumbing")
+    end = title_format("Drain Cleaning in Austin – Acme Plumbing", "Acme Plumbing")
+    assert start == {"position": "start", "sep": " | ", "brand": "Acme Plumbing"}
+    assert end["position"] == "end" and end["sep"] == " – "
+    assert follows_format("Acme Plumbing | Same-Day Drain Cleaning", start)
+    assert not follows_format("Same-Day Drain Cleaning | Acme Plumbing", start)
+    assert follows_format("Same-Day Drain Cleaning – Acme Plumbing", end)
+
+
+def test_generator_prompt_has_no_preset_examples():
+    from app.listing_judge import GENERATOR_SYSTEM
+
+    for preset in ("Get a quote", "Book a call", "See plans", "e.g.", "Calgary", "kitchen"):
+        assert preset not in GENERATOR_SYSTEM
+    assert "TITLE FORMAT" in GENERATOR_SYSTEM

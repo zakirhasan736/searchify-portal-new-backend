@@ -191,6 +191,44 @@ def _has_brand(text: str, brand: str) -> bool:
     return bool(need) and need <= have
 
 
+def title_format(current: str, brand: str) -> dict:
+    """The site's own title pattern: where the brand sits and which separator it uses."""
+    text = str(current or "").strip()
+    for sep in (" | ", " – ", " — ", " - ", ": "):
+        if sep not in text:
+            continue
+        first, rest = text.split(sep, 1)
+        last = text.rsplit(sep, 1)[-1]
+        if brand and _has_brand(first, brand) and len(first.split()) <= len(str(brand).split()) + 2:
+            return {"position": "start", "sep": sep, "brand": first.strip()}
+        if brand and _has_brand(last, brand) and len(last.split()) <= len(str(brand).split()) + 2:
+            return {"position": "end", "sep": sep, "brand": last.strip()}
+    if brand:
+        return {"position": "end", "sep": " | ", "brand": str(brand).strip()}
+    return {"position": "none", "sep": " | ", "brand": ""}
+
+
+def follows_format(title: str, fmt: dict) -> bool:
+    """The draft keeps the site's brand position (start or end) when the site has one."""
+    position, brand = fmt.get("position"), fmt.get("brand") or ""
+    if position not in {"start", "end"} or not brand:
+        return True
+    for sep in (" | ", " – ", " — ", " - ", ": "):
+        if sep in title:
+            part = title.split(sep, 1)[0] if position == "start" else title.rsplit(sep, 1)[-1]
+            if _has_brand(part, brand):
+                return True
+    return False
+
+
+def title_format_line(fmt: dict) -> str:
+    if fmt.get("position") == "start":
+        return f"TITLE FORMAT: {fmt['brand']}{fmt['sep']}<page keyword and page-specific detail>"
+    if fmt.get("position") == "end":
+        return f"TITLE FORMAT: <page keyword and page-specific detail>{fmt['sep']}{fmt['brand']}"
+    return "TITLE FORMAT: <page keyword and page-specific detail>"
+
+
 def _brand_tail(title: str, brand: str = "") -> str:
     """The brand segment at the END of a title, or "".
 
@@ -999,7 +1037,7 @@ def specificity_instruction(level: str) -> str:
     if key in {"2", "broad", "broader", "broader discovery"}:
         return (
             "Keyword specificity: broad. You may use one nearby search angle this page can honestly support, "
-            "such as a related size, season, or audience already implied by the copy. "
+            "that the page copy itself implies. "
             "Do not invent a service the page does not offer."
         )
     return (
@@ -1578,6 +1616,7 @@ def write_title_description(
         f"- Offers confirmed on site: {', '.join(offers[:8]) or '(none)'}\n"
         f"- Places named: {', '.join(places[:6]) or '(none)'}\n"
         f"- Existing title: {scraped.get('title') or '(none)'}\n"
+        f"- {title_format_line(title_format(str(scraped.get('title') or ''), brand))}\n"
         f"- Existing description: {scraped.get('description') or '(none)'}\n"
         f"- Keyword evidence: {'insufficient — use page topic, do not invent research' if keyword_evidence_insufficient else (keyword or topic or 'page topic')}\n"
         f"- Canonical: {scraped.get('canonical') or '(same as page or unset)'}\n"
@@ -1599,7 +1638,7 @@ def write_title_description(
         f"A city leads the title only when the best keyword itself contains that city:\n{query_block}\n"
         f"BEST KEYWORD: {keyword or topic or '(use the business offer)'}\n\n"
         f"3. COMPETITOR TO MEET. Only use a competitor that sells the same kind of thing on this keyword. "
-        f"Never meet a kitchen store, cookware shop, or unrelated Places listing for a web or marketing page. "
+        f"Ignore results that sell something different from this business. "
         f"When a hard competitor is listed, the title must stand on the same search with the best keyword and a fact only this business can say. Do not copy their title:\n{meet.get('title') or '(none that share this keyword — write from the business offer and the live page)'}\n"
         f"Other competitors that sell the same kind of service:\n{_rival_block(rivals)}\n\n"
         f"4. SEARCH CONSOLE AND RESEARCH, already matched to this business:\n{research_lines(research, page_url, topic, offers)}\n"
@@ -1639,7 +1678,7 @@ def write_title_description(
             "Lead with the best keyword. Put one alternative keyword in the description. "
             "Start with a city only when that best keyword contains the city. "
             "Do not write a case-study title. Do not name any client project shown in selected work. "
-            "Do not invent a service count such as “5 Core Services”.\n"
+            "Do not invent a service count.\n"
         )
         if portfolio_clients:
             brief += (
@@ -1662,7 +1701,7 @@ def write_title_description(
         brief += (
             "\nThis page is a CASE STUDY about work the site owner did for a client. "
             "The client's name, city and industry belong to the client, not to the site owner. "
-            "Write the listing as a case study by the site owner (for example \"Case study: …\" or \"How we helped …\"). "
+            "Write the listing as a case study by the site owner, in the words this page uses for it. "
             "Never present the client's location or business as the site owner's.\n"
         )
     if taken:
@@ -1751,8 +1790,10 @@ def write_title_description(
     # ---- Candidate pool: every draft is fitted WITHOUT chopping phrases, then hard-gated. ----
     pool: list[tuple[str, str]] = []
 
+    fmt = title_format(current, brand)
+
     def add_pool(cand_title: str, cand_desc: str) -> None:
-        t = fit_title_strict(cand_title or "", tail or brand)
+        t = fit_title_strict(cand_title or "", tail or brand, brand_first=fmt["position"] == "start")
         d = fit_desc_strict(cand_desc or "")
         if not t or not d:
             return
@@ -1769,6 +1810,8 @@ def write_title_description(
             if hard_checks(t, d):
                 continue
             if live_has_brand and not _has_brand(t, brand):
+                continue
+            if not follows_format(t, fmt):
                 continue
             rows.append((t, d))
         return rows
