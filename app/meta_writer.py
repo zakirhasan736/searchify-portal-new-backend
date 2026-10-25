@@ -188,6 +188,96 @@ def _clean(value: str, limit: int) -> str:
     return cut or text[:limit].rstrip()
 
 
+def _parse_option_pairs(text: str) -> list[tuple[str, str]]:
+    """Every TITLE/DESCRIPTION pair in a model reply."""
+    pairs: list[tuple[str, str]] = []
+    title, desc = "", ""
+
+    def flush() -> None:
+        nonlocal title, desc
+        if title and desc:
+            pairs.append((_clean(title, 60), _clean(desc, 155)))
+        title, desc = "", ""
+
+    for line in (text or "").splitlines():
+        low = line.strip().lstrip("*-# ").replace("**", "")
+        up = low.upper()
+        if up.startswith("TITLE:"):
+            if title or desc:
+                flush()
+            title = low.split(":", 1)[-1].strip()
+        elif up.startswith("DESCRIPTION:"):
+            desc = low.split(":", 1)[-1].strip()
+    flush()
+    return pairs
+
+
+def _extra_listings(brief: str, title: str, desc: str) -> list[tuple[str, str]]:
+    """Two more real listings for the same page, written as search results rather than editor notes."""
+    if not (title and desc) or not openai_configured():
+        return []
+    prompt = (
+        f"{brief}\n\n"
+        "The strongest listing already chosen for this page is:\n"
+        f"TITLE: {title}\nDESCRIPTION: {desc}\n\n"
+        "Write two more listings a searcher could click. Same page, same facts, different lead. "
+        "Put the real offer or keyword first in each title, and end with the brand when it still fits. "
+        "Each description is one natural sentence about what this page offers. "
+        "Do not repeat the chosen title. Do not write editor notes, audit findings, or the words fix, suggestion, or option.\n"
+        "TITLE: ...\nDESCRIPTION: ...\n"
+        "TITLE: ...\nDESCRIPTION: ...\n"
+    )
+    try:
+        text, _, _ = chat_text(
+            system=(
+                "You write two alternate Google title and description pairs for one page. "
+                "Use only facts in the brief. Return exactly four lines and nothing else."
+            ),
+            user=prompt,
+            kind="meta-seo",
+            writing_type="Meta title & description",
+            tokens=500,
+            max_tokens=700,
+        )
+    except Exception:
+        return []
+    return _parse_option_pairs(text)[:2]
+
+
+def _listing_alternatives(kept, extras, title, desc, reject, fluff) -> list[dict]:
+    """Up to two other listings. Prefer the extra model pass, then earlier drafts that still pass the checks."""
+    final = ((title or "").strip().lower(), (desc or "").strip().lower())
+    seen = {final}
+    rows: list[dict] = []
+
+    def push(cand_title: str, cand_desc: str) -> None:
+        t = _clean(cand_title or "", 60)
+        d = _clean(cand_desc or "", 155)
+        if not t or not d:
+            return
+        key = (t.lower(), d.lower())
+        if key in seen:
+            return
+        blob = f"{t} {d}".lower()
+        if (
+            "so the page says what it offers" in blob
+            or "obvious in the title" in blob
+            or "fix “" in blob
+            or 'fix "' in blob
+        ):
+            return
+        if reject(t, d) or fluff(t, d):
+            return
+        seen.add(key)
+        rows.append({"title": t, "description": d})
+
+    for cand_title, cand_desc in list(extras or []) + list(kept or []):
+        push(cand_title, cand_desc)
+        if len(rows) >= 2:
+            break
+    return rows
+
+
 def _parse_meta(text: str) -> tuple[str, str, str]:
     title, desc, reason = "", "", ""
     for line in (text or "").splitlines():
@@ -1635,11 +1725,14 @@ def write_title_description(
         "analysis": analysis,
         "title": title,
         "metaDescription": desc,
-        "alternatives": [
-            {"title": t, "description": d}
-            for t, d in kept_options
-            if (t.lower(), d.lower()) != ((title or "").strip().lower(), (desc or "").strip().lower())
-        ][:2],
+        "alternatives": _listing_alternatives(
+            kept_options,
+            _extra_listings(brief, title, desc),
+            title,
+            desc,
+            hard_checks,
+            lambda cand_title, cand_desc: listing_fluff_problems(cand_title, cand_desc, evidence=evidence_text),
+        ),
         "openGraphTitle": og_title,
         "openGraphDescription": og_desc,
         "shareImage": share,

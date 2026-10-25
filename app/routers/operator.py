@@ -67,12 +67,7 @@ def _row_key(row) -> str:
 
 
 def site_limit_for(user: User) -> int:
-    n = int(getattr(user, "site_limit", 0) or 0)
-    if n > 0:
-        return max(1, min(n, 100))
-    if user.role == "ROLE_ADMIN":
-        return PLAN_LIMITS["scale"]
-    return PLAN_LIMITS.get((getattr(user, "plan", None) or "starter").lower(), 5)
+    return quotas.site_cap(user)
 
 
 def workspace_plan(user: User, used: int) -> dict:

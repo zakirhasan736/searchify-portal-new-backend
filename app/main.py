@@ -8,7 +8,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from app.auto_sync import auto_sync_loop
 from app.config import CORS_ORIGINS, PUBLIC_SITE_URL
 from app.database import Base, SessionLocal, engine, ensure_indexes
-from app.routers import auth, billing, catalog, crawl, features, google_connect, hq, operator, partners, product, projects, push, research, social_auth, workflow
+from app.routers import auth, billing, catalog, crawl, features, google_connect, hq, operator, partners, product, projects, public_scan, push, research, social_auth, workflow
 from app.seed import seed
 
 
@@ -57,6 +57,7 @@ app.include_router(product.router)
 app.include_router(partners.router)
 app.include_router(hq.router)
 app.include_router(billing.router)
+app.include_router(public_scan.router)
 app.include_router(research.router)
 app.include_router(push.router)
 

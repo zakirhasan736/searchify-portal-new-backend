@@ -39,6 +39,7 @@ PLANS = {
     },
 }
 SERVER_PLAN = {"starter": "starter", "growth": "growth", "agency": "agency", "scale": "agency", "custom": "agency"}
+SITE_CAPS = {"starter": 1, "solo": 1, "growth": 5, "pro": 5, "agency": 25, "premium": 25, "scale": 25}
 KIND = "dfs-quota"
 LOCK_BASE = 7_400_000
 
@@ -59,6 +60,18 @@ def period(now: datetime | None = None) -> str:
 def next_reset(now: datetime | None = None) -> datetime:
     now = now or datetime.utcnow()
     return datetime(now.year + (now.month == 12), now.month % 12 + 1, 1)
+
+
+def site_cap(user: User) -> int:
+    """Websites the account plan allows. Admins and enterprise keep a stored custom cap."""
+    if getattr(user, "role", "") == "ROLE_ADMIN":
+        stored = int(getattr(user, "site_limit", 0) or 0)
+        return max(1, min(stored or 25, 100))
+    plan = (getattr(user, "plan", None) or "starter").lower()
+    if plan in ("custom", "enterprise"):
+        stored = int(getattr(user, "site_limit", 0) or 0)
+        return max(1, min(stored or 25, 100))
+    return SITE_CAPS.get(plan, 1)
 
 
 def plan_for(db: Session, user: User) -> str | None:

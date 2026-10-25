@@ -607,3 +607,53 @@ def scan_site(
         "failed": crawled.get("failed") or [],
         "error": crawled.get("error") or "",
     }
+
+
+def _preview_tone(page: dict) -> tuple[str, str, str]:
+    """Colour from what the page actually has. No invented scores."""
+    title = str(page.get("title") or "").strip()
+    description = str(page.get("description") or "").strip()
+    if page.get("noindex"):
+        return "red", "Hidden from Google", "This page asks Google not to index it."
+    if not title:
+        return "red", "Missing title", "Google has no title to show for this page."
+    if not description:
+        return "yellow", "Missing description", "The search snippet will be chosen by Google."
+    if len(title) < 12 or len(title) > 65:
+        return "yellow", "Title length", "The title is hard to read in a search result."
+    if not str(page.get("h1") or "").strip():
+        return "yellow", "Missing heading", "The page has no H1."
+    return "green", "Listing is in place", "A title and description are on the page."
+
+
+def preview_scan(home: str, limit: int = 8) -> dict:
+    """Free public look: a few live pages, colour-coded. No AI and no paid research."""
+    crawled = crawl(home, limit=max(1, min(int(limit or 8), 12)))
+    pages = crawled.get("pages") or []
+    findings = []
+    dots = []
+    counts = {"red": 0, "yellow": 0, "green": 0, "blue": 0}
+    for page in pages:
+        color, label, detail = _preview_tone(page)
+        counts[color] = counts.get(color, 0) + 1
+        path = urlparse(page.get("url") or "").path or "/"
+        dots.append({"color": color, "path": path})
+        if color != "green":
+            findings.append({
+                "color": color,
+                "path": path,
+                "label": label,
+                "detail": detail,
+                "title": str(page.get("title") or "").strip(),
+            })
+    order = {"red": 0, "yellow": 1, "green": 2}
+    findings.sort(key=lambda item: order.get(item["color"], 9))
+    return {
+        "home": crawled.get("home") or home,
+        "host": crawled.get("host") or host_of(home),
+        "pagesRead": len(pages),
+        "counts": counts,
+        "dots": dots[:40],
+        "findings": findings[:6],
+        "error": crawled.get("error") or "",
+    }

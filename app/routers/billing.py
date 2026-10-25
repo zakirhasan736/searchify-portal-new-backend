@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app import quotas
 from app.database import get_db
 from app.models import CmsConnection, FeatureRecord, User
 from app.security import get_current_user, get_optional_user
@@ -30,6 +31,7 @@ CATALOG = [
             "One move at a time, with results",
             "Change log, one-click undo, unlimited CSV export",
             "1 branded PDF report per month",
+            "2 site scans, 10 tracked keywords, and 5 backlink checks a month",
         ],
     },
     {
@@ -46,6 +48,7 @@ CATALOG = [
             "5 branded reports per site, per month",
             "1 scheduled client send + 3 client logins per site",
             "AI answer tracking and autopilot within limits",
+            "8 site scans, 40 keyword checks (50 tracked), and 20 backlink checks a month",
         ],
     },
     {
@@ -62,6 +65,7 @@ CATALOG = [
             "Unlimited scheduled sends and client logins",
             "Social channels via Postiz",
             "All-clients view and team seats",
+            "30 site scans, 150 keyword checks (200 tracked), and 60 backlink checks a month",
         ],
     },
     {
@@ -168,8 +172,9 @@ def account(db: Session = Depends(get_db), user: User = Depends(get_current_user
         "canonical": stored,
         "name": plan["name"],
         "billing": billing,
-        "siteLimit": int(user.site_limit or plan["siteLimit"] or 1),
+        "siteLimit": quotas.site_cap(user) if plan["id"] == "enterprise" else int(plan["siteLimit"] or 1),
         "sitesUsed": max(ready, connected),
+        "allowance": quotas.summary(db, user),
         "email": user.email or "",
         "status": checkout.get("status") or "active",
         "trialDays": int(checkout.get("trialDays") or 0),
