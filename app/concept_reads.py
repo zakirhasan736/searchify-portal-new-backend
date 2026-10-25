@@ -31,10 +31,9 @@ def offer_fit(term: str, offers: list[str]) -> tuple[float, str]:
     return best_score, best_offer
 
 
-def business_offers(db, user_id: int, host: str) -> list[str]:
-    """Offers named when the site was read. Empty when the site has not been read."""
+def _site_business(db, user_id: int, host: str) -> dict:
     if db is None or not user_id or not host:
-        return []
+        return {}
     from app.models import FeatureRecord
 
     row = (
@@ -47,14 +46,35 @@ def business_offers(db, user_id: int, host: str) -> list[str]:
         .order_by(FeatureRecord.id.desc())
         .first()
     )
-    business = dict((getattr(row, "payload", None) or {}).get("business") or {}) if row else {}
+    return dict((getattr(row, "payload", None) or {}).get("business") or {}) if row else {}
+
+
+def business_offers(db, user_id: int, host: str) -> list[str]:
+    """Services/products named when the site was read. Empty when the site has not been read.
+
+    The one-sentence business summary is NOT an offer: used as a keyword seed it became
+    “Acme Plumbing is a family owned” and returned no useful searches. It is used only when the
+    site read found no offers at all.
+    """
+    business = _site_business(db, user_id, host)
     offers: list[str] = []
-    values = [business.get("business"), *(business.get("offers") or [])]
-    for value in values:
+    for value in business.get("offers") or []:
         text = " ".join(str(value or "").split())
         if text and text.lower() not in {item.lower() for item in offers}:
             offers.append(text[:80])
+    if not offers and business.get("business"):
+        offers.append(" ".join(str(business["business"]).split())[:80])
     return offers[:8]
+
+
+def business_places(db, user_id: int, host: str) -> list[str]:
+    """Cities/regions the site says it serves (from the site read)."""
+    places = []
+    for value in _site_business(db, user_id, host).get("places") or []:
+        text = " ".join(str(value or "").split())
+        if text and text.lower() not in {item.lower() for item in places}:
+            places.append(text[:60])
+    return places[:6]
 
 
 def seed_phrase(offer: str) -> str:

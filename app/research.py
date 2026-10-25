@@ -16,7 +16,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app import config, llm_requests, locations, markets, quotas
-from app.concept_reads import backlink_concepts, business_offers, keyword_concepts, offer_fit, seed_phrase, visibility_reading
+from app.concept_reads import backlink_concepts, business_offers, business_places, keyword_concepts, offer_fit, seed_phrase, visibility_reading
 from app.models import FeatureRecord, User
 
 log = logging.getLogger("searchify.research")
@@ -27,6 +27,8 @@ WINDOWS = {"keywords": timedelta(hours=24), "backlinks": timedelta(hours=24), "v
 AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
+# Bump when keyword seeding changes so suggestions built from old seeds refresh once.
+KEYWORDS_QUALITY = 3
 PROVIDER_ERRORS = {
     40104: "Searchify SEO is not fully set up yet. Ask an admin to finish Searchify SEO setup.",
     40200: "Searchify SEO research credit is empty. Top up Searchify SEO to run live research again.",
@@ -243,8 +245,27 @@ def _rank_key(row: dict) -> tuple:
     return (pos if isinstance(pos, int) else 10**6, -(vol if isinstance(vol, (int, float)) else -1))
 
 
-def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3, offers: list[str] | None = None) -> list[str]:
-    """Seeds for paid keyword suggestions. Offers from the site read come first."""
+# Searches by job seekers, students or DIY researchers — not buyers of a service.
+_OFF_INTENT = re.compile(
+    r"\b(jobs?|careers?|salary|salaries|hiring|internship|course|courses|class|classes|certification|"
+    r"degree|tutorial|template|templates|free download|pdf|meaning|definition|wiki|reddit|diy)\b",
+    re.I,
+)
+
+
+def _idea_seeds(
+    clean: list[str],
+    ranked: list[dict],
+    limit: int = 3,
+    offers: list[str] | None = None,
+    places: list[str] | None = None,
+) -> list[str]:
+    """Seeds for paid keyword suggestions. Offers from the site read come first.
+
+    For a local business the top offers are seeded with the served place first (“web design calgary”),
+    because DataForSEO keyword_suggestions only returns phrases containing the seed: a bare “seo” seed
+    returns worldwide terms like “seo tools” that this business cannot win.
+    """
     seeds: list[str] = []
 
     def add(term: str) -> bool:
@@ -254,7 +275,14 @@ def _idea_seeds(clean: list[str], ranked: list[dict], limit: int = 3, offers: li
         return len(seeds) >= limit
 
     named = [offer for offer in (offers or []) if str(offer).strip()]
+    place = next((str(p).strip() for p in (places or []) if str(p).strip()), "")
     if named:
+        if place:
+            for offer in named[: max(1, limit - 1)]:
+                if place.lower() in offer.lower():
+                    continue
+                if add(f"{seed_phrase(offer)} {place}"):
+                    return seeds
         for offer in named:
             if add(offer):
                 return seeds
@@ -311,7 +339,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     title = f"Keywords {host} {place.iso or location} {language}"
     saved = None if force else cached(db, user.id, "dfs-keywords", title, WINDOWS["keywords"])
     offers = business_offers(db, user.id, host)
-    if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == 2:
+    if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == KEYWORDS_QUALITY:
         concepts = keyword_concepts(saved, offers)
         return {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped}
     quotas.check(db, user, "keywords")
@@ -402,7 +430,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             })
 
     ideas = []
-    seeds = _idea_seeds(clean, ranked, limit=3, offers=offers)
+    seeds = _idea_seeds(clean, ranked, limit=3, offers=offers, places=business_places(db, user.id, host))
     known = {t.lower() for t in clean} | set(by_term)
     idea_calls = 0
     for seed in seeds:
@@ -414,7 +442,17 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         )
         cost += c
         idea_calls += 1
-        for item in ((ideas_res or [{}])[0] or {}).get("items") or []:
+        first = (ideas_res or [{}])[0] or {}
+        # The seed itself ("web design calgary") is often the best search, and DataForSEO returns it
+        # separately as seed_keyword_data rather than in items.
+        seed_data = first.get("seed_keyword_data")
+        if isinstance(seed_data, dict):
+            seed_row = _kw_row({**seed_data, "keyword": seed_data.get("keyword") or first.get("seed_keyword") or seed})
+            seed_key = (seed_row.get("keyword") or "").lower()
+            if seed_key and seed_key not in known:
+                known.add(seed_key)
+                ideas.append({**seed_row, "source": f"Searchify SEO keyword suggestions · seed “{seed}”", "seed": seed})
+        for item in first.get("items") or []:
             row = _kw_row(item)
             key = (row.get("keyword") or "").lower()
             if not key or key in known:
@@ -423,6 +461,13 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             known.add(key)
             ideas.append({**row, "source": f"Searchify SEO keyword suggestions · seed “{seed}”", "seed": seed})
     ideas.sort(key=lambda r: (-(r["volume"] if isinstance(r.get("volume"), (int, float)) else -1), r.get("keyword") or ""))
+    if offers:
+        # Keep suggestions that belong to what this business sells. Seeds are offers, but
+        # keyword_suggestions still returns tangents ("seo jobs", "web design course").
+        on_offer = [row for row in ideas if offer_fit(row.get("keyword") or "", offers)[0] >= 0.34]
+        on_offer = [row for row in on_offer if not _OFF_INTENT.search(row.get("keyword") or "")]
+        if on_offer:
+            ideas = on_offer
     paid_calls = 1 + bool(clean) + idea_calls
     _spend(db, user, paid_calls, cost)
     quotas.consume(db, user, "keywords")
@@ -445,7 +490,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "ideas": ideas[:idea_limit],
         "seeds": seeds,
         "termLimit": term_limit,
-        "qualityVersion": 2,
+        "qualityVersion": KEYWORDS_QUALITY,
         "provider": "dataforseo",
         "dataKind": "keywords",
         "source": "Searchify SEO",
@@ -846,6 +891,8 @@ PAGE_CHECKS = {
     "duplicate_description": ("Pages share the same description", "Warning", "Write a description for each page that matches what that page offers.", True),
     "title_too_long": ("Titles get cut off in Google", "Notice", "Shorten the title so the main promise fits before the cut.", True),
     "title_too_short": ("Titles are too short to compete", "Notice", "Add the service, the place, or the benefit to the title.", True),
+    "description_too_long": ("Meta descriptions get cut off in Google", "Notice", "Keep the description under about 160 characters so the full sentence shows.", True),
+    "description_too_short": ("Meta descriptions are too short", "Notice", "Write one or two sentences (about 120–160 characters) about what the page offers and the next step.", True),
     "irrelevant_title": ("Titles do not match the page content", "Warning", "Rewrite the title from what the page actually says.", True),
     "irrelevant_description": ("Descriptions do not match the page content", "Notice", "Rewrite the description from what the page actually says.", True),
     "no_h1_tag": ("Pages have no main heading (H1)", "Warning", "Add one clear H1 that names the page subject.", False),
@@ -880,6 +927,8 @@ CHECK_GUIDE = {
     "no_description": ("Meta", ["Open the page.", "Let Searchify draft the description from the page, or write one sentence about who it is for and the next step.", "Approve it before it is published."]),
     "title_too_long": ("Typography", ["Keep the title between 50 and 60 characters.", "Put the keyword and the page topic first.", "Let Searchify draft it if you would rather not edit by hand."]),
     "title_too_short": ("Typography", ["Add the service or the place so the title is about 50 to 60 characters.", "Let Searchify draft it from the page."]),
+    "description_too_long": ("Meta", ["Keep the description between about 120 and 160 characters.", "Put the offer and the next step first so nothing important is cut.", "Let Searchify draft it from the page."]),
+    "description_too_short": ("Meta", ["Write about 120 to 160 characters: what the page offers, who it is for, the next step.", "Let Searchify draft it from the page."]),
     "irrelevant_title": ("Meta", ["Read the heading on the page.", "The title should say that same thing.", "Let Searchify draft a title that stays on the page topic."]),
     "no_h1_tag": ("Typography", ["In WordPress, set one heading at the top of the page.", "That heading should name the subject in plain words."]),
     "no_image_alt": ("Images", ["Open the page in WordPress.", "Select each image and fill in the alt text with what the picture shows.", "Update the page. Searchify does not replace the image file."]),
@@ -1165,7 +1214,30 @@ def _check_true(checks: dict, key: str) -> bool:
     return value is True or value == 1 or str(value).lower() == "true"
 
 
+DESC_MAX, DESC_MIN = 160, 70
+
+
+def _meta_length(item: dict, field: str) -> int:
+    meta = item.get("meta") or {}
+    raw = meta.get(f"{field}_length")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return int(raw)
+    return len(str(meta.get(field) or "").strip())
+
+
+def _length_detail(item: dict, key: str) -> str:
+    if key in {"title_too_long", "title_too_short"}:
+        return f"Title is {_meta_length(item, 'title')} characters. Aim for about 50–60."
+    if key in {"description_too_long", "description_too_short"}:
+        return f"Meta description is {_meta_length(item, 'description')} characters. Aim for about 120–160."
+    return ""
+
+
 def _pages_with_check(items: list[dict], key: str) -> list[dict]:
+    if key == "description_too_long":
+        return [i for i in items if _meta_length(i, "description") > DESC_MAX]
+    if key == "description_too_short":
+        return [i for i in items if 0 < _meta_length(i, "description") < DESC_MIN]
     hit = [i for i in items if _check_true(i.get("checks") or {}, key)]
     if hit or key not in {"no_title", "no_description"}:
         return hit
@@ -1218,7 +1290,7 @@ def _audit_report(task_id: str, summary: dict) -> dict:
         if not hit and not count_hint:
             continue
         area, steps = _guide(key, fix)
-        pages = [_page_snippet(i) for i in hit[:25]]
+        pages = [_page_snippet(i, detail=_length_detail(i, key)) for i in hit[:25]]
         # Prefer real page URLs. A summary metric alone must not invent blank URL rows.
         if pages:
             count = max(len(pages), count_hint) if count_hint else len(pages)
@@ -1360,7 +1432,10 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
             "target": netloc,
             "start_url": start,
             "max_crawl_pages": limit,
-            "load_resources": False,
+            # Image, script and stylesheet byte sizes (heavy images / heavy assets findings) and the
+            # render-blocking check need the crawler to fetch those resources. With this off, those
+            # reports never appeared. It raises the crawl cost per page.
+            "load_resources": True,
             "enable_javascript": False,
             "store_raw_html": False,
             "check_spell": False,

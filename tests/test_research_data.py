@@ -60,7 +60,7 @@ def test_keywords_keep_location_language_nulls_and_dedupe(offline, monkeypatch):
     assert tracked["unknown term"]["source"] == "Not in Searchify SEO keyword data"
     assert out["ideas"][0]["volume"] == 120
     assert "keyword suggestions" in out["ideas"][0]["source"]
-    assert out["qualityVersion"] == 2
+    assert out["qualityVersion"] == research.KEYWORDS_QUALITY
 
 
 def test_keywords_refuse_to_guess_location(offline, monkeypatch):
