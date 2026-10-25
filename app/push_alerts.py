@@ -107,7 +107,7 @@ def weekly_message(*, current: dict, previous: dict, errors: int, warnings: int,
     return {
         "title": "Weekly Searchify report",
         "body": body,
-        "url": "/app/phone",
+        "url": "/app",
         "tag": "weekly",
     }
 

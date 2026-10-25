@@ -54,7 +54,7 @@ def test_weekly_push_states_both_weeks_and_does_not_promise_a_ranking():
     assert "1 errors, 2 warnings, 3 notices" in message["body"]
     assert "will rank" not in message["body"].lower()
     assert "guaranteed" not in message["body"].lower()
-    assert message["url"] == "/app/phone"
+    assert message["url"] == "/app"
 
 
 def test_issue_counts_keep_notices_separate():
