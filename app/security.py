@@ -38,6 +38,35 @@ def make_token(user: User) -> str:
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
 
+def make_password_token(user: User, purpose: str, minutes: int) -> str:
+    """One-time link token for setting or resetting a password.
+
+    It carries a fingerprint of the current password hash, so it stops working as soon as the
+    password changes (single use) and when it expires.
+    """
+    expires = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    payload = {
+        "sub": str(user.id),
+        "pw": purpose,
+        "fp": hashlib.sha256((user.password_hash or "").encode()).hexdigest()[:16],
+        "exp": int(expires.timestamp()),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def read_password_token(token: str, db: Session) -> User | None:
+    try:
+        payload = jwt.decode(token or "", JWT_SECRET, algorithms=["HS256"])
+        user = db.get(User, int(payload["sub"]))
+    except (jwt.PyJWTError, KeyError, ValueError):
+        return None
+    if user is None or payload.get("pw") not in {"setup", "reset"}:
+        return None
+    if payload.get("fp") != hashlib.sha256((user.password_hash or "").encode()).hexdigest()[:16]:
+        return None
+    return user
+
+
 def user_type(role: str) -> str:
     if role == "ROLE_ADMIN":
         return "admin"

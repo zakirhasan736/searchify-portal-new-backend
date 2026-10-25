@@ -71,8 +71,38 @@ def seed(db: Session) -> None:
             db.add(user)
     db.commit()
 
+    ensure_admin_account(db)
     ensure_partner_account(db)
     ensure_hq_demo(db)
+
+
+def ensure_admin_account(db: Session) -> None:
+    """HQ admin from ADMIN_EMAIL / ADMIN_PASSWORD. Rotates the password when the env value changes."""
+    from app import config
+    from app.security import verify_password
+
+    email, password = config.ADMIN_EMAIL, config.ADMIN_PASSWORD
+    if not email or not password:
+        return
+    user = db.query(User).filter(User.email == email).one_or_none()
+    if user is None:
+        user = User(
+            username=email.split("@")[0][:40] or "admin",
+            email=email,
+            password_hash=hash_password(password),
+            role="ROLE_ADMIN",
+            plan="scale",
+            site_limit=15,
+        )
+        if db.query(User).filter(User.username == user.username).first():
+            user.username = f"{user.username}-admin"
+        db.add(user)
+    else:
+        user.role = "ROLE_ADMIN"
+        if not verify_password(password, user.password_hash):
+            user.password_hash = hash_password(password)
+        db.add(user)
+    db.commit()
 
     if db.query(Domain).count() > 0:
         return
