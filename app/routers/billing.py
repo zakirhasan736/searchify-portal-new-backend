@@ -222,6 +222,9 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
             "at": datetime.utcnow().isoformat() + "Z",
         },
     )
+    from app.routers.partners import referral_plan
+
+    referral_plan(db, user, canonical)  # a referred customer's plan shows on the partner's row
     return {
         "ok": True,
         "live": True,

@@ -12,6 +12,19 @@ DATABASE_URL = os.getenv(
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-local-secret")
 JWT_HOURS = int(os.getenv("JWT_HOURS", "12"))
 PUBLIC_SITE_URL = os.getenv("PUBLIC_SITE_URL", "http://localhost:3000").rstrip("/")
+
+# HQ admin login. When set, the seed creates or updates this admin account with this password.
+ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD") or ""
+
+# Outgoing email (partner invites, password resets). Without SMTP_HOST nothing is sent and the
+# admin is shown the link to copy instead — the app never claims an email went out.
+SMTP_HOST = (os.getenv("SMTP_HOST") or "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = (os.getenv("SMTP_USER") or "").strip()
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD") or ""
+SMTP_TLS = (os.getenv("SMTP_TLS", "starttls") or "starttls").strip().lower()  # starttls | ssl | none
+MAIL_FROM = (os.getenv("MAIL_FROM") or "Searchify <no-reply@searchify.io>").strip()
 CORS_ORIGINS = [
     origin.strip()
     for origin in os.getenv(

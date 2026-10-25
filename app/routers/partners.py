@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import logging
+import re
+import secrets
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app import config, mailer
 from app.database import get_db
 from app.models import FeatureRecord, User
-from app.security import get_current_user, hash_password
+from app.security import get_current_user, hash_password, make_password_token, make_token, read_password_token
+
+log = logging.getLogger("searchify.partners")
+SETUP_MINUTES = 72 * 60  # approval link: 3 days
+RESET_MINUTES = 30  # reset link: 30 minutes (as the sign-in screen says)
 
 router = APIRouter(prefix="/api/v1/partners", tags=["partners"])
 
@@ -37,6 +45,16 @@ class PayoutBody(BaseModel):
 
 class ResetBody(BaseModel):
     email: str
+
+
+class SetPasswordBody(BaseModel):
+    token: str
+    password: str
+
+
+class ClickBody(BaseModel):
+    ref: str
+    c: str = ""
 
 
 def _require_partner(user: User) -> User:
@@ -210,16 +228,19 @@ def apply(body: ApplyBody, db: Session = Depends(get_db)):
     name = body.name.strip()
     if not name or "@" not in email:
         raise HTTPException(400, "Name and a valid email are required")
-    if db.query(User).filter((User.email == email) | (User.username == email.split("@")[0])).first():
+    if db.query(User).filter(User.email == email).first():
         raise HTTPException(409, "An account already uses that email. Sign in instead.")
-    # Store application on a shared inbox user (admin) or create a pending feature on a synthetic record.
     admin = db.query(User).filter(User.role == "ROLE_ADMIN").order_by(User.id).first()
     owner_id = admin.id if admin else 1
     apps = _feature(db, owner_id, "partner-applications")
     rows = list(apps.get("rows") or [])
+    if any(str(r.get("email") or "").lower() == email and r.get("status") == "pending" for r in rows):
+        return {"ok": True, "detail": "Application sent. We reply within 2 business days with your partner link."}
     rows.insert(
         0,
         {
+            # Stable id: HQ decisions are keyed by it, so new applications never shift earlier ones.
+            "id": f"app-{secrets.token_hex(6)}",
             "name": name,
             "email": email,
             "channel": body.channel.strip(),
@@ -235,9 +256,259 @@ def apply(body: ApplyBody, db: Session = Depends(get_db)):
 @router.post("/reset-password")
 def reset_password(body: ResetBody, db: Session = Depends(get_db)):
     email = body.email.strip().lower()
+    user = db.query(User).filter(User.email == email, User.role == "ROLE_PARTNER").one_or_none()
+    if user is not None:
+        link = f"{config.PUBLIC_SITE_URL}/partners/login?reset={make_password_token(user, 'reset', RESET_MINUTES)}"
+        mailer.send(
+            user.email,
+            "Reset your Searchify partner password",
+            "Someone asked to reset the password for your Searchify partner account.\n\n"
+            f"Set a new password here (the link works for {RESET_MINUTES} minutes):\n{link}\n\n"
+            "If you did not ask for this, ignore this email. Your password stays the same.",
+        )
     # Never reveal whether the account exists.
-    _ = db.query(User).filter(User.email == email, User.role == "ROLE_PARTNER").one_or_none()
     return {"ok": True, "detail": "If that email has a partner account, a reset link is on its way."}
+
+
+@router.post("/set-password")
+def set_password(body: SetPasswordBody, db: Session = Depends(get_db)):
+    """Finish an approval invite or a reset: set the password and sign the partner in."""
+    user = read_password_token(body.token, db)
+    if user is None or user.role != "ROLE_PARTNER":
+        raise HTTPException(400, "This link has expired or was already used. Ask for a new one.")
+    if len(body.password or "") < 8:
+        raise HTTPException(400, "Use at least 8 characters.")
+    user.password_hash = hash_password(body.password)
+    db.add(user)
+    db.commit()
+    return {"ok": True, "token": make_token(user), "userType": "partner", "username": user.username}
+
+
+# --- Referral attribution -------------------------------------------------------------------------
+
+
+def _week_key(when: datetime | None = None) -> str:
+    year, week, _ = (when or datetime.utcnow()).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def _series(weekly: dict, field: str, weeks: int = 24) -> list[int]:
+    now = datetime.utcnow()
+    keys = [_week_key(now - timedelta(weeks=offset)) for offset in range(weeks - 1, -1, -1)]
+    return [int((weekly.get(key) or {}).get(field) or 0) for key in keys]
+
+
+def partner_by_handle(db: Session, handle: str) -> User | None:
+    want = re.sub(r"[^a-z0-9_-]", "", str(handle or "").strip().lower())
+    if not want:
+        return None
+    for user in db.query(User).filter(User.role == "ROLE_PARTNER").all():
+        profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
+        if str(profile.get("handle") or "").lower() == want:
+            return user
+    return None
+
+
+def _bump(db: Session, partner: User, field: str, ref_row: list | None = None) -> None:
+    ledger = {**_empty_ledger(), **_feature(db, partner.id, "partner-ledger")}
+    weekly = dict(ledger.get("weekly") or {})
+    key = _week_key()
+    bucket = dict(weekly.get(key) or {})
+    bucket[field] = int(bucket.get(field) or 0) + 1
+    weekly[key] = bucket
+    ledger["weekly"] = weekly
+    # The partner centre charts read these 24-week series.
+    ledger["clicks"] = _series(weekly, "clicks")
+    ledger["signups"] = _series(weekly, "signups")
+    ledger["paying"] = _series(weekly, "paying")
+    if ref_row:
+        ledger["refs"] = [ref_row, *(ledger.get("refs") or [])][:200]
+        total = sum(int(b.get("signups") or 0) for b in weekly.values())
+        paying = sum(int(b.get("paying") or 0) for b in weekly.values())
+        ledger["refSummary"] = f"{total} sign-up{'s' if total != 1 else ''} · {paying} paying"
+    _save_feature(db, partner.id, "partner-ledger", "Partner ledger", ledger)
+
+
+@router.post("/click")
+def click(body: ClickBody, db: Session = Depends(get_db)):
+    """Public: a visitor arrived through a partner link (?ref=handle). Unknown handles are ignored."""
+    partner = partner_by_handle(db, body.ref)
+    if partner is not None:
+        _bump(db, partner, "clicks")
+    return {"ok": True}
+
+
+def record_signup(db: Session, ref: str, customer: User) -> bool:
+    """Attribute a new customer account to the partner whose link they came through."""
+    partner = partner_by_handle(db, ref)
+    if partner is None or partner.id == customer.id or partner.email == customer.email:
+        return False  # self-referrals never count
+    when = datetime.utcnow().strftime("%b %d").replace(" 0", " ")
+    # Customer names stay private: the partner sees a new customer, not who it is.
+    # 5th element links the row to the customer (not shown) so plan and payments can update it.
+    _bump(db, partner, "signups", [when, "New customer", "Trial", "trial", f"c{customer.id}"])
+    referred = _feature(db, customer.id, "referred-by")
+    if not referred:
+        _save_feature(db, customer.id, "referred-by", "Referred by", {"partnerId": partner.id, "at": datetime.utcnow().isoformat() + "Z"})
+    return True
+
+
+PLAN_LABEL = {"solo": "Solo", "starter": "Solo", "pro": "Pro", "growth": "Pro", "agency": "Premium", "premium": "Premium", "scale": "Premium"}
+HOLD_DAYS = 30
+COMMISSION_MONTHS = 12
+
+
+def _referrer(db: Session, customer: User) -> tuple[User | None, dict]:
+    referred = _feature(db, customer.id, "referred-by")
+    partner = db.get(User, int(referred["partnerId"])) if referred.get("partnerId") else None
+    if partner is None or partner.role != "ROLE_PARTNER":
+        return None, {}
+    return partner, referred
+
+
+def referral_plan(db: Session, customer: User, plan: str) -> None:
+    """The referred customer chose a plan (trial). Show it on the partner's referral row."""
+    partner, _ = _referrer(db, customer)
+    if partner is None:
+        return
+    ledger = {**_empty_ledger(), **_feature(db, partner.id, "partner-ledger")}
+    label = PLAN_LABEL.get(str(plan or "").lower(), str(plan or "").title() or "Trial")
+    for row in ledger.get("refs") or []:
+        if isinstance(row, list) and len(row) > 4 and row[4] == f"c{customer.id}":
+            row[2] = label
+    _save_feature(db, partner.id, "partner-ledger", "Partner ledger", ledger)
+
+
+def record_payment(db: Session, customer: User, amount: float, plan: str, paid_at: datetime | None = None) -> float:
+    """A referred customer paid. Adds the partner's commission to the 30-day hold.
+
+    Call this from the payment provider's webhook (e.g. Stripe invoice.paid) once one is connected.
+    Returns the commission amount (0 when the customer was not referred or is past 12 months).
+    """
+    partner, referred = _referrer(db, customer)
+    if partner is None or amount <= 0:
+        return 0.0
+    paid_at = paid_at or datetime.utcnow()
+    try:
+        joined = datetime.fromisoformat(str(referred.get("at") or "").replace("Z", ""))
+    except ValueError:
+        joined = paid_at
+    if paid_at - joined > timedelta(days=365 * COMMISSION_MONTHS / 12):
+        return 0.0
+    profile = {**_default_profile(partner), **_feature(db, partner.id, "partner-profile")}
+    rate = float(profile.get("rate") or 0.3)
+    commission = round(float(amount) * rate, 2)
+    label = PLAN_LABEL.get(str(plan or "").lower(), str(plan or "").title())
+    ledger = {**_empty_ledger(), **_feature(db, partner.id, "partner-ledger")}
+    first = True
+    for row in ledger.get("refs") or []:
+        if isinstance(row, list) and len(row) > 4 and row[4] == f"c{customer.id}":
+            first = row[3] != "paying"
+            row[2], row[3] = label or row[2], "paying"
+    clears = (paid_at + timedelta(days=HOLD_DAYS)).strftime("%b %d").replace(" 0", " ")
+    when = paid_at.strftime("%b %d").replace(" 0", " ")
+    ledger["earnings"] = [[when, "New customer", label, "hold", f"Clears {clears}"], *(ledger.get("earnings") or [])][:500]
+    totals = dict(ledger.get("totals") or {"cleared": 0, "hold": 0, "rev": 0, "paid": 0})
+    totals["hold"] = round(float(totals.get("hold") or 0) + commission, 2)
+    ledger["totals"] = totals
+    ledger["hold"] = totals["hold"]
+    if first:
+        mix = dict(ledger.get("mix") or {"Solo": 0, "Pro": 0, "Premium": 0})
+        if label in mix:
+            mix[label] = int(mix.get(label) or 0) + 1
+        ledger["mix"] = mix
+    _save_feature(db, partner.id, "partner-ledger", "Partner ledger", ledger)
+    if first:
+        _bump(db, partner, "paying")
+    return commission
+
+
+# --- HQ decisions (called from the HQ router) --------------------------------------------------------
+
+
+def _unique_handle(db: Session, name: str, email: str) -> str:
+    base = re.sub(r"[^a-z0-9]", "", (name or email.split("@")[0]).lower())[:20] or "partner"
+    handle, n = base, 1
+    while partner_by_handle(db, handle) is not None:
+        n += 1
+        handle = f"{base}{n}"
+    return handle
+
+
+def approve_application(db: Session, owner_id: int, app_id: str, *, rate: float = 0.3, founding: bool = False) -> dict:
+    """Create the partner account, mark the application approved, and email a set-password link."""
+    apps = _feature(db, owner_id, "partner-applications")
+    rows = list(apps.get("rows") or [])
+    row = next((r for r in rows if r.get("id") == app_id), None)
+    if row is None:
+        raise HTTPException(404, "Application not found")
+    if row.get("status") == "declined":
+        raise HTTPException(409, "This application was declined.")
+    email = str(row.get("email") or "").lower()
+    user = db.query(User).filter(User.email == email).one_or_none()
+    if user is not None and user.role != "ROLE_PARTNER":
+        raise HTTPException(409, "That email already has a customer or admin account.")
+    if user is None:
+        username = email.split("@")[0][:40] or "partner"
+        if db.query(User).filter(User.username == username).first():
+            username = f"{username}-{secrets.token_hex(2)}"
+        user = User(
+            username=username,
+            email=email,
+            # Unusable until the partner sets a password from the emailed link.
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            role="ROLE_PARTNER",
+            plan="partner",
+            site_limit=0,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        _save_feature(db, user.id, "partner-profile", "Partner profile", {
+            "displayName": row.get("name") or user.username,
+            "email": email,
+            "handle": _unique_handle(db, row.get("name") or "", email),
+            "tier": "founding" if founding else "standard",
+            "rate": rate,
+            "since": datetime.utcnow().strftime("%b %Y"),
+            "qualified": 0,
+            "country": row.get("country") or "",
+            "channel": row.get("channel") or "",
+        })
+        _save_feature(db, user.id, "partner-ledger", "Partner ledger", _empty_ledger())
+    profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
+    setup = f"{config.PUBLIC_SITE_URL}/partners/login?setup={make_password_token(user, 'setup', SETUP_MINUTES)}"
+    link = f"{config.PUBLIC_SITE_URL}/?ref={profile['handle']}"
+    emailed = mailer.send(
+        email,
+        "You're approved: welcome to the Searchify partner program",
+        f"Hi {row.get('name') or ''},\n\nYour Searchify partner application is approved at {int(round(rate * 100))}%.\n\n"
+        f"1. Set your password (link works for 3 days):\n{setup}\n\n"
+        f"2. Your referral link:\n{link}\n\n"
+        "Remember to say you earn a commission when you share it.\n",
+    )
+    row.update({"status": "approved", "partnerId": user.id, "decidedAt": datetime.utcnow().isoformat() + "Z", "emailed": emailed})
+    _save_feature(db, owner_id, "partner-applications", "Partner applications", {"rows": rows})
+    return {"ok": True, "emailed": emailed, "setupUrl": setup, "referralLink": link, "partnerId": user.id, "application": row}
+
+
+def decline_application(db: Session, owner_id: int, app_id: str) -> dict:
+    apps = _feature(db, owner_id, "partner-applications")
+    rows = list(apps.get("rows") or [])
+    row = next((r for r in rows if r.get("id") == app_id), None)
+    if row is None:
+        raise HTTPException(404, "Application not found")
+    if row.get("status") == "approved":
+        raise HTTPException(409, "This application is already approved.")
+    emailed = mailer.send(
+        str(row.get("email") or ""),
+        "Your Searchify partner application",
+        f"Hi {row.get('name') or ''},\n\nThank you for applying to the Searchify partner program. "
+        "We are not able to approve this application right now. You are welcome to apply again later.\n",
+    )
+    row.update({"status": "declined", "decidedAt": datetime.utcnow().isoformat() + "Z", "emailed": emailed})
+    _save_feature(db, owner_id, "partner-applications", "Partner applications", {"rows": rows})
+    return {"ok": True, "emailed": emailed, "application": row}
 
 
 @router.get("/me")
