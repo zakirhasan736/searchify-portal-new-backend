@@ -274,6 +274,34 @@ def scrape_page(url: str) -> dict:
     return {"url": str(response.url), **listing_from_parser(parser), "error": ""}
 
 
+# Camera, phone, CMS and export prefixes/suffixes carry no meaning for alt text.
+_IMAGE_NOISE = {
+    "img", "image", "images", "dsc", "dscn", "dcim", "pxl", "photo", "pic", "picture", "screenshot", "screen",
+    "shot", "scaled", "copy", "final", "edit", "edited", "min", "compressed", "optimized", "resized", "large",
+    "medium", "small", "thumb", "thumbnail", "hero", "banner", "bg", "background", "web", "new", "untitled",
+    "unnamed", "wp", "uploads", "jpg", "jpeg", "png", "webp", "gif", "svg", "x", "v", "e", "rotated",
+}
+
+
+def _image_name(src: str) -> str:
+    """Readable words from an image file name, or "" when the name is only camera/CMS noise or a hash."""
+    stem = str(src or "").rstrip("/").split("/")[-1].split("?")[0].rsplit(".", 1)[0]
+    stem = re.sub(r"-\d+x\d+$", "", stem)  # WordPress size suffix: -1024x768
+    compact = re.sub(r"[-_.\s]+", "", stem)
+    if len(compact) >= 16 and (
+        re.fullmatch(r"[0-9a-f]+", compact.lower()) or sum(ch.isdigit() for ch in compact) >= len(compact) * 0.6
+    ):
+        return ""  # hash / UUID / timestamp file name
+    words = []
+    for part in re.split(r"[-_.\s]+", re.sub(r"\d+", " ", stem)):
+        word = part.strip().lower()
+        if len(word) < 2 or word in _IMAGE_NOISE:
+            continue
+        words.append(word)
+    name = " ".join(words)
+    return name[:1].upper() + name[1:] if len(name) >= 3 else ""
+
+
 def suggest_images(images: list | None, topic: str, page_url: str) -> list[dict]:
     """Alt text for the photos on the page. Existing alt is kept. Empty alt gets words from the page topic.
 
@@ -292,10 +320,7 @@ def suggest_images(images: list | None, topic: str, page_url: str) -> list[dict]
             continue
         seen.add(key)
         alt = " ".join(str((img or {}).get("alt") or "").split())[:160]
-        stem = src.rstrip("/").split("/")[-1].split("?")[0].rsplit(".", 1)[0]
-        name = " ".join(re.sub(r"[-_]+", " ", re.sub(r"\d+", " ", stem)).split())
-        if len(name) < 3:
-            name = ""
+        name = _image_name(src)
         # Describe the image; do not keyword-stuff the page topic into every alt.
         if alt:
             suggested = alt

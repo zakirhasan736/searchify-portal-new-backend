@@ -91,7 +91,9 @@ def test_publishes_exactly_the_approved_edited_text(env):
     assert r.status_code == 200, r.text
     assert env["writes"][-1]["title"] == "Edited Title For Calgary Plumbing"
     assert env["writes"][-1]["metaDescription"] == "Edited description."
-    assert "beforeTitle" not in env["writes"][-1]
+    # beforeTitle is sent on purpose: the WordPress connector uses it to refuse a publish when the live
+    # meta title changed since review. It must be the live title, never the edited text.
+    assert env["writes"][-1].get("beforeTitle") != env["writes"][-1].get("title")
     assert status_of(cid) == "monitoring"
     assert r.json()["execution"]["liveCheck"]["titleLive"] is True
 
@@ -196,3 +198,21 @@ def test_other_tenant_cannot_touch_change(env):
     assert c.patch(f"/api/v1/operator/changes/{cid}", json={"title": "x"}).status_code == 404
     env["current"]["user"] = env["owner"]
     assert status_of(cid) == "awaiting_approval"
+
+
+def test_silent_wordpress_meta_ignore_is_not_reported_as_published(env, monkeypatch):
+    """WordPress returns 200 but drops unregistered SEO meta: the live page still shows the old title."""
+    def ignored(provider, creds, site_url, change):
+        env["writes"].append(change)
+        return {"ok": True, "dryRun": False, "provider": provider, "verified": True, "remoteId": "7", "resource": "page",
+                "before": {"title": "", "metaDescription": ""}, "after": {"metaTitle": "", "metaDescription": ""}}
+
+    monkeypatch.setattr(operator.cms_connectors, "apply_change", ignored)
+    c, cid = env["client"], env["new"]()
+    assert c.post(f"/api/v1/operator/changes/{cid}/approve").status_code == 200
+    r = c.post(f"/api/v1/operator/changes/{cid}/execute", json={})
+    assert r.status_code == 200, r.text
+    assert r.json()["execution"]["liveCheck"]["titleLive"] is False
+    assert r.json()["execution"]["verified"] is False
+    assert status_of(cid) == "published_unverified"
+    assert "searchify-seo-meta.php" in r.json()["execution"]["detail"]

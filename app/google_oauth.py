@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -258,7 +259,53 @@ def fetch_gsc_page_queries(access_token: str, site_url: str, page_url: str, days
                 f"{row.get('position') or 0:.1f}",
             ]
         )
+    if not rows:
+        # Search Console stores the indexed URL exactly; retry trailing-slash and www variants.
+        for variant in _gsc_page_variants(page)[1:]:
+            response = None
+            body["dimensionFilterGroups"][0]["filters"][0]["expression"] = variant
+            with httpx.Client(timeout=45.0) as client:
+                response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
+            if response.status_code >= 400:
+                continue
+            found = response.json().get("rows") or []
+            if found:
+                return [
+                    [
+                        (row.get("keys") or [""])[0],
+                        str(int(row.get("clicks") or 0)),
+                        str(int(row.get("impressions") or 0)),
+                        f"{(row.get('ctr') or 0) * 100:.1f}%",
+                        f"{row.get('position') or 0:.1f}",
+                    ]
+                    for row in found
+                ]
     return rows
+
+
+def search_console_links(property_url: str, page_url: str = "") -> dict:
+    """Deep links into the Search Console UI for the connected property (and one page when given)."""
+    from urllib.parse import quote
+
+    prop = str(property_url or "").strip()
+    if not prop:
+        return {}
+    resource = quote(prop, safe="")
+    base = "https://search.google.com/search-console"
+    links = {
+        "performance": f"{base}/performance/search-analytics?resource_id={resource}",
+        "pages": f"{base}/index?resource_id={resource}",
+        "sitemaps": f"{base}/sitemaps?resource_id={resource}",
+        "coreWebVitals": f"{base}/core-web-vitals?resource_id={resource}",
+        "links": f"{base}/links?resource_id={resource}",
+    }
+    page = str(page_url or "").strip()
+    if page:
+        links["pagePerformance"] = (
+            f"{base}/performance/search-analytics?resource_id={resource}&page=!{quote(page, safe='')}"
+        )
+        links["inspect"] = f"{base}/inspect?resource_id={resource}&id={quote(page, safe='')}"
+    return links
 
 
 def fetch_gsc_top_pages(access_token: str, site_url: str, days: int = 28, row_limit: int = 25) -> list[list]:
@@ -275,6 +322,12 @@ def _gsc_page_variants(page_url: str) -> list[str]:
         variants.append(raw.rstrip("/") or raw)
     else:
         variants.append(raw + "/")
+    # www / non-www: the app may store one while Search Console indexed the other.
+    match = re.match(r"^(https?://)(www\.)?(.*)$", raw, re.I)
+    if match:
+        swapped = f"{match.group(1)}{'' if match.group(2) else 'www.'}{match.group(3)}"
+        variants.append(swapped)
+        variants.append(swapped.rstrip("/") if swapped.endswith("/") else swapped + "/")
     seen = set()
     ordered = []
     for item in variants:

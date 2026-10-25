@@ -255,7 +255,11 @@ def _fit_title(value: str, brand_tail: str = "") -> str:
 
 def _query_metric_rows(gsc: dict | None, queries: list | None) -> list[dict]:
     rows = []
-    for row in (gsc or {}).get("queryRows") or []:
+    # Page-level rows arrive as "queryRows" (regenerate) or "queries" (page bundle used by first drafts).
+    source = (gsc or {}).get("queryRows") or [
+        row for row in ((gsc or {}).get("queries") or []) if isinstance(row, dict) and row.get("query")
+    ]
+    for row in source:
         if isinstance(row, dict) and row.get("query"):
             rows.append(row)
         elif isinstance(row, (list, tuple)) and row and str(row[0]).strip():
@@ -269,6 +273,13 @@ def _query_metric_rows(gsc: dict | None, queries: list | None) -> list[dict]:
     if rows:
         return rows[:8]
     return [{"query": str(item).strip(), "clicks": "", "impressions": "", "ctr": "", "position": ""} for item in (queries or []) if str(item).strip()][:8]
+
+
+def _as_number(value) -> float:
+    try:
+        return float(str(value if value is not None else 0).replace(",", "").replace("%", ""))
+    except ValueError:
+        return 0.0
 
 
 def _query_lines(rows: list[dict]) -> str:
@@ -1116,7 +1127,10 @@ def write_title_description(
     audience: str = "",
     primary_keyword: str = "",
     extra_instructions: str = "",
+    content_seed: dict | None = None,
 ) -> dict:
+    """content_seed: a DataForSEO generate_meta_tags draft fetched by the caller (batch drafts run in
+    threads without a DB session, so the caller fetches it up front). When None, it is fetched here."""
     scraped = page if page and not page.get("error") and page.get("url") else scrape_page(url)
     kind = kind or page_quality.page_type(url, ((site or {}).get("page") or {}).get("role") or "", scraped)
     brand = str(((site or {}).get("business") or {}).get("brand") or profile.get("business") or "")
@@ -1124,7 +1138,19 @@ def write_title_description(
     if isinstance(headings, list):
         headings = " | ".join(headings)
     gsc = gsc or {}
-    queries = [q for q in (queries or []) if str(q).strip()][:8]
+    # This page's own Search Console queries lead (highest impressions first); site-wide terms follow.
+    page_query_terms = [
+        str(row.get("query")).strip()
+        for row in sorted(
+            [r for r in (gsc.get("queries") or []) if isinstance(r, dict) and str(r.get("query") or "").strip()],
+            key=lambda r: -_as_number(r.get("impressions")),
+        )
+    ]
+    merged_terms: list[str] = []
+    for term in [*page_query_terms, *[str(q).strip() for q in (queries or [])]]:
+        if term and term.lower() not in {item.lower() for item in merged_terms}:
+            merged_terms.append(term)
+    queries = merged_terms[:8]
     rivals = competitors or []
     page_only = " ".join(
         part for part in (
@@ -1264,6 +1290,9 @@ def write_title_description(
 
     def seo_content_draft() -> dict:
         from app import dfs_meta
+
+        if content_seed is not None:
+            return dict(content_seed or {})
 
         measured = []
         if gsc.get("clicks") not in (None, ""):

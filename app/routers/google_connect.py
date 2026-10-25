@@ -332,7 +332,12 @@ def connection_for_site(row: GoogleConnection | None, site: str = "") -> dict:
     payload["gscSiteUrl"] = gsc
     payload["ga4PropertyId"] = ga4
     payload["ga4PropertyName"] = name
-    payload["gsc"] = {"status": prop_status(gsc, "gsc"), "siteUrl": gsc, "checkedAt": (validated.get("gsc") or {}).get("at")}
+    payload["gsc"] = {
+        "status": prop_status(gsc, "gsc"),
+        "siteUrl": gsc,
+        "checkedAt": (validated.get("gsc") or {}).get("at"),
+        "links": goauth.search_console_links(gsc),
+    }
     payload["ga4"] = {
         "status": prop_status(ga4, "ga4"),
         "propertyId": ga4,

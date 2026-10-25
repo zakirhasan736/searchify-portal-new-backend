@@ -47,7 +47,8 @@ def test_usage_reports_the_plan_limits(env):
     assert body["plan"] == "starter"
     assert body["trackedKeywords"] == 10
     assert body["features"]["backlinks"] == {"label": "Backlink refreshes", "used": 0, "limit": 5, "left": 5}
-    assert set(body["features"]) == {"keywords", "backlinks", "visibility", "competitors", "audits"}
+    # "content" is the DataForSEO meta-tag content generation quota used by the title writer.
+    assert set(body["features"]) == {"keywords", "backlinks", "visibility", "competitors", "audits", "content"}
 
 
 def test_paid_call_counts_and_cached_answer_is_free(env):
@@ -55,7 +56,8 @@ def test_paid_call_counts_and_cached_answer_is_free(env):
     assert c.post("/api/v1/research/backlinks", json={"site": "https://acme.example"}).status_code == 200
     assert c.post("/api/v1/research/backlinks", json={"site": "https://acme.example"}).json()["cached"] is True
     assert c.get("/api/v1/research/usage").json()["features"]["backlinks"]["used"] == 1
-    assert len(env["calls"]) == 2
+    # summary + live referring domains + lost referring domains; the cached second request makes no calls.
+    assert len(env["calls"]) == 3
 
 
 def test_limit_reached_blocks_before_calling_the_provider(env):
