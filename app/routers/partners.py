@@ -147,7 +147,53 @@ def live_ledger(stored: dict | None) -> dict:
             ledger["clicks"] = _series(weekly, "clicks") if weekly else []
             ledger["signups"] = _series(weekly, "signups") if weekly else []
             ledger["paying"] = _series(weekly, "paying") if weekly else []
+    return mature(ledger)
+
+
+def mature(ledger: dict, today: datetime | None = None) -> dict:
+    """Commissions whose 30-day hold has passed move from 'hold' to 'cleared' (ready for the 15th)."""
+    today = today or datetime.utcnow()
+    totals = dict(ledger.get("totals") or {"cleared": 0, "hold": 0, "rev": 0, "paid": 0})
+    rows = []
+    for row in ledger.get("earnings") or []:
+        row = list(row) if isinstance(row, list) else row
+        # New rows: [when, who, plan, status, note, clears_iso, amount]
+        if isinstance(row, list) and len(row) > 6 and row[3] == "hold":
+            try:
+                due = datetime.fromisoformat(str(row[5]))
+            except ValueError:
+                due = None
+            if due and due <= today:
+                amount = float(row[6] or 0)
+                row[3], row[4] = "cleared", "In the next payout on the 15th"
+                totals["hold"] = round(max(0.0, float(totals.get("hold") or 0) - amount), 2)
+                totals["cleared"] = round(float(totals.get("cleared") or 0) + amount, 2)
+        rows.append(row)
+    ledger["earnings"] = rows
+    ledger["totals"] = totals
+    ledger["hold"] = totals.get("hold") or 0
     return ledger
+
+
+def pay_out(db: Session, partner: User, *, paid_on: datetime | None = None, minimum: float = 50.0) -> dict:
+    """Record a payout of the partner's cleared balance. Money is sent outside Searchify (PayPal/Wise/bank)."""
+    paid_on = paid_on or datetime.utcnow()
+    ledger = live_ledger(_feature(db, partner.id, "partner-ledger"))
+    totals = dict(ledger.get("totals") or {})
+    amount = round(float(totals.get("cleared") or 0), 2)
+    if amount < minimum:
+        return {"paid": 0.0, "carried": amount, "reason": f"Under the ${minimum:.0f} minimum, carried to next month."}
+    label = paid_on.strftime("%b %d, %Y").replace(" 0", " ")
+    for row in ledger.get("earnings") or []:
+        if isinstance(row, list) and len(row) > 4 and row[3] == "cleared":
+            row[3], row[4] = "paid", f"Paid {label}"
+    ledger["payouts"] = [*(ledger.get("payouts") or []), [label, amount]]
+    totals["paid"] = round(float(totals.get("paid") or 0) + amount, 2)
+    totals["cleared"] = 0.0
+    ledger["totals"] = totals
+    _save_feature(db, partner.id, "partner-ledger", "Partner ledger", ledger)
+    payout = _feature(db, partner.id, "partner-payout")
+    return {"paid": amount, "carried": 0.0, "method": payout.get("method") or "not set", "to": payout.get("email") or partner.email}
 
 
 def _demo_ledger() -> dict:
@@ -440,7 +486,8 @@ def record_payment(db: Session, customer: User, amount: float, plan: str, paid_a
             row[2], row[3] = label or row[2], "paying"
     clears = (paid_at + timedelta(days=HOLD_DAYS)).strftime("%b %d").replace(" 0", " ")
     when = paid_at.strftime("%b %d").replace(" 0", " ")
-    ledger["earnings"] = [[when, "New customer", label, "hold", f"Clears {clears}"], *(ledger.get("earnings") or [])][:500]
+    due = (paid_at + timedelta(days=HOLD_DAYS)).isoformat(timespec="seconds")
+    ledger["earnings"] = [[when, "New customer", label, "hold", f"Clears {clears}", due, commission], *(ledger.get("earnings") or [])][:500]
     totals = dict(ledger.get("totals") or {"cleared": 0, "hold": 0, "rev": 0, "paid": 0})
     totals["hold"] = round(float(totals.get("hold") or 0) + commission, 2)
     ledger["totals"] = totals

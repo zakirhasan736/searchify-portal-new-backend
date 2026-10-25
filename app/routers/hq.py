@@ -19,9 +19,14 @@ PRICE = {"solo": 29, "pro": 79, "premium": 399, "ent": 1250}
 
 
 class CustomerActionBody(BaseModel):
-    action: str = Field(..., description="free_month|refund|change_plan|cancel|impersonate")
+    action: str = Field(..., description="record_payment|mark_failed|free_month|refund|change_plan|cancel|impersonate")
     plan: str | None = None
+    amount: float | None = None  # record_payment: amount paid (defaults to the plan price)
     reason: str = "Customer asked"
+
+
+class PayoutRunBody(BaseModel):
+    ids: list[str] | None = None  # partner ids ("u12"); default: every partner approved in the run
 
 
 class PartnersStateBody(BaseModel):
@@ -545,6 +550,7 @@ def act_customer(
         body.plan,
         body.reason or "Customer asked",
         user.username or "Admin",
+        body.amount,
     )
     if result.get("error") == "Unknown plan":
         raise HTTPException(400, "Unknown plan")
@@ -695,6 +701,22 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
         state["apps"] = {**state.get("apps", {}), **body.apps}
     if body.rates is not None:
         state["rates"] = {**state.get("rates", {}), **body.rates}
+        # The rate lives on the partner's own account, so the partner centre shows the same number.
+        from app.routers.partners import _save_feature as save_partner_feature
+
+        for key, value in body.rates.items():
+            try:
+                partner = db.get(User, int(str(key).lstrip("u")))
+                pct = float(value)
+            except (TypeError, ValueError):
+                continue
+            if partner is None or partner.role != "ROLE_PARTNER" or not 1 <= pct <= 60:
+                continue
+            profile = _feature(db, partner.id, "partner-profile")
+            if profile.get("tier") == "founding" and pct / 100 < float(profile.get("rate") or 0.35):
+                raise HTTPException(400, "A founding partner's rate can only be moved up.")
+            profile["rate"] = round(pct / 100, 4)
+            save_partner_feature(db, partner.id, "partner-profile", "Partner profile", profile)
     if body.cleared is not None:
         state["cleared"] = {**state.get("cleared", {}), **body.cleared}
     if body.grants is not None:
@@ -702,6 +724,49 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
     _save_feature(db, admin.id, "hq-partners-state", "HQ partners state", state)
     data = _partners_payload(db, admin)
     return {"ok": True, "live": True, **data}
+
+
+@router.post("/partners/payout")
+def run_partner_payout(body: PayoutRunBody | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Record this month's payouts: each approved partner's cleared balance moves to Paid.
+
+    The money itself is sent outside Searchify (PayPal, Wise or bank) using the method on file.
+    """
+    _require_admin(user)
+    from app.routers.partners import _feature as partner_feature
+    from app.routers.partners import pay_out
+
+    admin = _admin_owner(db)
+    state = dict(_feature(db, admin.id, "hq-partners-state") or {})
+    approved = [key for key, value in (state.get("run") or {}).items() if value == "approved"]
+    ids = (body.ids if body and body.ids else approved) or []
+    results, total = [], 0.0
+    for key in ids:
+        try:
+            partner = db.get(User, int(str(key).lstrip("u")))
+        except ValueError:
+            partner = None
+        if partner is None or partner.role != "ROLE_PARTNER":
+            continue
+        payout = partner_feature(db, partner.id, "partner-payout")
+        if not (payout.get("certified") or payout.get("legalName")):
+            results.append({"id": key, "paid": 0, "held": True, "reason": "Tax details missing."})
+            continue
+        done = pay_out(db, partner)
+        total += done["paid"]
+        results.append({"id": key, **done})
+    state["paid"] = bool(total)
+    state["lastRun"] = {"at": datetime.utcnow().isoformat() + "Z", "total": round(total, 2), "results": results}
+    state["run"] = {k: v for k, v in (state.get("run") or {}).items() if k not in {r["id"] for r in results if r.get("paid")}}
+    _save_feature(db, admin.id, "hq-partners-state", "HQ partners state", state)
+    data = _partners_payload(db, admin)
+    paid_n = len([r for r in results if r.get("paid")])
+    message = (
+        f"Recorded ${total:,.2f} paid to {paid_n} partner{'s' if paid_n != 1 else ''}. Send each amount with the method on file."
+        if paid_n
+        else "Nothing was paid: no approved partner had a cleared balance over the minimum with tax details on file."
+    )
+    return {"ok": True, "message": message, "results": results, **data}
 
 
 @router.get("/problems")
@@ -735,8 +800,18 @@ def act_problem(
         done[problem_id] = True
         msg = "Resolved."
     elif body.action == "email":
-        emailed[problem_id] = True
-        msg = "Email sent."
+        from app import mailer
+
+        item = next(item for item in items if item.get("id") == problem_id)
+        to = item.get("email") or ""
+        if not to:
+            raise HTTPException(400, "This problem has no customer email.")
+        if mailer.send(to, item.get("emailSubject") or "A note from Searchify", item.get("emailBody") or ""):
+            emailed[problem_id] = True
+            msg = f"Email sent to {to}."
+        else:
+            # Never claim an email went out when it did not.
+            msg = f"Email isn't set up, so nothing was sent. Contact {to} directly."
     else:
         raise HTTPException(400, "Unknown action")
     _save_feature(db, admin.id, "hq-problems-state", "HQ problems state", {"done": done, "emailed": emailed})
