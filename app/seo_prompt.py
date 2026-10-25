@@ -117,32 +117,20 @@ Do not promise ranking or traffic gains.
 
 ## 9. REQUIRED OUTPUT
 
-Return one JSON object and nothing else. No Markdown fences. No prose before or after the JSON.
+Return exactly four lines in this format, with no Markdown fences and no extra commentary:
 
-{
-  "page_url": "",
-  "analysis_status": "READY | INSUFFICIENT_EVIDENCE",
-  "current_metadata": {"title": "", "description": ""},
-  "search_intent": "",
-  "primary_keyword": "",
-  "supporting_keywords": [],
-  "evidence_summary": [],
-  "data_quality_warnings": [],
-  "title_candidates": [{"title": "", "reasoning": "", "evidence_refs": [], "limitations": []}],
-  "description_candidates": [{"description": "", "reasoning": "", "evidence_refs": [], "limitations": []}],
-  "decision": "RECOMMEND_CHANGE | KEEP_CURRENT | INSUFFICIENT_EVIDENCE",
-  "recommended_title": null,
-  "recommended_description": null,
-  "comparison_summary": "",
-  "confidence": "HIGH | MEDIUM | LOW",
-  "human_approval_required": true
-}
+TITLE: [proposed title]
+DESCRIPTION: [proposed meta description]
+TARGET: [primary keyword or page topic]
+REASON: [one concise sentence explaining the evidence-supported decision]
 
-Use evidence reference ids supplied in the evidence record. Never fabricate source ids, API results, or numeric metrics.
-If no meaningful improvement exists, leave recommended_title and recommended_description null.
+Rules:
+- TITLE must contain only the title text.
+- DESCRIPTION must contain only the description text.
+- TARGET must name the selected keyword or page topic; do not invent search data.
+- REASON must explain why the candidate is preferable to the current listing, or state that the current listing should be kept.
+- If a change is not justified, reproduce the current title and description unchanged and explain why in REASON.
+- Never invent metrics, search volume, rankings, competitor facts, or services.
+- The application enforces its own character limits. Do not truncate important words, the brand, or a meaningful phrase just to hit an arbitrary ideal length.
 
-## 10. FINAL DECISION POLICY
-
-Recommend a change only when the page and its current metadata are verified, the search intent is understood, the change is supported by relevant evidence, and the candidate is more accurate, useful, distinctive, and natural than the current version while preserving useful brand and location context.
-If the evidence does not establish an advantage, do not manufacture one.
 """

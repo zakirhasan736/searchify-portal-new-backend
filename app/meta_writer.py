@@ -38,44 +38,6 @@ FILLER = (
     "#1",
 )
 
-SYSTEM = (
-    "You are a senior SEO copywriter competing with the best SEO tools. You write the Google title and meta description for one specific page. "
-    "The page topic is the concept. The best keyword is the search this page can honestly win. "
-    "Work in this order: (1) read the page topic and page type in the brief and stay on that concept — do not switch to another service, product, or case study from elsewhere on the site; "
-    "(2) put the best keyword, in those words, near the front of the title when it fits the page; "
-    "(3) add one concrete fact that belongs to THIS page only (a place, an offer, or a detail stated in the page copy) so the listing is specific and not a paste of the H1; "
-    "(4) meet the hardest competitor on that same search when one is listed. Match keyword strength. Add one fact only this business can say. Do not copy their title; "
-    "(5) replace the live title only when a Search Console query for THIS page is missing from that title and this page can honestly rank for it. "
-    "If the live title and description already name the offer, the place, and the brand, return that live title and description unchanged. "
-    "Never delete the brand, the place, or a service from the live title just to make it shorter. "
-    "Never invent service counts (for example “5 Core Services”), awards, “best/leading/top-rated”, prices, or years unless the page states them. "
-    "Do not open the description with filler templates such as “Business owners can explore…” or “Buyers can compare…”. Write a natural sentence about the offer. "
-    "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
-    "Use Search Console queries, Analytics landing facts, site-audit notes, backlink anchors, and AI-visibility gaps only as evidence for which angle to win — never invent numbers. "
-    "Every page on the site needs its own topic: never reuse another page's title. "
-    "Homepage and service pages describe the business offer. Never name a portfolio client, case-study project, or unrelated product on those pages. "
-    "Only a case-study or portfolio page may name the client or project that page is about. "
-    "It does not sound like an agency slogan. "
-    "Do not invent reviews, years in business, prices, awards, or certifications. "
-    "Do not copy a competitor title. "
-    "Do not use filler such as welcome, trusted, discover, unlock, elevate, seamless, leading, or one-stop. "
-    "Title: HARD LIMIT 60 characters, counting every letter and space. Keyword and topic first, brand at the end. "
-    "If the offer and the brand do not both fit, shorten the offer words until the whole title is 60 characters or fewer. "
-    "Never write past 60. Never delete the brand to get under 60. "
-    "Description: HARD LIMIT 160 characters, counting every letter and space. Aim for 140–160. "
-    "It must not repeat the title word for word. Never write past 160. "
-    "Explain the actual offering and why it matters to the searcher. "
-    "The same title and description are the Open Graph title, the Open Graph description, and the WebPage schema name and description. "
-    "Read the current title, meta description, Open Graph, and JSON-LD. Stay on that page's concept. "
-    "A one-word H1 such as Home is not the topic — use the schema name, the Open Graph title, or the real heading. "
-    "Do not invent search volume, positions, or mentions that are not in the brief. "
-    "Do not put click counts, session counts, or bounce rates inside the title or description. "
-    "Return exactly four lines:\n"
-    "TITLE: ...\n"
-    "DESCRIPTION: ...\n"
-    "TARGET: the best keyword this listing is written to win\n"
-    "REASON: one sentence naming the page topic, the keyword, and whether this improves on the live listing."
-)
 
 OBJECTIVES = {
     "balanced": (
@@ -195,11 +157,18 @@ def _clean(value: str, limit: int) -> str:
     return cut or text[:limit].rstrip()
 
 
-def _brand_tail(title: str) -> str:
-    text = str(title or "")
-    for sep in (" | ", " – ", " — ", " - "):
-        if sep in text:
-            return text.split(sep)[-1].strip()
+def _brand_tail(title: str, brand: str = "") -> str:
+    """Return the known brand only if it is actually a suffix of the title.
+
+    Never infer a brand from the text after a separator: brand-first titles
+    commonly use a separator before the service phrase.
+    """
+    text = re.sub(r"\s+", " ", str(title or "")).strip()
+    brand = re.sub(r"\s+", " ", str(brand or "")).strip()
+    if not text or not brand:
+        return ""
+    if text.casefold().endswith(brand.casefold()):
+        return brand
     return ""
 
 
@@ -866,10 +835,6 @@ def listing_is_stronger(
     current_d = (current_desc or "").strip()
     if current and title.strip().lower() == current.lower() and desc.strip().lower() == current_d.lower():
         return False
-    if current and _overlap(title, current) >= 0.75:
-        return False
-    if current_d and _overlap(desc, current_d) >= 0.85:
-        return False
     concept = " ".join(str(item) for item in (offers or []) if str(item).strip()) or keyword
     concept_words = _content_tokens(concept)
     title_words = _content_tokens(title)
@@ -884,8 +849,6 @@ def listing_is_stronger(
             continue
         if title.split("|")[0].strip().lower().startswith(name.lower()):
             return False
-    if rival and not meets_competitor(title, rival, keyword):
-        return False
     if listing_fluff_problems(title, desc, evidence=f"{current} {current_d}"):
         return False
     # Live title already targets this keyword: the draft must add a new offer word or a new fact.
@@ -900,7 +863,7 @@ def listing_is_stronger(
                 break
         if not fresh and not alt_hit:
             return False
-    tail = _brand_tail(current)
+    tail = _brand_tail(current, brand)
     if tail and tail.lower() not in (title or "").lower():
         return False
     # Do not treat a thinner rewrite as stronger when the live title already names brand + offers.
@@ -1653,16 +1616,12 @@ def write_title_description(
                 "The draft is not stronger than the live title. Lead with the best keyword, keep a fact only this page can say, "
                 "and do not paste the current listing or the page headings."
             ))
-        if meet.get("title") and not meets_competitor(t, meet, keyword):
-            found.insert(0, (
-                f"The title does not meet “{meet.get('title')}”. Put “{keyword}” near the front and add a fact only this page can say."
-            ))
         return found[:8]
 
     kept_options: list[tuple[str, str]] = []
 
     def keep_option(cand_title: str, cand_desc: str) -> None:
-        t = _fit_title(cand_title or "", _brand_tail(current))
+        t = _fit_title(cand_title or "", _brand_tail(current, brand))
         d = _fit_desc(cand_desc or "")
         if not t or not d:
             return
@@ -1706,7 +1665,8 @@ def write_title_description(
         weak = 0 if listing_is_stronger(
             cand_title, cand_desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
         ) else 1
-        length_penalty = abs(len(cand_title) - 55) + abs(len(cand_desc) - 148)
+        # Length is a constraint, not a quality target; do not reward arbitrary sizes.
+        length_penalty = 0
         return (open_count, weak, length_penalty)
 
     if seo_seed.get("title") and seo_seed.get("description"):
@@ -1771,7 +1731,7 @@ def write_title_description(
                     "Regeneration did not produce a validated, demonstrably stronger listing."
                 )
     query_rows = _query_metric_rows(gsc, queries)
-    tail = _brand_tail(current)
+    tail = _brand_tail(current, brand)
     live_fit = ctr_fit_score(
         current, live_desc, keyword=keyword, brand_tail=tail, current_title=current, query_rows=query_rows,
     )
