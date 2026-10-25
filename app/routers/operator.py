@@ -1317,6 +1317,7 @@ def _page_search_console(db: Session, user: User, url: str, evidence: dict | Non
     merged["status"] = live.get("status") or "partial"
     merged["queryScope"] = "page"
     merged["page_url"] = url
+    merged["links"] = goauth.search_console_links(property_url, live.get("matched_url") or url)
     return merged
 
 
@@ -1947,6 +1948,36 @@ def propose_from_gsc(
             "analytics": _analytics_for_page(db, user.id, url),
         })
 
+    # DataForSEO content generation needs the DB session (quota + spend), which threads cannot share.
+    # Fetch one draft per page here, sequentially, and hand it to the writer as a candidate.
+    try:
+        from app import dfs_meta
+        from app.listing_research import page_anchors, visibility_gap
+
+        site_offers = [str(o) for o in ((scan.get("business") or {}).get("offers") or []) if str(o).strip()]
+        for job in jobs:
+            page_info = job["page"] or {}
+            heads = page_info.get("headings")
+            heads = " | ".join(heads) if isinstance(heads, list) else str(heads or "")
+            topic_seed = str(page_info.get("h1") or page_info.get("schemaName") or page_info.get("title") or "").split("|")[0].strip()
+            page_terms = [str(r.get("query")) for r in ((job.get("gsc") or {}).get("queries") or []) if isinstance(r, dict) and r.get("query")]
+            job["contentSeed"] = dfs_meta.draft_from_research(
+                db,
+                user,
+                keyword=(page_terms[0] if page_terms else (query_terms[0] if query_terms else topic_seed)),
+                topic=topic_seed,
+                offers=site_offers,
+                current_title=str(page_info.get("title") or ""),
+                current_desc=str(page_info.get("description") or ""),
+                page_text=str(page_info.get("text") or ""),
+                headings=heads,
+                rival_title=str(((job.get("rivals") or [{}])[0] or {}).get("title") or ""),
+                anchors=page_anchors(stored_research, job["url"]),
+                visibility_gap=visibility_gap(stored_research),
+            )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("content generation seeds skipped: %s", exc)
+
     def draft(job: dict, taken: list[str] | None = None) -> dict:
         try:
             return write_title_description(
@@ -1962,7 +1993,7 @@ def propose_from_gsc(
                 taken=taken,
                 kind=job["kind"],
                 research=stored_research,
-                # Searchify SEO content generation runs on single-card regenerate (thread-safe session).
+                content_seed=job.get("contentSeed") or {},
             )
         except Exception as exc:  # noqa: BLE001
             return {"aiError": str(exc)[:200]}
@@ -2356,6 +2387,17 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
             "note": "" if after else "The live page could not be read after publishing.",
         }
         verified = result.get("verified")
+        meta_readable = bool((result.get("after") or {}).get("metaTitle") or (result.get("after") or {}).get("metaDescription"))
+        if after is not None and not title_live and not meta_readable:
+            # WordPress returned 200 but the SEO plugin fields are not exposed to REST, so nothing changed.
+            # Do not report a publish that the live page contradicts.
+            verified = False
+            result["verified"] = False
+            result["detail"] = (
+                "WordPress accepted the request, but the live page still shows the old title. "
+                "Install the Searchify SEO Meta helper (deploy/wordpress/searchify-seo-meta.php) so Yoast, "
+                "Rank Math, or SEOPress fields can be written, or clear the page cache and check again."
+            )
         row.proposed = proposed
         row.applied_at = datetime.utcnow()
         row.status = "monitoring" if verified is not False else "published_unverified"

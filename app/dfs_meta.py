@@ -6,7 +6,16 @@ Fails soft when the provider is off, out of credit, or returns nothing usable.
 
 from __future__ import annotations
 
+import logging
+
 from app import research
+
+log = logging.getLogger(__name__)
+
+# DataForSEO generate_meta_tags accepts 1–500 tokens of "text". ~3.6 characters per token for English
+# marketing copy, so 1,700 characters keeps a safe margin. Sending more made the call fail and the
+# failure was swallowed, so the content API never contributed a draft.
+SOURCE_CHAR_LIMIT = 1700
 
 
 def pack_source_text(
@@ -43,10 +52,15 @@ def pack_source_text(
     body = " ".join(str(page_text or "").split())
     if headings:
         parts.append("Headings: " + " | ".join(str(headings).split("|")[:8]))
-    if body:
-        parts.append(body[:1800])
+    head = "\n".join(parts)
+    room = max(0, SOURCE_CHAR_LIMIT - len(head) - 1)
+    if body and room > 200:
+        cut = body[:room]
+        if len(body) > room and " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        parts.append(cut)
     text = "\n".join(parts)
-    return text[:4500]
+    return text[:SOURCE_CHAR_LIMIT]
 
 
 def generate_meta_tags(text: str, *, creativity: float = 0.75) -> dict:
@@ -58,10 +72,12 @@ def generate_meta_tags(text: str, *, creativity: float = 0.75) -> dict:
         result, cost = research._call(
             "POST",
             "/content_generation/generate_meta_tags/live",
-            [{"text": source[:4500], "creativity": max(0.1, min(1.0, float(creativity)))}],
+            # Field is creativity_index (0–1) per the DataForSEO Content Generation API.
+            [{"text": source[:SOURCE_CHAR_LIMIT], "creativity_index": max(0.1, min(1.0, float(creativity)))}],
             timeout=45,
         )
-    except research.ResearchError:
+    except research.ResearchError as exc:
+        log.warning("DataForSEO generate_meta_tags failed: %s", exc)
         return {}
     row = (result or [{}])[0] or {}
     title = " ".join(str(row.get("title") or "").split())

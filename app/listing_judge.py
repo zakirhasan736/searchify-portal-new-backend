@@ -37,28 +37,27 @@ WIN_MARGIN = 4.0  # On a 0–100 scale the winner must clear the live listing by
 # ---------------------------------------------------------------------------
 
 GENERATOR_SYSTEM = (
-    "You are the best SEO copywriter in the world, writing the Google title tag and meta description for ONE page. "
-    "Your job is to write listings that beat the current live listing on relevance AND click appeal. "
-    "Echoing the live listing is a failure; small reshuffles of it are a failure.\n\n"
-    "What a winning listing does:\n"
-    "- Title: the best keyword (or its natural variant) in the first 3–5 words, then the most persuasive page-true "
-    "differentiator (place, audience, specific service, concrete benefit), then the brand at the end after ' | '. "
-    "Reads like a human headline, not a keyword list. 50–60 characters. Never more than 60.\n"
-    "- Description: 140–158 characters, one or two complete sentences. Lead with what the searcher gets, add one concrete "
-    "page-true detail that competitors cannot claim, end with a soft action (e.g. 'Get a quote', 'See plans', "
-    "'Book a call') only if the page offers it. Use a secondary keyword naturally. Never repeat the title.\n"
-    "- Matches search intent: commercial pages sell the offer, homepages state what the business is and where, "
-    "articles promise the answer.\n\n"
+    "You write the Google title tag and meta description for ONE page of ONE website. "
+    "Everything you write comes from that website's own evidence in the brief: its page copy, headings, offers, "
+    "places, brand, Search Console queries and keyword research. Nothing is preset; every site has its own concept.\n"
+    "Your listings must beat the current live listing on relevance and click appeal. Echoing it, or reshuffling its "
+    "words, is a failure.\n\n"
+    "Format (follow exactly):\n"
+    "- Title: follow the TITLE FORMAT line in the brief (brand position and separator). The page's best keyword, "
+    "in the words searchers use, comes first in the non-brand part. Readable as a headline, not a keyword list. "
+    "50–60 characters, never more than 60.\n"
+    "- Description: 140–158 characters, one or two complete sentences built from this page's own copy: what the "
+    "searcher gets, one detail this page states, and a next step only if the page itself offers one. "
+    "Use a second relevant keyword naturally. Never repeat the title.\n\n"
     "Hard rules:\n"
-    "- Use only facts in the brief. Never invent prices, years, counts, awards, reviews, guarantees, or results.\n"
-    "- No filler: welcome, discover, unlock, elevate, seamless, cutting-edge, leading, world-class, one-stop, "
-    "trusted, look no further, best-in-class.\n"
+    "- Use only facts in the brief. Never invent prices, years, counts, awards, reviews, guarantees, places or results.\n"
+    "- No generic filler or hype words; every word must be specific to this page.\n"
     "- Keep the brand when the live title has it. Shorten other words instead.\n"
     "- Stay on this page's topic. Do not name portfolio clients on home or service pages.\n"
     "- Count characters. Titles over 60 or descriptions over 160 are thrown away, not shortened.\n\n"
-    "Write 5 genuinely different candidates, each with a different lead angle:\n"
-    "1 keyword-first, 2 benefit/outcome-first, 3 audience or place-specific, 4 differentiator-first, "
-    "5 intent-matched (how the searcher phrases the need).\n\n"
+    "Write 5 genuinely different candidates, each leading with a different angle that this page's evidence supports "
+    "(the main keyword, the outcome for the searcher, the audience or place the page names, what sets the page apart, "
+    "the way searchers phrase the need in the Search Console queries).\n\n"
     "Return only this format, nothing else:\n"
     "TITLE: ...\nDESCRIPTION: ...\n"
     "(repeat for all 5)\n"
@@ -110,17 +109,22 @@ def _norm(value: str) -> str:
 def _split_brand(title: str, brand_tail: str) -> tuple[str, str, str]:
     """(head, separator, brand) when the title ends with the brand; otherwise (title, '', '')."""
     tail = (brand_tail or "").strip().lower()
+    tail_words = set(re.findall(r"[a-z0-9]+", tail)) - {"inc", "llc", "ltd", "co", "corp", "company"}
     for sep in _SEPS:
         if sep in title:
             left, right = title.rsplit(sep, 1)
-            if not tail or right.strip().lower() == tail:
+            right_words = set(re.findall(r"[a-z0-9]+", right.lower()))
+            if not tail or right.strip().lower() == tail or (tail_words and tail_words <= right_words):
                 if tail or len(right.split()) <= 4:
                     return left.strip(), sep, right.strip()
     return title, "", ""
 
 
-def fit_title_strict(title: str, brand_tail: str = "") -> str:
-    """Return a title within 60 chars / ~580px without cutting a phrase. '' when it cannot fit cleanly."""
+def fit_title_strict(title: str, brand_tail: str = "", *, brand_first: bool = False) -> str:
+    """Return a title within 60 chars / ~580px without cutting a phrase. '' when it cannot fit cleanly.
+
+    brand_first keeps a leading “Brand | …” and shortens only the part after it.
+    """
     text = _norm(title).rstrip(" |–—-:")
     if not text:
         return ""
@@ -130,6 +134,23 @@ def fit_title_strict(title: str, brand_tail: str = "") -> str:
 
     if ok(text):
         return text
+    if brand_first:
+        for sep in _SEPS:
+            if sep in text:
+                lead, rest = text.split(sep, 1)
+                shorter = fit_title_strict(rest, "")
+                # Shrink the non-brand part to the room left after “Brand | ”.
+                room = TITLE_MAX - len(lead) - len(sep)
+                items = [p.strip() for p in re.split(r",\s*|\s+&\s+|\s+and\s+|\s+\|\s+", rest) if p.strip()]
+                while items:
+                    joined = items[0] if len(items) == 1 else ", ".join(items[:-1]) + " & " + items[-1]
+                    if len(joined) <= room and ok(f"{lead}{sep}{joined}"):
+                        return f"{lead}{sep}{joined}"
+                    items.pop()
+                if shorter and ok(f"{lead}{sep}{shorter}"):
+                    return f"{lead}{sep}{shorter}"
+                return ""
+        return ""
     head, sep, brand = _split_brand(text, brand_tail)
     suffix = f"{sep}{brand}" if brand else ""
     # Drop middle " | " segments of the head, right to left.
@@ -164,6 +185,14 @@ def fit_desc_strict(desc: str) -> str:
         cut = max(cut, len(window) - 1)
     if cut >= 100:
         return window[: cut + 1].strip()
+    # One long sentence: end it at the last clause break that keeps a useful description.
+    room = text[: DESC_MAX]
+    for marker in (" — ", " – ", "; ", ", ", " with ", " and "):
+        at = room.rfind(marker)
+        if at >= 110:
+            clause = room[:at].rstrip(" ,;:–—-")
+            if not _DANGLING.search(clause):
+                return clause + "."
     return ""
 
 
@@ -252,7 +281,7 @@ def judge_listings(evidence: str, listings: list[dict], *, salt: str = "") -> li
         )
         data = _extract_json(text)
     except Exception as exc:  # noqa: BLE001
-        log.info("listing judge unavailable: %s", exc)
+        log.warning("listing judge unavailable, falling back to heuristic rules: %s", exc)
         return None
     out: list[dict | None] = [None] * len(listings)
     for item in data.get("items") or []:
@@ -273,9 +302,14 @@ def judge_listings(evidence: str, listings: list[dict], *, salt: str = "") -> li
             "accurate": accuracy >= 6,
             "note": str(item.get("note") or "")[:200],
         }
-    if any(row is None for row in out):
+    # The live listing (index 0 when present) must be scored; unscored drafts are dropped, not fatal.
+    if out[0] is None:
+        log.warning("listing judge skipped the first listing; falling back to heuristic rules")
         return None
-    return out  # type: ignore[return-value]
+    return [
+        row if row is not None else {**listings[i], "scores": {}, "score": 0.0, "accurate": False, "note": "not scored"}
+        for i, row in enumerate(out)
+    ]
 
 
 def judge_evidence(
@@ -292,9 +326,13 @@ def judge_evidence(
     page_text: str,
     queries: list[str],
     rival_titles: list[str],
+    research: str = "",
+    search_console: str = "",
 ) -> str:
     return "\n".join(
         [
+            f"Keyword research (DataForSEO, matched to this page):\n{research.strip()[:900] or '(none)'}",
+            f"Search Console for this URL: {search_console or '(not connected)'}",
             f"URL: {url}",
             f"Page type: {kind or 'page'}",
             f"Page topic: {topic or '(unknown)'}",
