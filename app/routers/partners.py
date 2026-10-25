@@ -24,6 +24,91 @@ router = APIRouter(prefix="/api/v1/partners", tags=["partners"])
 
 PRICE = {"Solo": 29, "Pro": 79, "Premium": 399}
 
+# The two partner programs, as the business set them. A partner's rate starts at `base` and moves to `top`
+# for good once STEP_UP_REFERRALS referred customers make a first payment within STEP_UP_DAYS.
+PROGRAMS = {
+    "founding": {
+        "key": "founding",
+        "name": "Founding partner",
+        "who": "Investors and developers",
+        "base": 0.35,
+        "top": 0.40,
+    },
+    "standard": {
+        "key": "standard",
+        "name": "Affiliate",
+        "who": "Creators and affiliates on TikTok, Facebook, Instagram, YouTube, blogs and newsletters",
+        "base": 0.20,
+        "top": 0.25,
+    },
+}
+STEP_UP_REFERRALS = 10
+STEP_UP_DAYS = 183
+
+
+def program_of(profile: dict | None) -> dict:
+    return PROGRAMS["founding" if (profile or {}).get("tier") == "founding" else "standard"]
+
+
+def rate_of(profile: dict | None) -> float:
+    """The partner's current commission rate (the program's starting rate when none is stored)."""
+    try:
+        value = float((profile or {}).get("rate") or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return value if value > 0 else program_of(profile)["base"]
+
+
+def _recent_qualified(profile: dict, now: datetime | None = None) -> int:
+    now = now or datetime.utcnow()
+    cutoff = now - timedelta(days=STEP_UP_DAYS)
+    count = 0
+    for stamp in profile.get("qualifiedAt") or []:
+        try:
+            if datetime.fromisoformat(str(stamp).replace("Z", "")) >= cutoff:
+                count += 1
+        except ValueError:
+            continue
+    return count
+
+
+def program_status(profile: dict | None, now: datetime | None = None) -> dict:
+    """What the partner centre and HQ show about the partner's program and the step-up."""
+    profile = profile or {}
+    prog = program_of(profile)
+    rate = rate_of(profile)
+    recent = _recent_qualified(profile, now)
+    stepped = rate >= prog["top"] - 1e-9
+    return {
+        **prog,
+        "rate": rate,
+        "qualified6m": recent,
+        "need": STEP_UP_REFERRALS,
+        "toGo": 0 if stepped else max(0, STEP_UP_REFERRALS - recent),
+        "steppedUp": stepped,
+        "rateUpAt": profile.get("rateUpAt") or "",
+    }
+
+
+def _count_qualified(db: Session, partner: User, paid_at: datetime) -> None:
+    """A referred customer made their first payment: count it, and step the rate up when the bar is met."""
+    profile = {**_default_profile(partner), **_feature(db, partner.id, "partner-profile")}
+    stamps = [*(profile.get("qualifiedAt") or []), paid_at.isoformat(timespec="seconds")][-200:]
+    profile["qualifiedAt"] = stamps
+    profile["qualified"] = int(profile.get("qualified") or 0) + 1
+    prog = program_of(profile)
+    if _recent_qualified(profile, paid_at) >= STEP_UP_REFERRALS and rate_of(profile) < prog["top"]:
+        profile["rate"] = prog["top"]
+        profile["rateUpAt"] = paid_at.strftime("%b %d, %Y").replace(" 0", " ")
+        mailer.send(
+            partner.email,
+            f"Your Searchify rate is now {int(round(prog['top'] * 100))}%",
+            f"Hi {profile.get('displayName') or ''},\n\n{STEP_UP_REFERRALS} customers you referred started paying within "
+            f"6 months, so your commission is now {int(round(prog['top'] * 100))}% on every payment from here on. "
+            "It stays at this rate for good.\n",
+        )
+    _save_feature(db, partner.id, "partner-profile", "Partner profile", profile)
+
 
 class ApplyBody(BaseModel):
     name: str
@@ -97,7 +182,7 @@ def _default_profile(user: User) -> dict:
         "email": user.email,
         "handle": handle,
         "tier": "standard",
-        "rate": 0.3,
+        "rate": PROGRAMS["standard"]["base"],
         "since": datetime.utcnow().strftime("%b %Y"),
         "qualified": 0,
     }
@@ -271,7 +356,7 @@ def ensure_partner_account(db: Session) -> User:
                 "email": email,
                 "handle": "samortiz",
                 "tier": "standard",
-                "rate": 0.3,
+                "rate": PROGRAMS["standard"]["base"],
                 "since": "May 2026",
                 "qualified": 38,
             },
@@ -475,7 +560,7 @@ def record_payment(db: Session, customer: User, amount: float, plan: str, paid_a
     if paid_at - joined > timedelta(days=365 * COMMISSION_MONTHS / 12):
         return 0.0
     profile = {**_default_profile(partner), **_feature(db, partner.id, "partner-profile")}
-    rate = float(profile.get("rate") or 0.3)
+    rate = rate_of(profile)
     commission = round(float(amount) * rate, 2)
     label = PLAN_LABEL.get(str(plan or "").lower(), str(plan or "").title())
     ledger = {**_empty_ledger(), **_feature(db, partner.id, "partner-ledger")}
@@ -500,6 +585,7 @@ def record_payment(db: Session, customer: User, amount: float, plan: str, paid_a
     _save_feature(db, partner.id, "partner-ledger", "Partner ledger", ledger)
     if first:
         _bump(db, partner, "paying")
+        _count_qualified(db, partner, paid_at)
     return commission
 
 
@@ -509,7 +595,7 @@ def record_refund(db: Session, customer: User, amount: float, plan: str) -> floa
     if partner is None or amount <= 0:
         return 0.0
     profile = {**_default_profile(partner), **_feature(db, partner.id, "partner-profile")}
-    rate = float(profile.get("rate") or 0.3)
+    rate = rate_of(profile)
     commission = round(float(amount) * rate, 2)
     label = PLAN_LABEL.get(str(plan or "").lower(), str(plan or "").title())
     ledger = live_ledger(_feature(db, partner.id, "partner-ledger"))
@@ -536,7 +622,7 @@ def _unique_handle(db: Session, name: str, email: str) -> str:
     return handle
 
 
-def approve_application(db: Session, owner_id: int, app_id: str, *, rate: float = 0.3, founding: bool = False) -> dict:
+def approve_application(db: Session, owner_id: int, app_id: str, *, rate: float | None = None, founding: bool = False) -> dict:
     """Create the partner account, mark the application approved, and email a set-password link."""
     apps = _feature(db, owner_id, "partner-applications")
     rows = list(apps.get("rows") or [])
@@ -545,6 +631,13 @@ def approve_application(db: Session, owner_id: int, app_id: str, *, rate: float 
         raise HTTPException(404, "Application not found")
     if row.get("status") == "declined":
         raise HTTPException(409, "This application was declined.")
+    prog = PROGRAMS["founding" if founding else "standard"]
+    rate = prog["base"] if rate is None else float(rate)
+    if not prog["base"] - 1e-9 <= rate <= prog["top"] + 1e-9:
+        raise HTTPException(
+            400,
+            f"{prog['name']} rates run from {int(round(prog['base'] * 100))}% to {int(round(prog['top'] * 100))}%.",
+        )
     email = str(row.get("email") or "").lower()
     user = db.query(User).filter(User.email == email).one_or_none()
     if user is not None and user.role != "ROLE_PARTNER":
@@ -580,10 +673,13 @@ def approve_application(db: Session, owner_id: int, app_id: str, *, rate: float 
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
     setup = f"{config.PUBLIC_SITE_URL}/partners/login?setup={make_password_token(user, 'setup', SETUP_MINUTES)}"
     link = f"{config.PUBLIC_SITE_URL}/?ref={profile['handle']}"
+    top_pct = int(round(prog["top"] * 100))
+    rise = "" if rate >= prog["top"] else f", rising to {top_pct}% once {STEP_UP_REFERRALS} of your referrals start paying within 6 months"
     emailed = mailer.send(
         email,
         "You're approved: welcome to the Searchify partner program",
-        f"Hi {row.get('name') or ''},\n\nYour Searchify partner application is approved at {int(round(rate * 100))}%.\n\n"
+        f"Hi {row.get('name') or ''},\n\nYour Searchify partner application is approved: {prog['name']} program, "
+        f"{int(round(rate * 100))}% of every payment for each customer's first 12 months{rise}.\n\n"
         f"1. Set your password (link works for 3 days):\n{setup}\n\n"
         f"2. Your referral link:\n{link}\n\n"
         "Remember to say you earn a commission when you share it.\n",
@@ -624,6 +720,7 @@ def me(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
         "profile": profile,
         "payout": payout,
         "tier": profile.get("tier") or "standard",
+        "program": program_status(profile),
     }
 
 
@@ -632,7 +729,7 @@ def overview(db: Session = Depends(get_db), user: User = Depends(get_current_use
     _require_partner(user)
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
     ledger = live_ledger(_feature(db, user.id, "partner-ledger"))
-    rate = float(profile.get("rate") or 0.3)
+    rate = rate_of(profile)
     mix = ledger.get("mix") or {"Solo": 0, "Pro": 0, "Premium": 0}
     monthly = sum(int(mix.get(k) or 0) * PRICE[k] * rate for k in PRICE)
     ref_mrr = sum(int(mix.get(k) or 0) * PRICE[k] for k in PRICE)
@@ -641,6 +738,7 @@ def overview(db: Session = Depends(get_db), user: User = Depends(get_current_use
         "profile": profile,
         "rate": rate,
         "tier": profile.get("tier") or "standard",
+        "program": program_status(profile),
         "qualified": int(profile.get("qualified") or 0),
         "since": profile.get("since") or "this year",
         "handle": profile.get("handle") or user.username,
@@ -664,7 +762,7 @@ def earnings(db: Session = Depends(get_db), user: User = Depends(get_current_use
     _require_partner(user)
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
     ledger = live_ledger(_feature(db, user.id, "partner-ledger"))
-    rate = float(profile.get("rate") or 0.3)
+    rate = rate_of(profile)
     totals = ledger.get("totals") or {
         "cleared": 0,
         "hold": float(ledger.get("hold") or 0),
@@ -702,3 +800,150 @@ def put_payout(body: PayoutBody, db: Session = Depends(get_db), user: User = Dep
     }
     _save_feature(db, user.id, "partner-payout", "Partner payout", payload)
     return {"ok": True, "payout": payload}
+
+
+# --- Pitch writer: campaign messages for a partner, with their link and the commission disclosure -----------
+
+WRITER_DAILY_LIMIT = 40
+CHANNELS = {
+    "tiktok": ("TikTok or Reels caption", 300),
+    "instagram": ("Instagram post", 600),
+    "facebook": ("Facebook post or group", 700),
+    "youtube": ("YouTube description", 900),
+    "linkedin": ("LinkedIn post", 900),
+    "x": ("X / Twitter post", 270),
+    "email": ("Email or newsletter", 1400),
+    "blog": ("Blog or review paragraph", 1400),
+    "whatsapp": ("WhatsApp or DM", 400),
+}
+AUDIENCES = {
+    "owners": "small business owners with a WordPress site",
+    "agencies": "web designers and agencies who look after client sites",
+    "bloggers": "bloggers and content creators on WordPress",
+    "local": "local businesses that want more customers from Google",
+    "stores": "WooCommerce store owners",
+}
+TONES = {"friendly": "warm and plain-spoken", "expert": "knowledgeable and specific", "bold": "punchy and confident, never exaggerated"}
+PRODUCT_FACTS = (
+    "Searchify is an SEO tool for WordPress sites. It connects to the site, scans every page, and suggests better page titles, "
+    "meta descriptions, keywords to target (from real search data) and fixes for broken or slow pages. It reads Google Search Console "
+    "and Analytics so results are measured. Nothing goes live without the owner's approval, every change is checked live, and any change "
+    "can be undone. Plans: Solo $29/month, Pro $79/month, Premium $399/month."
+)
+
+
+class WriterBody(BaseModel):
+    channel: str = "instagram"
+    audience: str = "owners"
+    tone: str = "friendly"
+    angle: str = Field(default="", max_length=300)  # what the partner wants to stress, in their words
+
+
+def _disclosure(channel: str) -> str:
+    if channel in ("x", "tiktok"):
+        return "#ad I earn a commission if you sign up."
+    return "I earn a commission if you sign up through my link, at no extra cost to you."
+
+
+def _template_pitch(body: WriterBody, link: str, seed: int) -> str:
+    who = AUDIENCES.get(body.audience, AUDIENCES["owners"])
+    hooks = {
+        "friendly": [
+            "If your WordPress site isn't showing up on Google, this helped me.",
+            "Quick tip for anyone running a WordPress site:",
+            "I finally stopped guessing at SEO.",
+        ],
+        "expert": [
+            "Most WordPress sites lose clicks to weak titles and descriptions.",
+            "Search Console tells you what's wrong. Searchify fixes it, page by page.",
+            "The fastest SEO wins are usually titles, descriptions and broken pages.",
+        ],
+        "bold": [
+            "Stop letting your best pages hide on page 2.",
+            "Your WordPress site deserves better titles than \"Home\".",
+            "SEO without the guesswork.",
+        ],
+    }[body.tone if body.tone in TONES else "friendly"]
+    middles = [
+        "Searchify scans every page, writes better titles and descriptions, finds the keywords people actually search for, and nothing goes live until you approve it.",
+        "It reads your real Google data, suggests fixes for each page, checks every change live, and anything can be undone in one click.",
+        "It finds the pages that are close to ranking, suggests the changes, and measures the results in Search Console, with your approval at every step.",
+    ]
+    hook = hooks[seed % len(hooks)]
+    middle = middles[(seed // 3) % len(middles)]
+    angle = f" {body.angle.strip().rstrip('.')}." if body.angle.strip() else ""
+    for_who = f"Made for {who}."
+    disc = _disclosure(body.channel)
+    if body.channel == "email":
+        return (
+            f"Subject: The SEO tool I use on WordPress sites\n\n{hook}\n\n{middle}{angle} {for_who}\n\n"
+            f"Plans start at $29 a month: {link}\n\nHeads up: this is a partner link. {disc}"
+        )
+    if body.channel in ("x", "tiktok"):
+        return f"{hook} {middle.split(',')[0]}.{angle} {link} {disc}"
+    return f"{hook}\n\n{middle}{angle} {for_who}\n\nTry it: {link}\n\n{disc}"
+
+
+def _clean_pitch(text: str, link: str, channel: str) -> str:
+    text = (text or "").strip().strip('"').strip()
+    # The link and the disclosure must always be there; rankings can never be promised.
+    if link not in text:
+        text = f"{text}\n\n{link}"
+    lowered = text.lower()
+    if "commission" not in lowered and "#ad" not in lowered and "affiliate" not in lowered:
+        text = f"{text}\n\n{_disclosure(channel)}"
+    return text
+
+
+@router.post("/write-message")
+def write_message(body: WriterBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Draft one campaign message for the partner. Uses AI when the server has it, otherwise our templates."""
+    _require_partner(user)
+    if body.channel not in CHANNELS:
+        raise HTTPException(400, "Pick a channel from the list.")
+    profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
+    link = f"{config.MARKETING_SITE_URL.replace('https://', '').replace('http://', '')}/?ref={profile['handle']}"
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    usage = _feature(db, user.id, "partner-writer-usage")
+    count = int(usage.get("n") or 0) if usage.get("day") == today else 0
+    if count >= WRITER_DAILY_LIMIT:
+        raise HTTPException(429, f"That's {WRITER_DAILY_LIMIT} drafts today. The writer opens again tomorrow.")
+    _save_feature(db, user.id, "partner-writer-usage", "Partner writer usage", {"day": today, "n": count + 1})
+
+    label, limit = CHANNELS[body.channel]
+    source = "template"
+    text = ""
+    from app.openai_client import chat_text, openai_configured
+
+    if openai_configured():
+        system = (
+            "You write short affiliate marketing messages for partners of Searchify. Facts you may use, and nothing beyond them:\n"
+            f"{PRODUCT_FACTS}\n\nRules: never promise rankings, traffic or results; never invent numbers, reviews, discounts or free trials; "
+            "never pretend to be Searchify; write in the first person as the partner; include the referral link exactly once; "
+            "include a clear commission disclosure near the top or right next to the link (US FTC rules). "
+            "Return only the message text, no quotes or notes."
+        )
+        prompt = (
+            f"Channel: {label} (keep it under {limit} characters).\nAudience: {AUDIENCES.get(body.audience, AUDIENCES['owners'])}.\n"
+            f"Tone: {TONES.get(body.tone, TONES['friendly'])}.\nReferral link: {link}\n"
+            + (f"What the partner wants to stress: {body.angle.strip()}\n" if body.angle.strip() else "")
+            + ("Start with a 'Subject:' line, then the email body.\n" if body.channel == "email" else "")
+        )
+        try:
+            text, _model, _role = chat_text(system=system, user=prompt, kind="partner-pitch", max_tokens=600)
+            if "guarantee" in text.lower():
+                text = ""
+            else:
+                source = "ai"
+        except Exception as exc:  # noqa: BLE001 - the template keeps the button useful when AI fails
+            log.warning("partner writer AI failed: %s", exc)
+            text = ""
+    if not text:
+        text = _template_pitch(body, link, count + user.id)
+    return {
+        "text": _clean_pitch(text, link, body.channel),
+        "source": source,
+        "channel": label,
+        "left": WRITER_DAILY_LIMIT - count - 1,
+    }

@@ -327,7 +327,7 @@ def overview(db: Session, rows: list[dict], problems_count: int) -> dict:
 
 
 def partner_rows(db: Session) -> list[dict]:
-    from app.routers.partners import _default_profile, live_ledger
+    from app.routers.partners import _default_profile, live_ledger, program_status, rate_of
 
     rows = []
     for user in db.query(User).filter(User.role == "ROLE_PARTNER").order_by(User.id).all():
@@ -347,12 +347,13 @@ def partner_rows(db: Session) -> list[dict]:
         paid = sum(float(item[1]) for item in (ledger.get("payouts") or []) if isinstance(item, (list, tuple)) and len(item) > 1)
         life = round(paid + cleared + hold, 2)
         founding = profile.get("tier") == "founding"
-        rate = int(round(float(profile.get("rate") or (0.35 if founding else 0.3)) * 100))
+        rate = int(round(rate_of(profile) * 100))
+        program = program_status(profile)
         tax = bool(payout.get("certified") or payout.get("legalName") or payout.get("taxId"))
         method = str(payout.get("method") or "Not set")
         flag = "" if tax else "Tax details missing"
         since = profile.get("since") or _when(user.created_at)
-        label = "Founding partner" if founding else "Partner"
+        label = "Founding partner" if founding else "Affiliate"
         mrr = sum(int(mix.get(name) or 0) * {"Solo": 29, "Pro": 79, "Premium": 399}[name] for name in ("Solo", "Pro", "Premium"))
         rows.append({
             "id": f"u{user.id}",
@@ -363,7 +364,10 @@ def partner_rows(db: Session) -> list[dict]:
             "runType": f"{label} · {rate}%",
             "rate": rate,
             "founding": founding,
-            "qual": signups,
+            "program": program,
+            # Qualified = referred customers who started paying within the last 6 months (drives the step-up).
+            "qual": program["qualified6m"],
+            "signups": signups,
             "paying": paying,
             "life": life,
             "flag": flag,
@@ -405,6 +409,7 @@ def partner_book(db: Session) -> dict:
             "type": person["type"],
             "rate": person["rate"],
             "founding": person["founding"],
+            "program": person["program"],
             "qual": person["qual"],
             "paying": person["paying"],
             "life": person["life"],
@@ -426,6 +431,8 @@ def partner_book(db: Session) -> dict:
             "id": person["id"],
             "name": person["name"],
             "qual": person["qual"],
+            "rate": person["rate"],
+            "program": person["program"],
             "mrr": person["mrr"],
             "held": held,
         })
