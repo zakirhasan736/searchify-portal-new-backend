@@ -49,6 +49,7 @@ class ShareholdersStateBody(BaseModel):
     prepared: bool | None = None
     quarterly: str | None = None
     howard: list | None = None
+    holders: list[dict] | None = None  # cap table: [{name, pct 0-1, shares, where, wh 0-0.5, note}]
 
 
 def _require_admin(user: User) -> User:
@@ -854,8 +855,33 @@ def put_shareholders(
         state["quarterly"] = body.quarterly
     if body.howard is not None:
         state["howard"] = body.howard
+    if body.holders is not None:
+        clean = []
+        for row in body.holders[:50]:
+            name = " ".join(str(row.get("name") or "").split())[:80]
+            if not name:
+                continue
+            try:
+                pct = float(row.get("pct") or 0)
+                wh = float(row.get("wh") or 0)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"Check the numbers for {name}.")
+            if not 0 < pct <= 1 or not 0 <= wh <= 0.5:
+                raise HTTPException(400, f"{name}: ownership must be above 0% and at most 100%, withholding 0–50%.")
+            clean.append({
+                "name": name,
+                "pct": round(pct, 6),
+                "shares": " ".join(str(row.get("shares") or "").split())[:30],
+                "where": " ".join(str(row.get("where") or "").split())[:40],
+                "wh": round(wh, 4),
+                "note": " ".join(str(row.get("note") or "").split())[:120],
+            })
+        if sum(r["pct"] for r in clean) > 1.0001:
+            raise HTTPException(400, "Ownership adds up to more than 100%.")
+        state["holders"] = clean
     _save_feature(db, admin.id, "hq-shareholders-state", "HQ shareholders state", state)
     rows = hq_live.customer_list(db)
     data = hq_live.shareholders(db, rows)
     data["state"] = {**data["state"], **state}
+    data["holders"] = state.get("holders") or []
     return {"ok": True, "live": True, **data}

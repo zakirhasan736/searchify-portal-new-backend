@@ -100,3 +100,13 @@ def test_problem_email_is_honest_without_smtp(env):
     assert "nothing was sent" in r["message"]
     assert not r["emailed"].get(item["id"])
     assert env["sent"] and env["sent"][-1][0] == env["customer"].email
+
+
+def test_cap_table_is_validated_and_saved(env):
+    c = env["c"]
+    bad = c.put("/api/v1/hq/shareholders", json={"holders": [{"name": "A", "pct": 0.7}, {"name": "B", "pct": 0.5}]})
+    assert bad.status_code == 400
+    ok = c.put("/api/v1/hq/shareholders", json={"holders": [{"name": "Founder", "pct": 0.8, "shares": 8000, "where": "US", "wh": 0, "note": ""}]})
+    assert ok.status_code == 200
+    assert ok.json()["holders"][0]["name"] == "Founder"
+    assert c.get("/api/v1/hq/shareholders").json()["holders"][0]["pct"] == 0.8
