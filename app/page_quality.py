@@ -180,9 +180,27 @@ def _allowed_name_tokens(brand: str, places: list[str] | None, offers: list[str]
     return {part for part in re.findall(r"[a-z0-9]+", blob.lower()) if len(part) > 2}
 
 
+# Title-cased headings and CTAs ("Free Consultation", "Small Business Owners", "Our Process") sit next to
+# words like "work" or "client" on almost every page. They are not client names, and treating them as
+# such rejected good, on-topic suggestions.
+_GENERIC_NAME_WORDS = {
+    "our", "your", "the", "and", "for", "with", "get", "free", "quote", "call", "contact", "book", "now", "today",
+    "learn", "more", "read", "view", "see", "all", "new", "about", "home", "services", "service", "solutions",
+    "solution", "business", "businesses", "small", "local", "owners", "owner", "team", "process", "approach",
+    "consultation", "consult", "started", "start", "plan", "plans", "pricing", "price", "support", "care", "repair",
+    "installation", "maintenance", "custom", "professional", "quality", "results", "work", "works", "case",
+    "studies", "study", "project", "projects", "client", "clients", "portfolio", "selected", "featured", "recent",
+    "why", "choose", "how", "what", "who", "faq", "faqs", "questions", "reviews", "review", "testimonials",
+    "marketing", "digital", "website", "websites", "design", "development", "seo", "social", "media", "ads",
+    "brand", "branding", "strategy", "content", "online", "search", "engine", "optimization", "management",
+    "residential", "commercial", "industrial", "emergency", "company", "agency", "group", "experts", "expert",
+    "years", "experience", "trusted", "best", "top", "product", "products", "shop", "store", "collection",
+}
+
+
 def portfolio_client_names(page_text: str, headings: str = "", *, brand: str = "", places: list[str] | None = None, offers: list[str] | None = None) -> list[str]:
     """Proper names that appear in portfolio/case-study context on the page — not the site owner."""
-    allowed = _allowed_name_tokens(brand, places, offers)
+    allowed = _allowed_name_tokens(brand, places, offers) | _GENERIC_NAME_WORDS
     blob = f"{page_text or ''} {headings or ''}"
     found: list[str] = []
     for match in _PROPER_NAME.finditer(blob):
