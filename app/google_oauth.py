@@ -223,8 +223,170 @@ def fetch_gsc_top_queries(access_token: str, site_url: str, days: int = 28, row_
     return fetch_gsc_dimension(access_token, site_url, "query", days, row_limit)
 
 
+def fetch_gsc_page_queries(access_token: str, site_url: str, page_url: str, days: int = 28, row_limit: int = 10) -> list[list]:
+    """Queries, clicks, impressions, CTR, and position for one page."""
+    page = str(page_url or "").strip()
+    if not page:
+        return []
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    body = {
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+        "dimensions": ["query"],
+        "dimensionFilterGroups": [
+            {"filters": [{"dimension": "page", "operator": "equals", "expression": page}]}
+        ],
+        "rowLimit": row_limit,
+    }
+    from urllib.parse import quote
+
+    url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
+    with httpx.Client(timeout=45.0) as client:
+        response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
+    if response.status_code >= 400:
+        raise RuntimeError(f"GSC page queries failed: {response.text[:300]}")
+    rows = []
+    for row in response.json().get("rows") or []:
+        keys = row.get("keys") or [""]
+        rows.append(
+            [
+                keys[0],
+                str(int(row.get("clicks") or 0)),
+                str(int(row.get("impressions") or 0)),
+                f"{(row.get('ctr') or 0) * 100:.1f}%",
+                f"{row.get('position') or 0:.1f}",
+            ]
+        )
+    return rows
+
+
 def fetch_gsc_top_pages(access_token: str, site_url: str, days: int = 28, row_limit: int = 25) -> list[list]:
     return fetch_gsc_dimension(access_token, site_url, "page", days, row_limit)
+
+
+def _gsc_page_variants(page_url: str) -> list[str]:
+    """URLs to try against a Search Console page filter. Order preserves the caller's URL."""
+    raw = " ".join(str(page_url or "").split())
+    if not raw:
+        return []
+    variants = [raw]
+    if raw.endswith("/"):
+        variants.append(raw.rstrip("/") or raw)
+    else:
+        variants.append(raw + "/")
+    seen = set()
+    ordered = []
+    for item in variants:
+        if item and item not in seen:
+            seen.add(item)
+            ordered.append(item)
+    return ordered
+
+
+def _gsc_query(access_token: str, site_url: str, body: dict) -> list[dict]:
+    from urllib.parse import quote
+
+    url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
+    with httpx.Client(timeout=45.0) as client:
+        response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
+    if response.status_code >= 400:
+        raise RuntimeError(f"GSC page query failed: {response.text[:300]}")
+    return list(response.json().get("rows") or [])
+
+
+def fetch_gsc_page_bundle(
+    access_token: str,
+    site_url: str,
+    page_url: str,
+    days: int = 28,
+    row_limit: int = 25,
+) -> dict:
+    """Page-specific Search Console totals and queries.
+
+    A successful response with no rows is partial, not proof of zero demand.
+    The property URL is kept separate from the page URL.
+    """
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    date_range = {"start": start.isoformat(), "end": end.isoformat(), "days": days}
+    base = {
+        "property": site_url,
+        "page_url": page_url,
+        "matched_url": None,
+        "date_range": date_range,
+        "fetched_at": fetched_at,
+        "row_limit": row_limit,
+        "queryScope": "page",
+        "queries": [],
+        "page_metrics": None,
+        "segments": {"country": {"status": "not_requested"}, "device": {"status": "not_requested"}},
+        "status": "partial",
+        "warnings": [
+            "Search Console performance data is typically delayed by a few days. "
+            "A response with no rows can omit lower-priority queries and is not proof that no relevant searches exist."
+        ],
+        "error": None,
+    }
+    last_error = ""
+    for variant in _gsc_page_variants(page_url):
+        page_filter = {
+            "dimensionFilterGroups": [
+                {"groupType": "and", "filters": [{"dimension": "page", "operator": "equals", "expression": variant}]}
+            ],
+            "startDate": date_range["start"],
+            "endDate": date_range["end"],
+            "dataState": "final",
+            "rowLimit": row_limit,
+        }
+        try:
+            totals = _gsc_query(access_token, site_url, page_filter)
+            queries = _gsc_query(access_token, site_url, {**page_filter, "dimensions": ["query"]})
+        except RuntimeError as exc:
+            last_error = str(exc)
+            continue
+        metric_row = totals[0] if totals else {}
+        query_rows = []
+        for row in queries:
+            keys = row.get("keys") or [""]
+            query_rows.append({
+                "query": keys[0],
+                "clicks": int(row.get("clicks") or 0),
+                "impressions": int(row.get("impressions") or 0),
+                "ctr": f"{(row.get('ctr') or 0) * 100:.1f}%",
+                "position": f"{row.get('position') or 0:.1f}",
+            })
+        impressions = int(metric_row.get("impressions") or 0) if metric_row else 0
+        if not query_rows and not impressions:
+            continue
+        base.update({
+            "matched_url": variant,
+            "queries": query_rows,
+            "page_metrics": {
+                "clicks": int(metric_row.get("clicks") or 0) if metric_row else None,
+                "impressions": impressions if metric_row else None,
+                "ctr": f"{(metric_row.get('ctr') or 0) * 100:.1f}%" if metric_row else None,
+                "position": f"{metric_row.get('position') or 0:.1f}" if metric_row else None,
+            },
+            "clicks": int(metric_row.get("clicks") or 0) if metric_row else None,
+            "impressions": impressions if metric_row else None,
+            "ctr": f"{(metric_row.get('ctr') or 0) * 100:.1f}%" if metric_row else None,
+            "position": f"{metric_row.get('position') or 0:.1f}" if metric_row else None,
+            "status": "verified" if (query_rows or impressions) else "partial",
+            "error": None,
+        })
+        if len(query_rows) >= row_limit:
+            base["warnings"].append("The query row limit was reached, so additional queries may exist.")
+            base["status"] = "partial"
+        return base
+    if last_error and not base.get("matched_url"):
+        base["status"] = "error"
+        base["error"] = last_error[:300]
+        base["warnings"].append("The Search Console request failed. This is not an empty query set.")
+        return base
+    base["status"] = "partial"
+    return base
 
 
 def fetch_gsc_by_country(access_token: str, site_url: str, days: int = 28, row_limit: int = 15) -> list[list]:

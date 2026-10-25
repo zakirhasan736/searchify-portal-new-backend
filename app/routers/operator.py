@@ -9,6 +9,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from app import approval, cms_connectors, markets, quotas, site_profiles
 from app.database import get_db
@@ -581,6 +582,63 @@ def delete_connection(connection_id: int, db: Session = Depends(get_db), user: U
     except Exception:  # noqa: BLE001
         log.exception("cms_disconnect_feature_sync_failed", extra={"user_id": user.id})
     return {"ok": True, "disconnectedId": conn_id}
+
+
+class ForgetSiteBody(BaseModel):
+    site: str = ""
+
+
+@router.post("/sites/forget")
+def forget_site(body: ForgetSiteBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Drop one website from client sites, Plug in, and the reports stored for it."""
+    host = host_key(body.site)
+    if not host:
+        raise HTTPException(status_code=400, detail="Enter a website address.")
+
+    removed_cms = 0
+    for row in db.query(CmsConnection).filter(CmsConnection.customer_id == user.id).all():
+        if host_key(row.site_url or "") != host:
+            continue
+        linked = db.query(SiteChange).filter(SiteChange.cms_connection_id == row.id).all()
+        for change in linked:
+            change.cms_connection_id = None
+            db.delete(change)
+        db.delete(row)
+        removed_cms += 1
+
+    for change in db.query(SiteChange).filter(SiteChange.customer_id == user.id).all():
+        if host_key(change.target_url or "") == host:
+            db.delete(change)
+
+    for rec in db.query(FeatureRecord).filter(FeatureRecord.customer_id == user.id).all():
+        payload = rec.payload or {}
+        title = str(rec.title or "")
+        if payload_host(payload) == host or title.endswith(f" · {host}"):
+            db.delete(rec)
+
+    google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    if google is not None:
+        meta = dict(google.meta or {})
+        by_host = {key: value for key, value in dict(meta.get("byHost") or {}).items() if host_key(key) != host}
+        meta["byHost"] = by_host
+        if host_key(str(meta.get("activeHost") or "")) == host:
+            meta["activeHost"] = next(iter(by_host), "")
+        google.meta = meta
+        flag_modified(google, "meta")
+        current_host = host_key(google.gsc_site_url or "")
+        if current_host == host or not current_host:
+            nxt = next((value for value in by_host.values() if isinstance(value, dict)), {})
+            google.gsc_site_url = nxt.get("gscSiteUrl") or ""
+            google.ga4_property_id = nxt.get("ga4PropertyId") or ""
+            google.ga4_property_name = nxt.get("ga4PropertyName") or ""
+
+    try:
+        db.commit()
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        log.exception("forget_site_failed", extra={"host": host, "user_id": user.id})
+        raise HTTPException(status_code=500, detail=f"Could not remove this website: {exc}") from exc
+    return {"ok": True, "host": host, "removedConnections": removed_cms}
 
 
 @router.post("/workspace/reset")
@@ -1218,8 +1276,48 @@ def _gsc_for_page(db: Session, user_id: int, url: str, evidence: dict | None = N
             base.setdefault("sessions", row[5])
             base.setdefault("users", row[6])
         base["source"] = "search_console"
+        base.setdefault("status", "partial")
+        base.setdefault("queryScope", "page_totals")
         break
     return base
+
+
+def _page_search_console(db: Session, user: User, url: str, evidence: dict | None = None) -> dict:
+    """Attach page-specific Search Console queries when the property is connected.
+
+    Stored page totals stay in the record. They are not a substitute for page queries.
+    """
+    gsc = _gsc_for_page(db, user.id, url, evidence)
+    google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    property_url = (google.gsc_site_url or "").strip() if google else ""
+    gsc.setdefault("property", property_url or None)
+    gsc.setdefault("queries", [])
+    if not property_url:
+        gsc["status"] = "not_verified"
+        gsc["queryScope"] = "not_page"
+        gsc["warning"] = "Search Console is not connected. Missing queries are not proof this page has no searches."
+        return gsc
+    try:
+        from app import google_oauth as goauth
+        from app.routers.google_connect import _valid_access_token
+
+        token = _valid_access_token(db, google)
+        live = goauth.fetch_gsc_page_bundle(token, property_url, url)
+    except Exception as exc:  # noqa: BLE001
+        gsc["status"] = "error"
+        gsc["property"] = property_url
+        gsc["queryScope"] = "page"
+        gsc["error"] = str(exc)[:240]
+        gsc["queries"] = []
+        gsc["warning"] = "The Search Console page query request failed. Do not treat this as zero demand."
+        return gsc
+    merged = {**gsc, **{key: value for key, value in live.items() if value not in (None, [], {})}}
+    merged["property"] = property_url
+    merged["queries"] = live.get("queries") or []
+    merged["status"] = live.get("status") or "partial"
+    merged["queryScope"] = "page"
+    merged["page_url"] = url
+    return merged
 
 
 def _speed_for_page(db: Session, user_id: int, url: str) -> dict:
@@ -1845,7 +1943,7 @@ def propose_from_gsc(
             "page": page,
             "site": site_ctx,
             "rivals": rivals or fallback_rivals,
-            "gsc": evidence.get(url) or {"clicks": "—", "impressions": "—", "position": "—"},
+            "gsc": _page_search_console(db, user, url, evidence.get(url) or {}),
             "analytics": _analytics_for_page(db, user.id, url),
         })
 
@@ -1937,6 +2035,10 @@ def propose_from_gsc(
                 ],
                 "meetCompetitor": drafted.get("meetCompetitor") or {},
                 "beatsLive": bool(drafted.get("beatsLive")),
+                "recommendKeep": bool(drafted.get("recommendKeep")),
+                "decision": drafted.get("decision") or "",
+                "evidenceRecord": drafted.get("evidenceRecord") or {},
+                "evaluation": drafted.get("evaluation") or {},
                 "jev": drafted.get("jev") or {},
                 "analysis": drafted.get("analysis") or {},
                 "analytics": bool((job["analytics"] or {}).get("connected")),
@@ -2419,7 +2521,23 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
 
         page_analytics = _analytics_for_page(db, user.id, row.target_url or "")
         page_analytics["speed"] = _speed_for_page(db, user.id, row.target_url or "")
-        gsc_evidence = _gsc_for_page(db, user.id, row.target_url or "", proposed.get("evidence") or {})
+        gsc_evidence = _page_search_console(db, user, row.target_url or "", proposed.get("evidence") or {})
+        page_query_rows = []
+        try:
+            from app import google_oauth as goauth
+            from app.models import GoogleConnection
+            from app.routers.google_connect import _valid_access_token
+
+            google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+            if google and (google.gsc_site_url or "").strip() and (google.access_token or google.refresh_token):
+                token = _valid_access_token(db, google)
+                page_query_rows = goauth.fetch_gsc_page_queries(token, google.gsc_site_url, row.target_url or "")
+        except Exception:  # noqa: BLE001
+            page_query_rows = []
+        if page_query_rows:
+            gsc_evidence = {**gsc_evidence, "queryRows": page_query_rows}
+            page_terms = [str(item[0]).strip() for item in page_query_rows if item and str(item[0]).strip()]
+            query_terms = page_terms + [term for term in query_terms if term.lower() not in {item.lower() for item in page_terms}]
         drafted = write_title_description(
             url=row.target_url,
             profile={**_brief_profile(profile, (scan or {}).get("brief")), "voice": body.tone or profile.get("voice") or ""},
@@ -2451,7 +2569,13 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
         proposed["speed"] = page_analytics["speed"]
     recommend_keep = bool(drafted.get("recommendKeep"))
     options = [
-        {"title": title, "description": desc, "reason": drafted.get("reason") or ""},
+        {
+            "title": title,
+            "description": desc,
+            "reason": drafted.get("reason") or "",
+            "ctrFit": drafted.get("ctrFit") or 0,
+            "seoScore": drafted.get("seoScore") or 0,
+        },
     ]
     for alt in drafted.get("alternatives") or []:
         if not isinstance(alt, dict):
@@ -2466,12 +2590,24 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             for row in options
         ):
             continue
-        options.append({"title": alt_title, "description": alt_desc, "reason": ""})
+        options.append({
+            "title": alt_title,
+            "description": alt_desc,
+            "reason": "",
+            "ctrFit": alt.get("ctrFit") or 0,
+            "seoScore": alt.get("seoScore") or 0,
+        })
+    options.sort(key=lambda row: (int(row.get("ctrFit") or 0), int(row.get("seoScore") or 0)), reverse=True)
     options = options[:3]
+    title = options[0]["title"]
+    desc = options[0]["description"]
     # Apply the regenerated listing package to the card — title, description, OG, and JSON-LD stay aligned.
     # No-change recommendations still refresh analysis but keep published messaging as the draft.
     proposed["title"] = title
     proposed["metaDescription"] = desc
+    proposed["ctrFit"] = options[0].get("ctrFit") or drafted.get("ctrFit") or 0
+    proposed["seoScore"] = options[0].get("seoScore") or drafted.get("seoScore") or 0
+    proposed["liveCtr"] = drafted.get("liveCtr") or gsc_evidence.get("ctr") or ""
     proposed["reason"] = drafted.get("reason") or ""
     proposed["aiAlternatives"] = options
     proposed["model"] = drafted.get("model")
@@ -2483,6 +2619,9 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["meetCompetitor"] = drafted.get("meetCompetitor") or {}
     proposed["beatsLive"] = bool(drafted.get("beatsLive"))
     proposed["recommendKeep"] = recommend_keep
+    proposed["decision"] = drafted.get("decision") or ""
+    proposed["evidenceRecord"] = drafted.get("evidenceRecord") or {}
+    proposed["evaluation"] = drafted.get("evaluation") or {}
     proposed["jev"] = drafted.get("jev") or {}
     proposed["analysis"] = drafted.get("analysis") or {}
     proposed["target"] = drafted.get("target") or proposed.get("target") or ""

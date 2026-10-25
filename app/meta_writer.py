@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from datetime import datetime
 
 from app import page_quality
 from app.openai_client import chat_text, openai_configured
 from app.page_scrape import scrape_page
+from app.seo_prompt import METADATA_SYSTEM as SYSTEM
 
 FILLER = (
     "welcome to",
@@ -42,8 +45,9 @@ SYSTEM = (
     "(2) put the best keyword, in those words, near the front of the title when it fits the page; "
     "(3) add one concrete fact that belongs to THIS page only (a place, an offer, or a detail stated in the page copy) so the listing is specific and not a paste of the H1; "
     "(4) meet the hardest competitor on that same search when one is listed. Match keyword strength. Add one fact only this business can say. Do not copy their title; "
-    "(5) beat the live title only when an improvement is justified. "
-    "If the live title and description already accurately represent this page, say so in REASON and write a listing that preserves that positioning — do not invent a thinner substitute. "
+    "(5) replace the live title only when a Search Console query for THIS page is missing from that title and this page can honestly rank for it. "
+    "If the live title and description already name the offer, the place, and the brand, return that live title and description unchanged. "
+    "Never delete the brand, the place, or a service from the live title just to make it shorter. "
     "Never invent service counts (for example “5 Core Services”), awards, “best/leading/top-rated”, prices, or years unless the page states them. "
     "Do not open the description with filler templates such as “Business owners can explore…” or “Buyers can compare…”. Write a natural sentence about the offer. "
     "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
@@ -55,8 +59,11 @@ SYSTEM = (
     "Do not invent reviews, years in business, prices, awards, or certifications. "
     "Do not copy a competitor title. "
     "Do not use filler such as welcome, trusted, discover, unlock, elevate, seamless, leading, or one-stop. "
-    "Title: about 50–60 characters when practical. Keyword and topic first. Brand at the end when it still fits. "
-    "Description: about 140–155 characters when practical. It must not repeat the title word for word. "
+    "Title: HARD LIMIT 60 characters, counting every letter and space. Keyword and topic first, brand at the end. "
+    "If the offer and the brand do not both fit, shorten the offer words until the whole title is 60 characters or fewer. "
+    "Never write past 60. Never delete the brand to get under 60. "
+    "Description: HARD LIMIT 160 characters, counting every letter and space. Aim for 140–160. "
+    "It must not repeat the title word for word. Never write past 160. "
     "Explain the actual offering and why it matters to the searcher. "
     "The same title and description are the Open Graph title, the Open Graph description, and the WebPage schema name and description. "
     "Read the current title, meta description, Open Graph, and JSON-LD. Stay on that page's concept. "
@@ -188,6 +195,169 @@ def _clean(value: str, limit: int) -> str:
     return cut or text[:limit].rstrip()
 
 
+def _brand_tail(title: str) -> str:
+    text = str(title or "")
+    for sep in (" | ", " – ", " — ", " - "):
+        if sep in text:
+            return text.split(sep)[-1].strip()
+    return ""
+
+
+def _keep_published(value: str, limit: int = 180) -> str:
+    """Keep a live title or description. Do not shorten it to force a score."""
+    return re.sub(r"\s+", " ", (value or "").strip())[:limit]
+
+
+def _fit_desc(value: str) -> str:
+    """Meta description hard limit: 160 characters."""
+    return _clean(value, 160)
+
+
+def _fit_title(value: str, brand_tail: str = "") -> str:
+    """Title hard limit: 60 characters, with the brand kept by shortening the front."""
+    text = re.sub(r"\s+", " ", (value or "").strip().strip("\"'`"))
+    tail = (brand_tail or "").strip()
+    if not tail:
+        return _clean(text, 60)
+    sep = " | "
+    head = text
+    for candidate in (" | ", " – ", " — ", " - "):
+        if candidate not in text:
+            continue
+        left, right = text.rsplit(candidate, 1)
+        if right.strip().lower() == tail.lower():
+            head = left.strip()
+            sep = candidate
+            break
+    else:
+        if text.lower().endswith(tail.lower()):
+            head = text[: -len(tail)].rstrip(" |–—-")
+    suffix = f"{sep}{tail}"
+    if len(suffix) >= 60:
+        return _clean(f"{head} {tail}", 60)
+    head = _clean(head, 60 - len(suffix))
+    if not head:
+        return _clean(suffix, 60)
+    fitted = f"{head}{suffix}"
+    return fitted if len(fitted) <= 60 else _clean(fitted, 60)
+
+
+def _query_metric_rows(gsc: dict | None, queries: list | None) -> list[dict]:
+    rows = []
+    for row in (gsc or {}).get("queryRows") or []:
+        if isinstance(row, dict) and row.get("query"):
+            rows.append(row)
+        elif isinstance(row, (list, tuple)) and row and str(row[0]).strip():
+            rows.append({
+                "query": str(row[0]).strip(),
+                "clicks": row[1] if len(row) > 1 else "",
+                "impressions": row[2] if len(row) > 2 else "",
+                "ctr": row[3] if len(row) > 3 else "",
+                "position": row[4] if len(row) > 4 else "",
+            })
+    if rows:
+        return rows[:8]
+    return [{"query": str(item).strip(), "clicks": "", "impressions": "", "ctr": "", "position": ""} for item in (queries or []) if str(item).strip()][:8]
+
+
+def _query_lines(rows: list[dict]) -> str:
+    if not rows:
+        return "(No page-level Search Console queries yet. Do not invent a query, and do not replace an accurate live title.)"
+    lines = []
+    for row in rows:
+        ctr = row.get("ctr") or "—"
+        lines.append(
+            f"- {row.get('query')} · clicks {row.get('clicks') or '—'} · impressions {row.get('impressions') or '—'} · CTR {ctr} · position {row.get('position') or '—'}"
+        )
+    return "\n".join(lines)
+
+
+def ctr_fit_score(
+    title: str,
+    desc: str,
+    *,
+    keyword: str = "",
+    brand_tail: str = "",
+    current_title: str = "",
+    query_rows: list | None = None,
+) -> int:
+    """0–100 listing fit. This is not a promised Google CTR."""
+    score = 35
+    low = (title or "").lower()
+    needle = (keyword or "").strip().lower()
+    if needle and needle in low:
+        score += 20 if low.find(needle) <= 28 else 10
+    tail = (brand_tail or "").strip().lower()
+    if tail:
+        score += 22 if tail in low else -28
+    length = len(title or "")
+    if 30 <= length <= 60:
+        score += 12
+    elif length > 60:
+        score -= 20
+    desc_len = len(desc or "")
+    if 120 <= desc_len <= 160:
+        score += 8
+    elif desc_len > 160:
+        score -= 15
+    weighted = 0.0
+    covered = 0.0
+    for row in query_rows or []:
+        query = str((row or {}).get("query") or "").strip().lower()
+        if not query:
+            continue
+        try:
+            weight = max(float(str((row or {}).get("impressions") or "0").replace(",", "")), 1.0)
+        except ValueError:
+            weight = 1.0
+        weighted += weight
+        words = [part for part in re.findall(r"[a-z0-9]+", query) if len(part) > 3]
+        if query in low or (words and all(part in low for part in words[:3])):
+            covered += weight
+    if weighted:
+        score += int(18 * covered / weighted)
+    if current_title and (title or "").strip().lower() == current_title.strip().lower():
+        score = min(score, 74)
+    return max(1, min(100, score))
+
+
+def seo_choice_score(
+    title: str,
+    desc: str,
+    *,
+    keyword: str = "",
+    brand: str = "",
+    page_text: str = "",
+    current_title: str = "",
+) -> int:
+    """0–100 metadata score for comparing options. This is not a Google ranking."""
+    score = 40
+    title_words = _content_tokens(title)
+    desc_words = _content_tokens(desc)
+    page_words = _content_tokens(page_text)
+    if page_words and title_words:
+        shared = len(title_words & page_words)
+        score += min(24, shared * 6)
+    keyword_words = _content_tokens(keyword)
+    if keyword_words and len(title_words & keyword_words) >= max(1, (len(keyword_words) + 1) // 2):
+        score += 16
+    elif keyword_words and desc_words & keyword_words:
+        score += 6
+    brand_name = " ".join(str(brand or "").split())
+    if brand_name:
+        if brand_name.lower() in (title or "").lower():
+            score += 12
+        elif current_title and brand_name.lower() in current_title.lower():
+            score -= 18
+    if desc_words - title_words:
+        score += 8
+    if title and desc and _overlap(title, desc) >= 0.7:
+        score -= 10
+    if listing_fluff_problems(title, desc, evidence=page_text or current_title):
+        score -= 20
+    return max(1, min(100, score))
+
+
 def _parse_option_pairs(text: str) -> list[tuple[str, str]]:
     """Every TITLE/DESCRIPTION pair in a model reply."""
     pairs: list[tuple[str, str]] = []
@@ -196,7 +366,7 @@ def _parse_option_pairs(text: str) -> list[tuple[str, str]]:
     def flush() -> None:
         nonlocal title, desc
         if title and desc:
-            pairs.append((_clean(title, 60), _clean(desc, 155)))
+            pairs.append((_clean(title, 100), _clean(desc, 160)))
         title, desc = "", ""
 
     for line in (text or "").splitlines():
@@ -251,8 +421,8 @@ def _listing_alternatives(kept, extras, title, desc, reject, fluff) -> list[dict
     rows: list[dict] = []
 
     def push(cand_title: str, cand_desc: str) -> None:
-        t = _clean(cand_title or "", 60)
-        d = _clean(cand_desc or "", 155)
+        t = _fit_title(cand_title or "", "")
+        d = _fit_desc(cand_desc or "")
         if not t or not d:
             return
         key = (t.lower(), d.lower())
@@ -289,7 +459,7 @@ def _parse_meta(text: str) -> tuple[str, str, str]:
             desc = low.split(":", 1)[-1].strip()
         elif up.startswith("REASON:"):
             reason = low.split(":", 1)[-1].strip()
-    return _clean(title, 60), _clean(desc, 155), _clean(reason, 220)
+    return _clean(title, 100), _clean(desc, 160), _clean(reason, 220)
 
 
 def _parse_target(text: str) -> str:
@@ -328,16 +498,10 @@ def _issues(
         if rival.get("title") and _overlap(title, rival["title"]) >= 0.85:
             issues.append("This copies a competitor title. Meet them on the same keyword with a fact only this page can say.")
             break
-    if len(title) < 42 or len(title) > 60:
-        issues.append(f"Title is {len(title)} characters. Rewrite it to 50–60.")
-    if len(desc) < 120 or len(desc) > 155:
-        issues.append(f"Description is {len(desc)} characters. Rewrite it to 140–155.")
     blob = f"{title} {desc}".lower()
     for phrase in FILLER:
         if phrase in blob:
             issues.append(f"Remove the filler phrase “{phrase.strip()}”.")
-    if current_title and _overlap(title, current_title) >= 0.9:
-        issues.append("The title is the same as the current title. Keep the topic, and make the keyword clearer.")
     if title and desc and _overlap(title, desc) >= 0.7:
         issues.append("The description repeats the title. Add a fact and a next step instead.")
     page_words = _tokens(page_bits)
@@ -736,6 +900,9 @@ def listing_is_stronger(
                 break
         if not fresh and not alt_hit:
             return False
+    tail = _brand_tail(current)
+    if tail and tail.lower() not in (title or "").lower():
+        return False
     # Do not treat a thinner rewrite as stronger when the live title already names brand + offers.
     if current and brand and brand.lower() in current.lower():
         live_offers = sum(1 for offer in (offers or []) if _content_tokens(offer) & current_words)
@@ -1169,8 +1336,8 @@ def write_title_description(
         recommend_keep = True
         beats = False
         open_issues: list[str] = []
-        seo_title = _clean(live_title, 60)
-        seo_desc = _clean(live_desc, 155)
+        seo_title = _keep_published(live_title)
+        seo_desc = _keep_published(live_desc, 320)
         reason = empty["reason"] if not (live_title or live_desc) else keep_reason
         model = ""
         role = "none"
@@ -1362,8 +1529,11 @@ def write_title_description(
         f"When a hard competitor is listed, the title must stand on the same search with the best keyword and a fact only this business can say. Do not copy their title:\n{meet.get('title') or '(none that share this keyword — write from the business offer and the live page)'}\n"
         f"Other competitors that sell the same kind of service:\n{_rival_block(rivals)}\n\n"
         f"4. SEARCH CONSOLE AND RESEARCH, already matched to this business:\n{research_lines(research, page_url, topic, offers)}\n"
-        f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} position={gsc.get('position')}\n\n"
-        f"5. CURRENT LISTING. This is what is live. Beat it. Do not copy it, and do not start with its city unless the best keyword contains that city:\n{current_listing}\n"
+        f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} CTR={gsc.get('ctr') or '—'} position={gsc.get('position')}\n"
+        f"Queries for THIS page only. A change is justified only when one of these queries is missing from the live title:\n{_query_lines(_query_metric_rows(gsc, queries))}\n\n"
+        f"5. CURRENT LISTING. Keep its meaning unless a page query above is missing from it. "
+        f"The title you return must be 60 characters or fewer, and the description 160 or fewer. "
+        f"Keep the brand by shortening the offer words, not by deleting the brand:\n{current_listing}\n"
         f"Page: {scraped.get('url') or url}\n"
         f"H1: {scraped.get('h1') or '(none)'}\n"
         f"Section headings: {headings or '(none)'}\n"
@@ -1492,8 +1662,8 @@ def write_title_description(
     kept_options: list[tuple[str, str]] = []
 
     def keep_option(cand_title: str, cand_desc: str) -> None:
-        t = _clean(cand_title or "", 60)
-        d = _clean(cand_desc or "", 155)
+        t = _fit_title(cand_title or "", _brand_tail(current))
+        d = _fit_desc(cand_desc or "")
         if not t or not d:
             return
         key = (t.lower(), d.lower())
@@ -1573,7 +1743,7 @@ def write_title_description(
         )
         if current.strip() and live_desc.strip():
             keep_option(title, desc)
-            title, desc = _clean(current, 60), _clean(live_desc, 155)
+            title, desc = _keep_published(current), _keep_published(live_desc, 320)
             reason = (
                 "No-change recommendation: the draft failed factual or relevance checks. "
                 "Kept the published listing rather than inventing a replacement."
@@ -1588,7 +1758,7 @@ def write_title_description(
         remaining_hard = hard_checks(title, desc) if title and desc else []
         if same or (not stronger) or fluff or remaining_hard:
             keep_option(title, desc)
-            title, desc = _clean(current, 60), _clean(live_desc, 155)
+            title, desc = _keep_published(current), _keep_published(live_desc, 320)
             recommend_keep = True
             if keyword_evidence_insufficient:
                 reason = (
@@ -1600,6 +1770,68 @@ def write_title_description(
                     "No-change recommendation: the published title and description already represent this page accurately. "
                     "Regeneration did not produce a validated, demonstrably stronger listing."
                 )
+    query_rows = _query_metric_rows(gsc, queries)
+    tail = _brand_tail(current)
+    live_fit = ctr_fit_score(
+        current, live_desc, keyword=keyword, brand_tail=tail, current_title=current, query_rows=query_rows,
+    )
+    live_seo = seo_choice_score(
+        current, live_desc, keyword=keyword, brand=brand, page_text=evidence_text, current_title=current,
+    )
+
+    def _fit_row(cand_title: str, cand_desc: str) -> dict:
+        fitted = _fit_title(cand_title, tail)
+        cleaned = _fit_desc(cand_desc)
+        return {
+            "title": fitted,
+            "description": cleaned,
+            "ctrFit": ctr_fit_score(
+                fitted, cleaned, keyword=keyword, brand_tail=tail, current_title=current, query_rows=query_rows,
+            ),
+            "seoScore": seo_choice_score(
+                fitted, cleaned, keyword=keyword, brand=brand, page_text=evidence_text, current_title=current,
+            ),
+        }
+
+    ranked: list[dict] = []
+    seen_fit: set[tuple[str, str]] = set()
+
+    def _push_fit(cand_title: str, cand_desc: str) -> None:
+        row = _fit_row(cand_title, cand_desc)
+        key = (row["title"].lower(), row["description"].lower())
+        if not row["title"] or not row["description"] or key in seen_fit:
+            return
+        if not listing_is_stronger(
+            row["title"], row["description"], current, live_desc, brand,
+            keyword=keyword, places=places, offers=offers, rival=meet,
+        ):
+            return
+        if row["ctrFit"] <= live_fit:
+            return
+        seen_fit.add(key)
+        ranked.append(row)
+
+    if not recommend_keep:
+        _push_fit(title, desc)
+    for kept_title, kept_desc in kept_options:
+        _push_fit(kept_title, kept_desc)
+    ranked.sort(key=lambda row: row["ctrFit"], reverse=True)
+    if current.strip() and not ranked:
+        title, desc = _keep_published(current), _keep_published(live_desc, 320)
+        recommend_keep = True
+        ctr_fit = live_fit
+        seo_score = live_seo
+        ranked_alts: list[dict] = []
+    elif ranked:
+        title, desc = ranked[0]["title"], ranked[0]["description"]
+        recommend_keep = False
+        ctr_fit = ranked[0]["ctrFit"]
+        seo_score = ranked[0]["seoScore"]
+        ranked_alts = ranked[1:3]
+    else:
+        ctr_fit = live_fit
+        seo_score = live_seo
+        ranked_alts = []
     if not reason:
         reason = "Written from the business concept, the best keyword, and the competitor this page has to meet."
     if keyword and "best keyword" not in reason.lower() and f"“{keyword}”" not in reason and not recommend_keep:
@@ -1635,8 +1867,8 @@ def write_title_description(
     target_kw = _parse_target(text) or keyword or ((site or {}).get("page") or {}).get("target") or ""
     # Preserve distinct social copy when recommending keep; otherwise align OG with the proposed listing.
     if recommend_keep:
-        og_title = _clean(str(scraped.get("ogTitle") or current or title), 60)
-        og_desc = _clean(str(scraped.get("ogDescription") or live_desc or desc), 155)
+        og_title = _fit_title(str(scraped.get("ogTitle") or current or title), tail)
+        og_desc = _fit_desc(str(scraped.get("ogDescription") or live_desc or desc))
     else:
         og_title, og_desc = title, desc
     from app.jev import score_listing
@@ -1725,14 +1957,10 @@ def write_title_description(
         "analysis": analysis,
         "title": title,
         "metaDescription": desc,
-        "alternatives": _listing_alternatives(
-            kept_options,
-            _extra_listings(brief, title, desc),
-            title,
-            desc,
-            hard_checks,
-            lambda cand_title, cand_desc: listing_fluff_problems(cand_title, cand_desc, evidence=evidence_text),
-        ),
+        "ctrFit": ctr_fit,
+        "seoScore": seo_score,
+        "liveCtr": gsc.get("ctr") or "",
+        "alternatives": ranked_alts,
         "openGraphTitle": og_title,
         "openGraphDescription": og_desc,
         "shareImage": share,
