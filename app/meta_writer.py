@@ -10,7 +10,16 @@ from datetime import datetime
 from app import page_quality
 from app.openai_client import chat_text, openai_configured
 from app.page_scrape import scrape_page
-from app.seo_prompt import METADATA_SYSTEM as SYSTEM
+from app.listing_judge import (
+    GENERATOR_SYSTEM,
+    REFINE_INSTRUCTION,
+    WIN_MARGIN,
+    fit_desc_strict,
+    fit_title_strict,
+    judge_evidence,
+    judge_listings,
+)
+from app.seo_prompt import METADATA_SYSTEM
 
 FILLER = (
     "welcome to",
@@ -38,44 +47,11 @@ FILLER = (
     "#1",
 )
 
-SYSTEM = (
-    "You are a senior SEO copywriter competing with the best SEO tools. You write the Google title and meta description for one specific page. "
-    "The page topic is the concept. The best keyword is the search this page can honestly win. "
-    "Work in this order: (1) read the page topic and page type in the brief and stay on that concept — do not switch to another service, product, or case study from elsewhere on the site; "
-    "(2) put the best keyword, in those words, near the front of the title when it fits the page; "
-    "(3) add one concrete fact that belongs to THIS page only (a place, an offer, or a detail stated in the page copy) so the listing is specific and not a paste of the H1; "
-    "(4) meet the hardest competitor on that same search when one is listed. Match keyword strength. Add one fact only this business can say. Do not copy their title; "
-    "(5) replace the live title only when a Search Console query for THIS page is missing from that title and this page can honestly rank for it. "
-    "If the live title and description already name the offer, the place, and the brand, return that live title and description unchanged. "
-    "Never delete the brand, the place, or a service from the live title just to make it shorter. "
-    "Never invent service counts (for example “5 Core Services”), awards, “best/leading/top-rated”, prices, or years unless the page states them. "
-    "Do not open the description with filler templates such as “Business owners can explore…” or “Buyers can compare…”. Write a natural sentence about the offer. "
-    "A strong listing is conceptual and keyword-clear: a searcher can tell what the page is about in the first words. "
-    "Use Search Console queries, Analytics landing facts, site-audit notes, backlink anchors, and AI-visibility gaps only as evidence for which angle to win — never invent numbers. "
-    "Every page on the site needs its own topic: never reuse another page's title. "
-    "Homepage and service pages describe the business offer. Never name a portfolio client, case-study project, or unrelated product on those pages. "
-    "Only a case-study or portfolio page may name the client or project that page is about. "
-    "It does not sound like an agency slogan. "
-    "Do not invent reviews, years in business, prices, awards, or certifications. "
-    "Do not copy a competitor title. "
-    "Do not use filler such as welcome, trusted, discover, unlock, elevate, seamless, leading, or one-stop. "
-    "Title: HARD LIMIT 60 characters, counting every letter and space. Keyword and topic first, brand at the end. "
-    "If the offer and the brand do not both fit, shorten the offer words until the whole title is 60 characters or fewer. "
-    "Never write past 60. Never delete the brand to get under 60. "
-    "Description: HARD LIMIT 160 characters, counting every letter and space. Aim for 140–160. "
-    "It must not repeat the title word for word. Never write past 160. "
-    "Explain the actual offering and why it matters to the searcher. "
-    "The same title and description are the Open Graph title, the Open Graph description, and the WebPage schema name and description. "
-    "Read the current title, meta description, Open Graph, and JSON-LD. Stay on that page's concept. "
-    "A one-word H1 such as Home is not the topic — use the schema name, the Open Graph title, or the real heading. "
-    "Do not invent search volume, positions, or mentions that are not in the brief. "
-    "Do not put click counts, session counts, or bounce rates inside the title or description. "
-    "Return exactly four lines:\n"
-    "TITLE: ...\n"
-    "DESCRIPTION: ...\n"
-    "TARGET: the best keyword this listing is written to win\n"
-    "REASON: one sentence naming the page topic, the keyword, and whether this improves on the live listing."
-)
+# The old single-draft prompt told the model to return the live listing unchanged whenever it already named
+# the brand, offer and place — so most runs echoed the current title. The generator now writes five
+# distinct candidates and a blind judge decides whether any beats the live listing.
+SYSTEM = GENERATOR_SYSTEM
+LEGACY_METADATA_SYSTEM = METADATA_SYSTEM
 
 OBJECTIVES = {
     "balanced": (
@@ -195,22 +171,12 @@ def _clean(value: str, limit: int) -> str:
     return cut or text[:limit].rstrip()
 
 
-def _brand_tail(title: str, brand: str = "") -> str:
-    """Trailing brand segment ("Services | Brand"). Empty for brand-first titles ("Brand | Services")."""
+def _brand_tail(title: str) -> str:
     text = str(title or "")
-    name = " ".join(str(brand or "").split()).lower()
-    if name and text.strip().lower().startswith(name):
-        return ""
     for sep in (" | ", " – ", " — ", " - "):
         if sep in text:
             return text.split(sep)[-1].strip()
     return ""
-
-
-def lost_current_terms(title: str, current: str, brand: str = "") -> list[str]:
-    """Meaningful words the live title has that the draft dropped (brand words excluded)."""
-    keep = _content_tokens(current) - _brand_tokens(brand)
-    return sorted(keep - _content_tokens(title))
 
 
 def _keep_published(value: str, limit: int = 180) -> str:
@@ -303,8 +269,8 @@ def ctr_fit_score(
     length = len(title or "")
     if 30 <= length <= 60:
         score += 12
-    elif length > 60 and not (current_title and (title or "").strip().lower() == current_title.strip().lower()):
-        score -= 20  # length is a display note for drafts; the published title is not punished for it
+    elif length > 60:
+        score -= 20
     desc_len = len(desc or "")
     if 120 <= desc_len <= 160:
         score += 8
@@ -368,15 +334,18 @@ def seo_choice_score(
     return max(1, min(100, score))
 
 
-def _parse_option_pairs(text: str) -> list[tuple[str, str]]:
-    """Every TITLE/DESCRIPTION pair in a model reply."""
+def _parse_option_pairs(text: str, *, raw: bool = False) -> list[tuple[str, str]]:
+    """Every TITLE/DESCRIPTION pair in a model reply. raw=True keeps full text so strict fitting can judge it."""
     pairs: list[tuple[str, str]] = []
     title, desc = "", ""
 
     def flush() -> None:
         nonlocal title, desc
         if title and desc:
-            pairs.append((_clean(title, 100), _clean(desc, 160)))
+            if raw:
+                pairs.append((re.sub(r"\s+", " ", title).strip(), re.sub(r"\s+", " ", desc).strip()))
+            else:
+                pairs.append((_clean(title, 100), _clean(desc, 160)))
         title, desc = "", ""
 
     for line in (text or "").splitlines():
@@ -910,17 +879,9 @@ def listing_is_stronger(
                 break
         if not fresh and not alt_hit:
             return False
-    tail = _brand_tail(current, brand)
+    tail = _brand_tail(current)
     if tail and tail.lower() not in (title or "").lower():
         return False
-    if current and brand and brand.lower() in current.lower() and brand.lower() not in (title or "").lower():
-        return False
-    # A draft may replace words, never just delete them (e.g. "Agency in Calgary" cut for length).
-    lost = lost_current_terms(title, current, brand)
-    if lost:
-        gained = _content_tokens(title) - _content_tokens(current)
-        if len(gained) < len(lost):
-            return False
     # Do not treat a thinner rewrite as stronger when the live title already names brand + offers.
     if current and brand and brand.lower() in current.lower():
         live_offers = sum(1 for offer in (offers or []) if _content_tokens(offer) & current_words)
@@ -978,8 +939,10 @@ def _ask(user: str) -> tuple[str, str, str]:
         user=user,
         kind="meta-seo",
         writing_type="Meta title & description",
-        tokens=700,
-        max_tokens=1200,
+        tokens=900,
+        # Reasoning models spend completion tokens before writing; 1200 often came back empty and
+        # silently fell through to a weaker fallback model.
+        max_tokens=3500,
     )
 
 
@@ -1219,7 +1182,7 @@ def write_title_description(
     )
 
     empty = {
-        "title": _keep_published(scraped.get("title") or ""),
+        "title": _clean(scraped.get("title") or "", 60),
         "metaDescription": _clean(scraped.get("description") or "", 155),
         "reason": "OpenAI is not configured, so the live title was kept.",
         "model": "",
@@ -1548,9 +1511,10 @@ def write_title_description(
         f"Other competitors that sell the same kind of service:\n{_rival_block(rivals)}\n\n"
         f"4. SEARCH CONSOLE AND RESEARCH, already matched to this business:\n{research_lines(research, page_url, topic, offers)}\n"
         f"This URL in Search Console: clicks={gsc.get('clicks')} impressions={gsc.get('impressions')} CTR={gsc.get('ctr') or '—'} position={gsc.get('position')}\n"
-        f"Queries for THIS page only. A change is justified only when one of these queries is missing from the live title:\n{_query_lines(_query_metric_rows(gsc, queries))}\n\n"
-        f"5. CURRENT LISTING. Keep its meaning unless a page query above is missing from it. "
-        f"The title you return must be 60 characters or fewer, and the description 160 or fewer. "
+        f"Queries for THIS page only. Prefer the highest-impression query this page can honestly win:\n{_query_lines(_query_metric_rows(gsc, queries))}\n\n"
+        f"5. CURRENT LISTING TO BEAT. Your listings are scored blind against this live listing on relevance, keyword, "
+        f"click appeal and specificity. Keep what it does well (brand, place, accurate offer) and fix what it lacks. "
+        f"Titles must be 60 characters or fewer and descriptions 160 or fewer — longer ones are discarded. "
         f"Keep the brand by shortening the offer words, not by deleting the brand:\n{current_listing}\n"
         f"Page: {scraped.get('url') or url}\n"
         f"H1: {scraped.get('h1') or '(none)'}\n"
@@ -1678,10 +1642,12 @@ def write_title_description(
         return found[:8]
 
     kept_options: list[tuple[str, str]] = []
+    tail = _brand_tail(current)
+    live_has_brand = bool(brand and brand.lower() in current.lower())
 
     def keep_option(cand_title: str, cand_desc: str) -> None:
-        t = _fit_title(cand_title or "", _brand_tail(current, brand))
-        d = _fit_desc(cand_desc or "")
+        t = fit_title_strict(cand_title or "", tail or brand) or _fit_title(cand_title or "", tail)
+        d = fit_desc_strict(cand_desc or "") or _fit_desc(cand_desc or "")
         if not t or not d:
             return
         key = (t.lower(), d.lower())
@@ -1689,34 +1655,69 @@ def write_title_description(
             return
         kept_options.append((t, d))
 
+    # ---- Candidate pool: every draft is fitted WITHOUT chopping phrases, then hard-gated. ----
+    pool: list[tuple[str, str]] = []
+
+    def add_pool(cand_title: str, cand_desc: str) -> None:
+        t = fit_title_strict(cand_title or "", tail or brand)
+        d = fit_desc_strict(cand_desc or "")
+        if not t or not d:
+            return
+        key = (t.lower(), d.lower())
+        if key == (current.strip().lower(), live_desc.strip().lower()):
+            return
+        if any((a.lower(), b.lower()) == key for a, b in pool):
+            return
+        pool.append((t, d))
+
+    def survivors() -> list[tuple[str, str]]:
+        rows = []
+        for t, d in pool:
+            if hard_checks(t, d):
+                continue
+            if live_has_brand and brand.lower() not in t.lower():
+                continue
+            rows.append((t, d))
+        return rows
+
+    def take(reply: str) -> list[tuple[str, str]]:
+        pairs = _parse_option_pairs(reply, raw=True)
+        for cand_title, cand_desc in pairs:
+            add_pool(cand_title, cand_desc)
+            keep_option(cand_title, cand_desc)
+        return pairs
+
     seo_seed = seo_content_draft()
     seed_note = ""
     if seo_seed.get("title") and seo_seed.get("description"):
         seed_note = (
-            "\nSearchify SEO content generation offered this draft to beat when it is stronger and on-keyword:\n"
+            "\nSearchify SEO content generation offered this draft. Treat it as one more listing to beat:\n"
             f"TITLE: {seo_seed['title']}\nDESCRIPTION: {seo_seed['description']}\n"
-            "You may improve it. Keep the best keyword near the front. Do not invent facts.\n"
         )
-    text, model, role = _ask(brief + seed_note + "\nWrite the listing for this page only.")
-    title, desc, reason = _parse_meta(text)
-    keep_option(title, desc)
+    text, model, role = _ask(brief + seed_note + "\nWrite the listings for this page only.")
+    first_pairs = take(text)
+    title, desc = (first_pairs[0] if first_pairs else ("", ""))
+    title, desc = _clean(title, 100), _clean(desc, 160)
+    reason = _parse_meta(text)[2]
     issues = checks(title, desc)
-    if issues:
+
+    if len(survivors()) < 2:
         retry_text, retry_model, retry_role = _ask(
             brief
             + seed_note
-            + "\nThe first draft failed these checks:\n- "
-            + "\n- ".join(issues)
+            + "\nThe first drafts failed these checks:\n- "
+            + "\n- ".join(issues or ["Titles over 60 or descriptions over 160 characters were discarded."])
             + f"\n\nRejected title: {title or '(empty)'}\nRejected description: {desc or '(empty)'}\n"
-            + "Write a new listing that fixes every check. Keep the page topic and put the best keyword near the front of the title."
+            + "Write new listings that fix every check. Keep the page topic and put the best keyword near the front of the title."
         )
-        retry_title, retry_desc, retry_reason = _parse_meta(retry_text)
-        retry_issues = checks(retry_title, retry_desc)
-        if len(retry_issues) <= len(issues) and retry_title and retry_desc:
-            keep_option(retry_title, retry_desc)
-            title, desc, reason = retry_title, retry_desc, retry_reason
-            text, model, role = retry_text, retry_model, retry_role
-            issues = retry_issues
+        retry_pairs = take(retry_text)
+        if retry_pairs:
+            retry_title, retry_desc = _clean(retry_pairs[0][0], 100), _clean(retry_pairs[0][1], 160)
+            retry_issues = checks(retry_title, retry_desc)
+            if len(retry_issues) <= len(issues) and retry_title and retry_desc:
+                title, desc, reason = retry_title, retry_desc, _parse_meta(retry_text)[2]
+                text, model, role = retry_text, retry_model, retry_role
+                issues = retry_issues
 
     def score_candidate(cand_title: str, cand_desc: str) -> tuple[int, int, int]:
         """Lower is better: open issues, not-stronger flag, distance from ideal length."""
@@ -1739,20 +1740,90 @@ def write_title_description(
         )
         if not seo_bleed:
             keep_option(seo_title, seo_desc)
-        if not seo_bleed and score_candidate(seo_title, seo_desc) < score_candidate(title, desc):
-            title, desc = seo_title, seo_desc
+            add_pool(seo_seed["title"], seo_seed["description"])
+
+    # ---- Blind judge: score live + every surviving candidate on one rubric. ----
+    judged_live: dict | None = None
+    judged_rows: list[dict] = []
+    judge_used = False
+    clean = survivors()
+    if clean:
+        evidence_brief = judge_evidence(
+            url=page_url, kind=kind, topic=topic, keyword=keyword, brand=brand, offers=offers, places=places,
+            h1=str(scraped.get("h1") or ""), headings=str(headings or ""), page_text=page_body,
+            queries=[*matched, *queries][:8], rival_titles=[str(r.get("title") or "") for r in rivals if r.get("title")],
+        )
+        has_live = bool(current.strip() and live_desc.strip())
+
+        def run_judge(rows: list[tuple[str, str]]) -> list[dict] | None:
+            listing = ([{"title": current.strip(), "description": live_desc.strip()}] if has_live else [])
+            listing += [{"title": t, "description": d} for t, d in rows[:8]]
+            return judge_listings(evidence_brief, listing, salt=page_url)
+
+        def split(result: list[dict]) -> tuple[dict | None, list[dict]]:
+            live_row = result[0] if has_live else None
+            cands = [row for row in (result[1:] if has_live else result) if row.get("accurate")]
+            cands.sort(key=lambda row: row["score"], reverse=True)
+            return live_row, cands
+
+        result = run_judge(clean)
+        if result is not None:
+            judge_used = True
+            judged_live, judged_rows = split(result)
+            bar = (judged_live["score"] + WIN_MARGIN) if judged_live else 0
+            if has_live and (not judged_rows or judged_rows[0]["score"] < bar):
+                # One refinement round with the reviewer's critique of the live listing and the best draft.
+                best = judged_rows[0] if judged_rows else {"title": title, "description": desc, "score": 0, "note": ""}
+                refine_text, refine_model, refine_role = _ask(
+                    brief + seed_note + REFINE_INSTRUCTION.format(
+                        live_score=judged_live["score"], live_note=judged_live.get("note") or "(none)",
+                        best_score=best.get("score", 0), best_title=best.get("title", ""),
+                        best_desc=best.get("description", ""), best_note=best.get("note") or "(none)",
+                    )
+                )
+                before = {(t.lower(), d.lower()) for t, d in clean}
+                take(refine_text)
+                fresh = [pair for pair in survivors() if (pair[0].lower(), pair[1].lower()) not in before]
+                if fresh:
+                    # Re-score the best earlier drafts together with the new ones so scores share one scale.
+                    keep_pairs = [(row["title"], row["description"]) for row in judged_rows[:3]]
+                    rescored = run_judge([*fresh, *keep_pairs])
+                    if rescored is not None:
+                        judged_live, judged_rows = split(rescored)
+                        model, role = refine_model, refine_role
+                        text = refine_text
+
+    if judge_used:
+        live_score = judged_live["score"] if judged_live else 0.0
+        bar = (live_score + WIN_MARGIN) if judged_live else 0.0
+        winners = [row for row in judged_rows if row["score"] >= bar]
+        if winners:
+            title, desc = winners[0]["title"], winners[0]["description"]
+            recommend_keep = False
             reason = (
-                f"Chose the Searchify SEO content draft on “{keyword or topic}” because it beat the first pass "
-                "on keyword fit and strength versus the live listing."
+                f"Scored {winners[0]['score']:.0f}/100 in a blind review"
+                + (f" vs {live_score:.0f}/100 for the live listing" if judged_live else "")
+                + (f". Live listing weakness: {judged_live.get('note')}" if judged_live and judged_live.get("note") else ".")
             )
-            model, role = "searchify-seo-content", "content"
-            text = f"TITLE: {title}\nDESCRIPTION: {desc}\nREASON: {reason}"
+        else:
+            title, desc = _keep_published(current), _keep_published(live_desc, 320)
+            recommend_keep = True
+            top = judged_rows[0]["score"] if judged_rows else 0
+            reason = (
+                f"No-change recommendation: the live listing scored {live_score:.0f}/100 in a blind review and no "
+                f"candidate beat it by {WIN_MARGIN:.0f}+ points (best {top:.0f}/100)."
+            )
+    else:
+        # ---- Fallback (judge unavailable): pick the best gated candidate, then the original safety logic. ----
+        if clean:
+            best_pair = min(clean, key=lambda pair: score_candidate(*pair))
+            if score_candidate(*best_pair) < score_candidate(title, desc):
+                title, desc = best_pair
+        recommend_keep = False
 
     # Never invent a stronger_listing replacement when a candidate fails — keep published instead.
     hard_fail = hard_checks(title, desc) if title and desc else ["The writer returned no title."]
-    if hard_fail and kind in {"home", "service", "product", "category", "location", "case_study", "portfolio", "other", ""}:
-        import logging
-
+    if not judge_used and hard_fail and kind in {"home", "service", "product", "category", "location", "case_study", "portfolio", "other", ""}:
         logging.getLogger(__name__).info(
             "meta_writer rejected hard-fail draft for %s (%s): %s",
             kind,
@@ -1766,8 +1837,7 @@ def write_title_description(
                 "No-change recommendation: the draft failed factual or relevance checks. "
                 "Kept the published listing rather than inventing a replacement."
             )
-    recommend_keep = False
-    if current.strip() and live_desc.strip():
+    if not judge_used and current.strip() and live_desc.strip():
         same = title.strip().lower() == current.strip().lower() and desc.strip().lower() == live_desc.strip().lower()
         stronger = listing_is_stronger(
             title, desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
@@ -1789,7 +1859,6 @@ def write_title_description(
                     "Regeneration did not produce a validated, demonstrably stronger listing."
                 )
     query_rows = _query_metric_rows(gsc, queries)
-    tail = _brand_tail(current, brand)
     live_fit = ctr_fit_score(
         current, live_desc, keyword=keyword, brand_tail=tail, current_title=current, query_rows=query_rows,
     )
@@ -1798,8 +1867,8 @@ def write_title_description(
     )
 
     def _fit_row(cand_title: str, cand_desc: str) -> dict:
-        fitted = _fit_title(cand_title, tail)
-        cleaned = _fit_desc(cand_desc)
+        fitted = fit_title_strict(cand_title, tail or brand) or _fit_title(cand_title, tail)
+        cleaned = fit_desc_strict(cand_desc) or _fit_desc(cand_desc)
         return {
             "title": fitted,
             "description": cleaned,
@@ -1812,44 +1881,58 @@ def write_title_description(
         }
 
     ranked: list[dict] = []
-    seen_fit: set[tuple[str, str]] = set()
-
-    def _push_fit(cand_title: str, cand_desc: str) -> None:
-        row = _fit_row(cand_title, cand_desc)
-        key = (row["title"].lower(), row["description"].lower())
-        if not row["title"] or not row["description"] or key in seen_fit:
-            return
-        if not listing_is_stronger(
-            row["title"], row["description"], current, live_desc, brand,
-            keyword=keyword, places=places, offers=offers, rival=meet,
-        ):
-            return
-        if row["ctrFit"] <= live_fit:
-            return
-        seen_fit.add(key)
-        ranked.append(row)
-
-    if not recommend_keep:
-        _push_fit(title, desc)
-    for kept_title, kept_desc in kept_options:
-        _push_fit(kept_title, kept_desc)
-    ranked.sort(key=lambda row: row["ctrFit"], reverse=True)
-    if current.strip() and not ranked:
-        title, desc = _keep_published(current), _keep_published(live_desc, 320)
-        recommend_keep = True
-        ctr_fit = live_fit
-        seo_score = live_seo
-        ranked_alts: list[dict] = []
-    elif ranked:
-        title, desc = ranked[0]["title"], ranked[0]["description"]
-        recommend_keep = False
-        ctr_fit = ranked[0]["ctrFit"]
-        seo_score = ranked[0]["seoScore"]
-        ranked_alts = ranked[1:3]
+    if judge_used:
+        # Judge order is the ranking. ctrFit is kept for the UI but is no longer the decision.
+        for row in judged_rows[:3]:
+            fit = _fit_row(row["title"], row["description"])
+            ranked.append({**fit, "title": row["title"], "description": row["description"], "judgeScore": row["score"], "judgeNote": row.get("note") or ""})
+        if recommend_keep:
+            ctr_fit, seo_score = live_fit, live_seo
+            ranked_alts = ranked[:2]
+        else:
+            ctr_fit, seo_score = ranked[0]["ctrFit"], ranked[0]["seoScore"]
+            ranked_alts = [row for row in ranked[1:3] if row["judgeScore"] >= (judged_live or {}).get("score", 0)]
     else:
-        ctr_fit = live_fit
-        seo_score = live_seo
-        ranked_alts = []
+        seen_fit: set[tuple[str, str]] = set()
+
+        def _push_fit(cand_title: str, cand_desc: str) -> None:
+            row = _fit_row(cand_title, cand_desc)
+            key = (row["title"].lower(), row["description"].lower())
+            if not row["title"] or not row["description"] or key in seen_fit:
+                return
+            if not listing_is_stronger(
+                row["title"], row["description"], current, live_desc, brand,
+                keyword=keyword, places=places, offers=offers, rival=meet,
+            ):
+                return
+            if hard_checks(row["title"], row["description"]):
+                return
+            if row["ctrFit"] <= live_fit:
+                return
+            seen_fit.add(key)
+            ranked.append(row)
+
+        if not recommend_keep:
+            _push_fit(title, desc)
+        for kept_title, kept_desc in kept_options:
+            _push_fit(kept_title, kept_desc)
+        ranked.sort(key=lambda row: row["ctrFit"], reverse=True)
+        if current.strip() and not ranked:
+            title, desc = _keep_published(current), _keep_published(live_desc, 320)
+            recommend_keep = True
+            ctr_fit = live_fit
+            seo_score = live_seo
+            ranked_alts = []
+        elif ranked:
+            title, desc = ranked[0]["title"], ranked[0]["description"]
+            recommend_keep = False
+            ctr_fit = ranked[0]["ctrFit"]
+            seo_score = ranked[0]["seoScore"]
+            ranked_alts = ranked[1:3]
+        else:
+            ctr_fit = live_fit
+            seo_score = live_seo
+            ranked_alts = []
     if not reason:
         reason = "Written from the business concept, the best keyword, and the competitor this page has to meet."
     if keyword and "best keyword" not in reason.lower() and f"“{keyword}”" not in reason and not recommend_keep:
@@ -1874,18 +1957,24 @@ def write_title_description(
         schema_types=scraped.get("schemaTypes") or [],
         share_image=share,
     ) if title or desc else {}
-    open_issues = [] if recommend_keep else (checks(title, desc) if title else ["The writer returned no title."])
-    beats_live = (
-        False
-        if recommend_keep
-        else bool(title and desc) and listing_is_stronger(
+    if recommend_keep:
+        open_issues = []
+    elif judge_used:
+        open_issues = hard_checks(title, desc) if title else ["The writer returned no title."]
+    else:
+        open_issues = checks(title, desc) if title else ["The writer returned no title."]
+    if recommend_keep:
+        beats_live = False
+    elif judge_used:
+        beats_live = bool(title and desc) and (judged_live is None or bool(ranked) and ranked[0]["judgeScore"] >= judged_live["score"] + WIN_MARGIN)
+    else:
+        beats_live = bool(title and desc) and listing_is_stronger(
             title, desc, current, live_desc, brand, keyword=keyword, places=places, offers=offers, rival=meet,
         )
-    )
     target_kw = _parse_target(text) or keyword or ((site or {}).get("page") or {}).get("target") or ""
     # Preserve distinct social copy when recommending keep; otherwise align OG with the proposed listing.
     if recommend_keep:
-        og_title = _keep_published(str(scraped.get("ogTitle") or current or title), 120)  # never truncate a published title
+        og_title = _fit_title(str(scraped.get("ogTitle") or current or title), tail)
         og_desc = _fit_desc(str(scraped.get("ogDescription") or live_desc or desc))
     else:
         og_title, og_desc = title, desc
@@ -1945,6 +2034,18 @@ def write_title_description(
         "dataKind": "listing_recommendation",
         "provider": model or "openai",
         "generatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "judge": {
+            "used": judge_used,
+            "margin": WIN_MARGIN,
+            "liveScore": (judged_live or {}).get("score"),
+            "liveNote": (judged_live or {}).get("note") or "",
+            "liveScores": (judged_live or {}).get("scores") or {},
+            "candidates": [
+                {"title": row["title"], "description": row["description"], "score": row["score"], "scores": row.get("scores") or {}, "note": row.get("note") or ""}
+                for row in judged_rows[:6]
+            ],
+            "candidatesConsidered": len(pool),
+        },
         "currentAssessment": current_assessment,
         "improvement": (
             "None — keep the published listing."
@@ -1977,6 +2078,10 @@ def write_title_description(
         "metaDescription": desc,
         "ctrFit": ctr_fit,
         "seoScore": seo_score,
+        "judgeScore": (
+            (judged_live or {}).get("score") if recommend_keep else (ranked[0].get("judgeScore") if ranked else None)
+        ) if judge_used else None,
+        "liveScore": (judged_live or {}).get("score") if judge_used else None,
         "liveCtr": gsc.get("ctr") or "",
         "alternatives": ranked_alts,
         "openGraphTitle": og_title,

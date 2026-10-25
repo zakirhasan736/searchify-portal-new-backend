@@ -2036,6 +2036,32 @@ def propose_from_gsc(
                 "meetCompetitor": drafted.get("meetCompetitor") or {},
                 "beatsLive": bool(drafted.get("beatsLive")),
                 "recommendKeep": bool(drafted.get("recommendKeep")),
+                "ctrFit": drafted.get("ctrFit") or 0,
+                "seoScore": drafted.get("seoScore") or 0,
+                "judgeScore": drafted.get("judgeScore"),
+                "liveScore": drafted.get("liveScore"),
+                "aiAlternatives": [
+                    {
+                        "title": drafted.get("title") or "",
+                        "description": drafted.get("metaDescription") or "",
+                        "reason": drafted.get("reason") or "",
+                        "ctrFit": drafted.get("ctrFit") or 0,
+                        "seoScore": drafted.get("seoScore") or 0,
+                        "judgeScore": drafted.get("judgeScore"),
+                    },
+                    *[
+                        {
+                            "title": alt.get("title") or "",
+                            "description": alt.get("description") or "",
+                            "reason": alt.get("judgeNote") or "",
+                            "ctrFit": alt.get("ctrFit") or 0,
+                            "seoScore": alt.get("seoScore") or 0,
+                            "judgeScore": alt.get("judgeScore"),
+                        }
+                        for alt in (drafted.get("alternatives") or [])[:2]
+                        if isinstance(alt, dict) and alt.get("title")
+                    ],
+                ],
                 "decision": drafted.get("decision") or "",
                 "evidenceRecord": drafted.get("evidenceRecord") or {},
                 "evaluation": drafted.get("evaluation") or {},
@@ -2575,6 +2601,7 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             "reason": drafted.get("reason") or "",
             "ctrFit": drafted.get("ctrFit") or 0,
             "seoScore": drafted.get("seoScore") or 0,
+            "judgeScore": drafted.get("judgeScore"),
         },
     ]
     for alt in drafted.get("alternatives") or []:
@@ -2596,8 +2623,12 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
             "reason": "",
             "ctrFit": alt.get("ctrFit") or 0,
             "seoScore": alt.get("seoScore") or 0,
+            "judgeScore": alt.get("judgeScore"),
         })
-    options.sort(key=lambda row: (int(row.get("ctrFit") or 0), int(row.get("seoScore") or 0)), reverse=True)
+    # The blind-judge score is the decision; ctrFit/seoScore only break ties. Keep the chosen listing first.
+    head, rest = options[:1], options[1:]
+    rest.sort(key=lambda row: (float(row.get("judgeScore") or 0), int(row.get("ctrFit") or 0), int(row.get("seoScore") or 0)), reverse=True)
+    options = head + rest
     options = options[:3]
     title = options[0]["title"]
     desc = options[0]["description"]
@@ -2608,6 +2639,8 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["ctrFit"] = options[0].get("ctrFit") or drafted.get("ctrFit") or 0
     proposed["seoScore"] = options[0].get("seoScore") or drafted.get("seoScore") or 0
     proposed["liveCtr"] = drafted.get("liveCtr") or gsc_evidence.get("ctr") or ""
+    proposed["judgeScore"] = drafted.get("judgeScore")
+    proposed["liveScore"] = drafted.get("liveScore")
     proposed["reason"] = drafted.get("reason") or ""
     proposed["aiAlternatives"] = options
     proposed["model"] = drafted.get("model")
