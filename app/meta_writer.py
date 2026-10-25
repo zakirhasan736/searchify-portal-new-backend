@@ -730,6 +730,22 @@ def _analytics_block(analytics: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _speed_block(analytics: dict | None) -> str:
+    speed = (analytics or {}).get("speed") or {}
+    if not speed.get("speedIndex") and not speed.get("seo") and not speed.get("lcp"):
+        return "(No PageSpeed reading for this page. Do not invent a Speed Index or a score.)"
+    return "\n".join(
+        [
+            f"- Mobile Speed Index: {speed.get('speedIndex') or '—'}",
+            f"- Desktop Speed Index: {speed.get('speedIndexDesktop') or '—'}",
+            f"- LCP: {speed.get('lcp') or '—'}",
+            f"- Performance score: {speed.get('performance') or '—'}",
+            f"- SEO score: {speed.get('seo') or '—'}",
+            f"- Source: {speed.get('source') or 'stored'}",
+        ]
+    )
+
+
 def _site_block(site: dict | None) -> str:
     data = site or {}
     business = data.get("business") or {}
@@ -947,6 +963,24 @@ def write_title_description(
     def seo_content_draft() -> dict:
         from app import dfs_meta
 
+        measured = []
+        if gsc.get("clicks") not in (None, ""):
+            measured.append(
+                f"Search Console: clicks {gsc.get('clicks')}, impressions {gsc.get('impressions')}, "
+                f"CTR {gsc.get('ctr')}, position {gsc.get('position')}."
+            )
+        speed = (analytics or {}).get("speed") or {}
+        if speed.get("speedIndex"):
+            measured.append(
+                f"PageSpeed mobile Speed Index {speed.get('speedIndex')}, LCP {speed.get('lcp') or 'unknown'}, "
+                f"SEO score {speed.get('seo') or 'unknown'}."
+            )
+        landing = (analytics or {}).get("landing")
+        if isinstance(landing, (list, tuple)) and len(landing) > 1:
+            measured.append(f"Analytics landing sessions {landing[1]}.")
+        page_text = str(scraped.get("text") or "")
+        if measured:
+            page_text = (page_text + "\nMeasured: " + " ".join(measured)).strip()
         return dfs_meta.draft_from_research(
             db,
             user,
@@ -955,7 +989,7 @@ def write_title_description(
             offers=offers,
             current_title=str(scraped.get("title") or ""),
             current_desc=str(scraped.get("description") or ""),
-            page_text=str(scraped.get("text") or ""),
+            page_text=page_text,
             headings=str(headings or ""),
             rival_title=str(meet.get("title") or ""),
             anchors=page_anchors(research, page_url),
@@ -1246,6 +1280,7 @@ def write_title_description(
         f"Page copy:\n{(scraped.get('text') or scraped.get('error') or '(could not read the page)')[:3200]}\n"
         f"{short_note}\n"
         f"Analytics for the property, last stored window. Use a figure only if it is written here:\n{_analytics_block(analytics)}\n\n"
+        f"6. PAGE SPEED. Context for how the page loads. Do not put the Speed Index in the title unless this page is about speed:\n{_speed_block(analytics)}\n\n"
         f"{specificity_instruction(specificity)}\n"
         f"{objective_instruction(objective_key)}\n"
     )
@@ -1364,6 +1399,18 @@ def write_title_description(
             ))
         return found[:8]
 
+    kept_options: list[tuple[str, str]] = []
+
+    def keep_option(cand_title: str, cand_desc: str) -> None:
+        t = _clean(cand_title or "", 60)
+        d = _clean(cand_desc or "", 155)
+        if not t or not d:
+            return
+        key = (t.lower(), d.lower())
+        if any((a.lower(), b.lower()) == key for a, b in kept_options):
+            return
+        kept_options.append((t, d))
+
     seo_seed = seo_content_draft()
     seed_note = ""
     if seo_seed.get("title") and seo_seed.get("description"):
@@ -1374,6 +1421,7 @@ def write_title_description(
         )
     text, model, role = _ask(brief + seed_note + "\nWrite the listing for this page only.")
     title, desc, reason = _parse_meta(text)
+    keep_option(title, desc)
     issues = checks(title, desc)
     if issues:
         retry_text, retry_model, retry_role = _ask(
@@ -1387,6 +1435,7 @@ def write_title_description(
         retry_title, retry_desc, retry_reason = _parse_meta(retry_text)
         retry_issues = checks(retry_title, retry_desc)
         if len(retry_issues) <= len(issues) and retry_title and retry_desc:
+            keep_option(retry_title, retry_desc)
             title, desc, reason = retry_title, retry_desc, retry_reason
             text, model, role = retry_text, retry_model, retry_role
             issues = retry_issues
@@ -1410,6 +1459,8 @@ def write_title_description(
             or "not a case study" in issue.lower()
             for issue in checks(seo_title, seo_desc)
         )
+        if not seo_bleed:
+            keep_option(seo_title, seo_desc)
         if not seo_bleed and score_candidate(seo_title, seo_desc) < score_candidate(title, desc):
             title, desc = seo_title, seo_desc
             reason = (
@@ -1431,6 +1482,7 @@ def write_title_description(
             "; ".join(hard_fail[:3]),
         )
         if current.strip() and live_desc.strip():
+            keep_option(title, desc)
             title, desc = _clean(current, 60), _clean(live_desc, 155)
             reason = (
                 "No-change recommendation: the draft failed factual or relevance checks. "
@@ -1445,6 +1497,7 @@ def write_title_description(
         fluff = listing_fluff_problems(title, desc, evidence=evidence_text)
         remaining_hard = hard_checks(title, desc) if title and desc else []
         if same or (not stronger) or fluff or remaining_hard:
+            keep_option(title, desc)
             title, desc = _clean(current, 60), _clean(live_desc, 155)
             recommend_keep = True
             if keyword_evidence_insufficient:
@@ -1528,6 +1581,7 @@ def write_title_description(
                 "Searchify SEO content generation" if (seo_seed and seo_seed.get("title")) or model == "searchify-seo-content" else "",
                 f"Competitor to meet: {meet.get('title')}" if meet.get("title") else "No same-keyword competitor stored",
                 "Analytics landing facts (not a ranking source)" if (analytics or {}).get("connected") else "",
+                "PageSpeed Speed Index" if ((analytics or {}).get("speed") or {}).get("speedIndex") else "",
                 "JEV draft score",
             ) if part
         ],
@@ -1581,6 +1635,11 @@ def write_title_description(
         "analysis": analysis,
         "title": title,
         "metaDescription": desc,
+        "alternatives": [
+            {"title": t, "description": d}
+            for t, d in kept_options
+            if (t.lower(), d.lower()) != ((title or "").strip().lower(), (desc or "").strip().lower())
+        ][:2],
         "openGraphTitle": og_title,
         "openGraphDescription": og_desc,
         "shareImage": share,

@@ -89,6 +89,8 @@ def _wp_meta_payload(
     meta_desc: str | None,
     *,
     include_open_graph: bool = False,
+    og_title: str | None = None,
+    og_desc: str | None = None,
 ) -> dict[str, str]:
     meta: dict[str, str] = {}
     title = (meta_title or "").strip()
@@ -97,14 +99,16 @@ def _wp_meta_payload(
         for key in _WP_META_TITLE_KEYS:
             meta[key] = title
         if include_open_graph:
+            social = (og_title or title).strip()
             for key in _WP_OG_TITLE_KEYS:
-                meta[key] = title
+                meta[key] = social
     if desc:
         for key in _WP_META_DESC_KEYS:
             meta[key] = desc
         if include_open_graph:
+            social_desc = (og_desc or desc).strip()
             for key in _WP_OG_DESC_KEYS:
-                meta[key] = desc
+                meta[key] = social_desc
     return meta
 
 
@@ -410,23 +414,35 @@ def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
     include_json_ld = _truthy(change.get("includeJsonLd"))
     page_url = (change.get("targetUrl") or change.get("link") or site_url or "").strip()
     site_host = urlparse(base).hostname or ""
+    og_title = (change.get("openGraphTitle") or meta_title).strip()
+    og_desc = (change.get("openGraphDescription") or meta_desc).strip()
 
     payload: dict[str, Any] = {}
     # Explicit content body only when requested — never remap meta title → WP title.
     if change.get("updateContent") and change.get("content"):
         payload["content"] = change["content"]
-    meta = _wp_meta_payload(meta_title, meta_desc, include_open_graph=include_og)
+    meta = _wp_meta_payload(
+        meta_title,
+        meta_desc,
+        include_open_graph=include_og,
+        og_title=og_title,
+        og_desc=og_desc,
+    )
     if meta:
         payload["meta"] = meta
 
     json_ld: dict[str, Any] | None = None
     if include_json_ld and (meta_title or meta_desc):
-        json_ld = build_webpage_json_ld(
-            meta_title=meta_title,
-            meta_description=meta_desc,
-            page_url=page_url,
-            site_name=site_host,
-        )
+        stored = change.get("jsonLd")
+        if isinstance(stored, dict) and (stored.get("@type") or stored.get("@graph")):
+            json_ld = {k: v for k, v in stored.items() if not str(k).startswith("_")}
+        else:
+            json_ld = build_webpage_json_ld(
+                meta_title=meta_title,
+                meta_description=meta_desc,
+                page_url=page_url,
+                site_name=site_host,
+            )
 
     if dry:
         intended = dict(payload)

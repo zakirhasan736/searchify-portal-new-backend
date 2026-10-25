@@ -107,6 +107,10 @@ class ChangeBody(BaseModel):
     draft_with_ai: bool = True
     remote_id: str = ""
     resource: str = "post"  # post|page for WP
+    title: str = ""
+    meta_description: str = ""
+    before_title: str = ""
+    before_description: str = ""
 
 
 class ExecuteBody(BaseModel):
@@ -710,6 +714,16 @@ def _create_change(db: Session, user: User, body: ChangeBody) -> SiteChange:
         except Exception as exc:  # noqa: BLE001
             proposed["aiError"] = str(exc)[:200]
 
+    if (body.title or "").strip():
+        proposed["title"] = " ".join(body.title.split())[:120]
+    if (body.meta_description or "").strip():
+        proposed["metaDescription"] = " ".join(body.meta_description.split())[:180]
+    if (body.before_title or "").strip() or (body.before_description or "").strip():
+        proposed["beforeTitle"] = (body.before_title or "").strip()
+        proposed["liveTitle"] = proposed["beforeTitle"]
+        proposed["beforeDescription"] = (body.before_description or "").strip()
+        proposed["liveMetaDescription"] = proposed["beforeDescription"]
+
     change = SiteChange(
         customer_id=user.id,
         cms_connection_id=body.cms_connection_id,
@@ -1161,6 +1175,102 @@ def _analytics_for_page(db: Session, user_id: int, url: str) -> dict:
         "channels": list(channels.get("rows") or [])[:6],
         "landing": list(matched) if matched else None,
     }
+
+
+def _norm_path(url: str) -> str:
+    from urllib.parse import urlparse
+
+    raw = str(url or "").strip()
+    path = urlparse(raw).path if "://" in raw else raw
+    return (path or "/").split("?")[0].rstrip("/") or "/"
+
+
+def _gsc_for_page(db: Session, user_id: int, url: str, evidence: dict | None = None) -> dict:
+    """Page-level Search Console numbers, falling back to the card's stored evidence."""
+    base = dict(evidence or {})
+    if base.get("clicks") not in (None, "") and base.get("impressions") not in (None, ""):
+        return base
+    rec = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "top-pages")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    want = _norm_path(url)
+    for row in ((rec.payload if rec else {}) or {}).get("rows") or []:
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        if _norm_path(str(row[0])) != want:
+            continue
+        base.setdefault("clicks", row[1] if len(row) > 1 else None)
+        base.setdefault("impressions", row[2] if len(row) > 2 else None)
+        base.setdefault("ctr", row[3] if len(row) > 3 else None)
+        base.setdefault("position", row[4] if len(row) > 4 else None)
+        if len(row) > 6:
+            base.setdefault("sessions", row[5])
+            base.setdefault("users", row[6])
+        base["source"] = "search_console"
+        break
+    return base
+
+
+def _speed_for_page(db: Session, user_id: int, url: str) -> dict:
+    """Speed Index and Lighthouse scores. Stored PageSpeed first, then a short live read."""
+    rec = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "site-audit")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    labels = {
+        "Speed Index": "speedIndex",
+        "LCP": "lcp",
+        "SEO": "seo",
+        "Performance": "performance",
+        "CLS": "cls",
+        "FCP": "fcp",
+    }
+    out: dict = {}
+    for row in ((rec.payload if rec else {}) or {}).get("rows") or []:
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        key = labels.get(str(row[0]))
+        if not key:
+            continue
+        mobile = row[1] if len(row) > 1 else ""
+        desktop = row[2] if len(row) > 2 else ""
+        if mobile not in (None, "", "—"):
+            out[key] = mobile
+        if key == "speedIndex" and desktop not in (None, "", "—"):
+            out["speedIndexDesktop"] = desktop
+    if out.get("speedIndex"):
+        out["source"] = "stored"
+        return out
+    try:
+        from app import config
+        from app.google_oauth import run_pagespeed
+
+        if not config.GOOGLE_PAGESPEED_API_KEY or not url:
+            return out
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            mobile = pool.submit(run_pagespeed, url, "mobile").result(timeout=25)
+        vitals = mobile.get("vitals") or {}
+        scores = mobile.get("scores") or {}
+        if vitals.get("SI") and vitals.get("SI") != "—":
+            out["speedIndex"] = vitals.get("SI")
+        if vitals.get("LCP") and vitals.get("LCP") != "—":
+            out["lcp"] = vitals.get("LCP")
+        if scores.get("seo"):
+            out["seo"] = scores.get("seo")
+        if scores.get("performance"):
+            out["performance"] = scores.get("performance")
+        if out:
+            out["source"] = "live"
+    except Exception:  # noqa: BLE001
+        return out
+    return out
 
 
 SCAN_MAX_AGE_HOURS = 72
@@ -2039,6 +2149,10 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
         "collectionId": (conn.credentials or {}).get("collectionId"),
         "includeOpenGraph": include_open_graph,
         "includeJsonLd": include_json_ld,
+        "openGraphTitle": (proposed.get("openGraphTitle") or approved["title"] or "").strip(),
+        "openGraphDescription": (proposed.get("openGraphDescription") or approved["metaDescription"] or "").strip(),
+        "jsonLd": proposed.get("jsonLd") if isinstance(proposed.get("jsonLd"), dict) else None,
+        "beforeTitle": proposed.get("beforeTitle") or proposed.get("liveTitle") or "",
     }
 
     if body.force_dry_run:
@@ -2055,7 +2169,18 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
                 status_code=409,
                 detail={"code": "source_unreadable", "message": "Could not read the live page to confirm it has not changed since review. Nothing was published. Try again."},
             )
-        changed = approval.listing_changed({"title": proposed.get("beforeTitle"), "description": proposed.get("beforeDescription")}, live)
+        seen_title = (proposed.get("beforeTitle") or "").strip()
+        seen_desc = (proposed.get("beforeDescription") or proposed.get("beforeMetaDescription") or "").strip()
+        if not seen_title and not seen_desc:
+            # First publish for this card: the page we just read is the baseline.
+            proposed["beforeTitle"] = live.get("title") or ""
+            proposed["beforeDescription"] = live.get("description") or ""
+            proposed["liveTitle"] = proposed["beforeTitle"]
+            proposed["liveMetaDescription"] = proposed["beforeDescription"]
+            row.proposed = proposed
+            changed = []
+        else:
+            changed = approval.listing_changed({"title": seen_title, "description": seen_desc}, live)
         if changed:
             approval.send_back_for_review(row, live, changed)
             db.commit()
@@ -2253,6 +2378,13 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
 
     scan = _latest_scan(db, user.id, host_of(row.target_url or ""))
     page, site_ctx, scan_rivals = _site_context(scan, row.target_url or "")
+    from app.page_scrape import scrape_page
+
+    fresh = scrape_page(row.target_url or "")
+    if fresh and not fresh.get("error"):
+        # Live scrape wins over the stored scan so the current title is what is on the page now.
+        page = {**(page or {}), **{k: v for k, v in fresh.items() if v not in (None, "", [], {})}}
+        page["url"] = fresh.get("url") or row.target_url or page.get("url")
     competitors = scan_rivals or proposed.get("competitors") or []
     if not competitors:
         try:
@@ -2282,10 +2414,12 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
         from app.meta_writer import write_title_description
 
         page_analytics = _analytics_for_page(db, user.id, row.target_url or "")
+        page_analytics["speed"] = _speed_for_page(db, user.id, row.target_url or "")
+        gsc_evidence = _gsc_for_page(db, user.id, row.target_url or "", proposed.get("evidence") or {})
         drafted = write_title_description(
             url=row.target_url,
             profile={**_brief_profile(profile, (scan or {}).get("brief")), "voice": body.tone or profile.get("voice") or ""},
-            gsc=(proposed.get("evidence") or {}),
+            gsc=gsc_evidence,
             queries=query_terms,
             competitors=competitors,
             analytics=page_analytics,
@@ -2307,10 +2441,29 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
 
     title = drafted.get("title") or ""
     desc = drafted.get("metaDescription") or ""
+    if gsc_evidence:
+        proposed["evidence"] = {**(proposed.get("evidence") or {}), **gsc_evidence}
+    if page_analytics.get("speed"):
+        proposed["speed"] = page_analytics["speed"]
     recommend_keep = bool(drafted.get("recommendKeep"))
     options = [
         {"title": title, "description": desc, "reason": drafted.get("reason") or ""},
     ]
+    for alt in drafted.get("alternatives") or []:
+        if not isinstance(alt, dict):
+            continue
+        alt_title = str(alt.get("title") or "").strip()
+        alt_desc = str(alt.get("description") or "").strip()
+        if not alt_title and not alt_desc:
+            continue
+        if any(
+            str(row.get("title") or "").strip() == alt_title
+            and str(row.get("description") or "").strip() == alt_desc
+            for row in options
+        ):
+            continue
+        options.append({"title": alt_title, "description": alt_desc, "reason": ""})
+    options = options[:3]
     # Apply the regenerated listing package to the card — title, description, OG, and JSON-LD stay aligned.
     # No-change recommendations still refresh analysis but keep published messaging as the draft.
     proposed["title"] = title
@@ -2375,8 +2528,11 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     )
     if scraped.get("title"):
         proposed["beforeTitle"] = scraped.get("title")
+        proposed["liveTitle"] = scraped.get("title")
     if scraped.get("description"):
         proposed["beforeDescription"] = scraped.get("description")
+        proposed["liveMetaDescription"] = scraped.get("description")
+        proposed["beforeMetaDescription"] = scraped.get("description")
     from app.approval import sync_listing_package
 
     sync_listing_package(proposed, page_url=row.target_url or "")
