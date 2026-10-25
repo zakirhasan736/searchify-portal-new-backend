@@ -69,13 +69,25 @@ def _ensure_google_config():
         raise HTTPException(status_code=503, detail="Google OAuth is not configured in .env")
 
 
-def _friendly_google_error(exc: Exception) -> str:
+def _friendly_google_error(exc: Exception, *, email: str = "", site_url: str = "") -> str:
     detail = str(exc)
     low = detail.lower()
     if "getaddrinfo" in low or "name or service not known" in low or "failed to resolve" in low:
         return "Could not reach Google APIs (DNS/network). Check internet, then Sync again."
     if "object is not bound" in low or "objectdeletederror" in low:
         return "Google was disconnected during sync. Connect Google again, then Sync."
+    if "sufficient permission" in low or ("permission" in low and "site" in low) or '"code": 403' in low or '"code":403' in low:
+        who = (email or "This Google account").strip()
+        prop = (site_url or "").strip()
+        if "cannot read Search Console" in detail:
+            return detail[:500]
+        kind = "Domain property" if prop.lower().startswith("sc-domain:") else "Search Console property"
+        target = prop or "the selected property"
+        return (
+            f"{who} cannot read {kind} {target}. "
+            "In Search Console > Users and permissions, add that exact Google email as Full on that exact property "
+            "(Domain `sc-domain:…` is not the same as `https://…`). Accept the invite, reconnect in Searchify, then Save and sync."
+        )
     return detail[:500]
 
 
@@ -821,7 +833,24 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
         if gsc_value:
             allowed = {p["siteUrl"]: p for p in goauth.list_gsc_sites(token)}
             if gsc_value not in allowed or allowed[gsc_value].get("permissionLevel") in google_match.UNUSABLE:
-                raise HTTPException(status_code=422, detail={"code": "gsc_no_access", "message": f"{row.google_email or 'This Google account'} cannot read Search Console data for {gsc_value}."})
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "gsc_no_access",
+                        "message": (
+                            f"{row.google_email or 'This Google account'} cannot read Search Console data for {gsc_value}. "
+                            "Ask the client to add this exact email as Full on that exact property "
+                            "(Domain and URL-prefix are separate), accept the invite, then try again."
+                        ),
+                    },
+                )
+            try:
+                goauth.probe_gsc_access(token, gsc_value, email=row.google_email or "")
+            except RuntimeError as probe_exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail={"code": "gsc_no_access", "message": str(probe_exc)[:500]},
+                ) from probe_exc
         if ga4_value:
             props = {p["propertyId"]: p for p in goauth.list_ga4_properties(token)}
             if ga4_value not in props:
@@ -1813,13 +1842,17 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         db.commit()
     except Exception as exc:  # noqa: BLE001
         db.rollback()
-        detail = _friendly_google_error(exc)
         fresh = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user_id).first()
+        detail = _friendly_google_error(
+            exc,
+            email=(fresh.google_email if fresh else "") or "",
+            site_url=(fresh.gsc_site_url if fresh else "") or "",
+        )
         if fresh is not None:
             fresh.last_error = detail[:500]
             fresh.status = "error"
             db.commit()
-        raise HTTPException(status_code=502, detail=detail[:300]) from exc
+        raise HTTPException(status_code=502, detail=detail[:500]) from exc
 
     return {"ok": True, "synced": synced, "enriched": enriched, "connection": _connection_payload(row)}
 

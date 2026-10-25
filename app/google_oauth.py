@@ -156,6 +156,41 @@ def list_gsc_sites(access_token: str) -> list[dict]:
     ]
 
 
+def explain_gsc_http_error(status_code: int, body: str, *, site_url: str = "", email: str = "") -> str:
+    """Turn Google Search Console HTTP errors into an actionable message."""
+    text = str(body or "")
+    low = text.lower()
+    who = (email or "This Google account").strip()
+    prop = (site_url or "this property").strip()
+    if status_code == 403 or "does not have sufficient permission" in low or "permission" in low and "site" in low:
+        kind = "Domain property" if prop.lower().startswith("sc-domain:") else "URL-prefix property"
+        return (
+            f"{who} cannot read Search Console data for {prop} ({kind}). "
+            "Ask the client to open Search Console > Settings > Users and permissions, "
+            f"add {who} as Full on that exact property (Domain and URL-prefix are different), "
+            "then accept the email invite and sign in to Searchify with that same Google account. "
+            "After that, choose the property again and Save and sync."
+        )
+    if status_code == 401 or "invalid_grant" in low or "auth" in low and "fail" in low:
+        return f"Google sign-in for {who} expired. Disconnect Google, connect again, then sync."
+    return f"GSC request failed ({status_code}) for {prop}: {text[:240]}"
+
+
+def probe_gsc_access(access_token: str, site_url: str, *, email: str = "") -> dict:
+    """Confirm this token can query Search Analytics for site_url. Raises RuntimeError if not."""
+    from urllib.parse import quote
+
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=7)
+    url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
+    body = {"startDate": start.isoformat(), "endDate": end.isoformat(), "dimensions": ["query"], "rowLimit": 1}
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
+    if response.status_code >= 400:
+        raise RuntimeError(explain_gsc_http_error(response.status_code, response.text, site_url=site_url, email=email))
+    return {"ok": True, "siteUrl": site_url}
+
+
 def list_ga4_properties(access_token: str) -> list[dict]:
     with httpx.Client(timeout=30.0) as client:
         response = client.get(
@@ -204,7 +239,7 @@ def fetch_gsc_dimension(
     with httpx.Client(timeout=45.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
-        raise RuntimeError(f"GSC {dimension} failed: {response.text[:300]}")
+        raise RuntimeError(explain_gsc_http_error(response.status_code, response.text, site_url=site_url))
     rows = []
     for row in response.json().get("rows") or []:
         keys = row.get("keys") or [""]
