@@ -19,9 +19,14 @@ PRICE = {"solo": 29, "pro": 79, "premium": 399, "ent": 1250}
 
 
 class CustomerActionBody(BaseModel):
-    action: str = Field(..., description="free_month|refund|change_plan|cancel|impersonate")
+    action: str = Field(..., description="record_payment|mark_failed|free_month|refund|change_plan|cancel|impersonate")
     plan: str | None = None
+    amount: float | None = None  # record_payment: amount paid (defaults to the plan price)
     reason: str = "Customer asked"
+
+
+class PayoutRunBody(BaseModel):
+    ids: list[str] | None = None  # partner ids ("u12"); default: every partner approved in the run
 
 
 class PartnersStateBody(BaseModel):
@@ -29,6 +34,7 @@ class PartnersStateBody(BaseModel):
     paid: bool | None = None
     apps: dict | None = None
     rates: dict | None = None
+    programs: dict | None = None  # {"u12": "founding" | "standard"}
     cleared: dict | None = None
     grants: dict | None = None
 
@@ -44,6 +50,7 @@ class ShareholdersStateBody(BaseModel):
     prepared: bool | None = None
     quarterly: str | None = None
     howard: list | None = None
+    holders: list[dict] | None = None  # cap table: [{name, pct 0-1, shares, where, wh 0-0.5, note}]
 
 
 def _require_admin(user: User) -> User:
@@ -332,10 +339,10 @@ def _demo_partners() -> dict:
             },
         ],
         "partners": [
-            {"id": "sam", "name": "Sam Ortiz", "type": "Partner since May 2026", "rate": 30, "founding": False, "qual": 38, "paying": 41, "life": 5779.7, "flag": ""},
-            {"id": "wp", "name": "WP Agency Collective", "type": "Partner since Jun 2026", "rate": 30, "founding": False, "qual": 15, "paying": 17, "life": 2104.9, "flag": ""},
-            {"id": "lml", "name": "Local Marketing Lab", "type": "Partner since Jul 2026", "rate": 30, "founding": False, "qual": 8, "paying": 9, "life": 744.0, "flag": "Tax details missing"},
-            {"id": "dana", "name": "Dana Kim", "type": "Partner since Aug 2026", "rate": 30, "founding": False, "qual": 4, "paying": 4, "life": 128.4, "flag": "2 sign-ups used Dana's card"},
+            {"id": "sam", "name": "Sam Ortiz", "type": "Affiliate since May 2026", "rate": 20, "founding": False, "qual": 38, "paying": 41, "life": 5779.7, "flag": ""},
+            {"id": "wp", "name": "WP Agency Collective", "type": "Affiliate since Jun 2026", "rate": 20, "founding": False, "qual": 15, "paying": 17, "life": 2104.9, "flag": ""},
+            {"id": "lml", "name": "Local Marketing Lab", "type": "Affiliate since Jul 2026", "rate": 20, "founding": False, "qual": 8, "paying": 9, "life": 744.0, "flag": "Tax details missing"},
+            {"id": "dana", "name": "Dana Kim", "type": "Affiliate since Aug 2026", "rate": 20, "founding": False, "qual": 4, "paying": 4, "life": 128.4, "flag": "2 sign-ups used Dana's card"},
             {"id": "nick", "name": "Nicholas Petitt", "type": "Founding partner", "rate": 35, "founding": True, "qual": 8, "paying": 13, "life": 2502.7, "flag": ""},
             {"id": "emin", "name": "Emin Navasartian", "type": "Founding partner", "rate": 35, "founding": True, "qual": 3, "paying": 4, "life": 188.1, "flag": ""},
             {"id": "howard", "name": "Howard Wang", "type": "Founding partner", "rate": 35, "founding": True, "qual": 2, "paying": 2, "life": 83.3, "flag": ""},
@@ -545,6 +552,7 @@ def act_customer(
         body.plan,
         body.reason or "Customer asked",
         user.username or "Admin",
+        body.amount,
     )
     if result.get("error") == "Unknown plan":
         raise HTTPException(400, "Unknown plan")
@@ -604,7 +612,7 @@ def _partners_payload(db: Session, admin: User) -> dict:
 
 def _real_partners(db: Session) -> list[dict]:
     """Partner accounts that exist in the database (approved applications and the seeded partner)."""
-    from app.routers.partners import PRICE, _default_profile
+    from app.routers.partners import PRICE, _default_profile, program_status
 
     out = []
     for user in db.query(User).filter(User.role == "ROLE_PARTNER").order_by(User.id).all():
@@ -619,9 +627,10 @@ def _real_partners(db: Session) -> list[dict]:
             "name": profile.get("displayName") or user.username,
             "email": user.email,
             "handle": profile.get("handle") or "",
-            "type": ("Founding partner" if founding else "Partner") + f" since {profile.get('since') or ''}".rstrip(),
-            "rate": int(round(float(profile.get("rate") or 0.3) * 100)),
+            "type": ("Founding partner" if founding else "Affiliate") + f" since {profile.get('since') or ''}".rstrip(),
+            "rate": int(round(rate_of(profile) * 100)),
             "founding": founding,
+            "program": program_status(profile),
             "qual": int(profile.get("qualified") or 0),
             "paying": paying,
             "life": round(life, 2),
@@ -631,9 +640,12 @@ def _real_partners(db: Session) -> list[dict]:
     return out
 
 
+from app.routers.partners import PROGRAMS, program_of, rate_of  # noqa: E402
+
+
 class DecisionBody(BaseModel):
-    rate: float = 30
-    founding: bool = False
+    rate: float | None = None  # percent; default is the program's starting rate
+    founding: bool = False  # True: founding program (investors, developers). False: affiliate program
 
 
 @router.post("/partners/applications/{app_id}/approve")
@@ -643,7 +655,7 @@ def approve_partner(app_id: str, body: DecisionBody | None = None, db: Session =
     from app.routers.partners import approve_application
 
     body = body or DecisionBody()
-    rate = max(1.0, min(60.0, float(body.rate or 30))) / 100
+    rate = None if body.rate is None else float(body.rate) / 100
     return approve_application(db, _admin_owner(db).id, app_id, rate=rate, founding=bool(body.founding))
 
 
@@ -695,6 +707,48 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
         state["apps"] = {**state.get("apps", {}), **body.apps}
     if body.rates is not None:
         state["rates"] = {**state.get("rates", {}), **body.rates}
+        # The rate lives on the partner's own account, so the partner centre shows the same number.
+        from app.routers.partners import _save_feature as save_partner_feature
+
+        for key, value in body.rates.items():
+            try:
+                partner = db.get(User, int(str(key).lstrip("u")))
+                pct = float(value)
+            except (TypeError, ValueError):
+                continue
+            if partner is None or partner.role != "ROLE_PARTNER":
+                continue
+            profile = _feature(db, partner.id, "partner-profile")
+            prog = program_of(profile)
+            if not round(prog["base"] * 100, 4) <= pct <= round(prog["top"] * 100, 4):
+                raise HTTPException(
+                    400,
+                    f"{prog['name']} rates run from {int(round(prog['base'] * 100))}% to {int(round(prog['top'] * 100))}%.",
+                )
+            if profile.get("tier") == "founding" and pct / 100 < rate_of(profile):
+                raise HTTPException(400, "A founding partner's rate can only be moved up.")
+            profile["rate"] = round(pct / 100, 4)
+            save_partner_feature(db, partner.id, "partner-profile", "Partner profile", profile)
+    if body.programs is not None:
+        # Move a partner between programs: the rate moves to the new program's starting rate
+        # (or stays, when it is already inside the new range).
+        from app.routers.partners import _save_feature as save_partner_feature
+
+        for key, value in body.programs.items():
+            if value not in PROGRAMS:
+                raise HTTPException(400, "Program must be founding or standard.")
+            try:
+                partner = db.get(User, int(str(key).lstrip("u")))
+            except (TypeError, ValueError):
+                continue
+            if partner is None or partner.role != "ROLE_PARTNER":
+                continue
+            profile = _feature(db, partner.id, "partner-profile")
+            new = PROGRAMS[value]
+            current = rate_of(profile)
+            profile["tier"] = value
+            profile["rate"] = current if new["base"] <= current <= new["top"] else new["base"]
+            save_partner_feature(db, partner.id, "partner-profile", "Partner profile", profile)
     if body.cleared is not None:
         state["cleared"] = {**state.get("cleared", {}), **body.cleared}
     if body.grants is not None:
@@ -702,6 +756,49 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
     _save_feature(db, admin.id, "hq-partners-state", "HQ partners state", state)
     data = _partners_payload(db, admin)
     return {"ok": True, "live": True, **data}
+
+
+@router.post("/partners/payout")
+def run_partner_payout(body: PayoutRunBody | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Record this month's payouts: each approved partner's cleared balance moves to Paid.
+
+    The money itself is sent outside Searchify (PayPal, Wise or bank) using the method on file.
+    """
+    _require_admin(user)
+    from app.routers.partners import _feature as partner_feature
+    from app.routers.partners import pay_out
+
+    admin = _admin_owner(db)
+    state = dict(_feature(db, admin.id, "hq-partners-state") or {})
+    approved = [key for key, value in (state.get("run") or {}).items() if value == "approved"]
+    ids = (body.ids if body and body.ids else approved) or []
+    results, total = [], 0.0
+    for key in ids:
+        try:
+            partner = db.get(User, int(str(key).lstrip("u")))
+        except ValueError:
+            partner = None
+        if partner is None or partner.role != "ROLE_PARTNER":
+            continue
+        payout = partner_feature(db, partner.id, "partner-payout")
+        if not (payout.get("certified") or payout.get("legalName")):
+            results.append({"id": key, "paid": 0, "held": True, "reason": "Tax details missing."})
+            continue
+        done = pay_out(db, partner)
+        total += done["paid"]
+        results.append({"id": key, **done})
+    state["paid"] = bool(total)
+    state["lastRun"] = {"at": datetime.utcnow().isoformat() + "Z", "total": round(total, 2), "results": results}
+    state["run"] = {k: v for k, v in (state.get("run") or {}).items() if k not in {r["id"] for r in results if r.get("paid")}}
+    _save_feature(db, admin.id, "hq-partners-state", "HQ partners state", state)
+    data = _partners_payload(db, admin)
+    paid_n = len([r for r in results if r.get("paid")])
+    message = (
+        f"Recorded ${total:,.2f} paid to {paid_n} partner{'s' if paid_n != 1 else ''}. Send each amount with the method on file."
+        if paid_n
+        else "Nothing was paid: no approved partner had a cleared balance over the minimum with tax details on file."
+    )
+    return {"ok": True, "message": message, "results": results, **data}
 
 
 @router.get("/problems")
@@ -735,8 +832,18 @@ def act_problem(
         done[problem_id] = True
         msg = "Resolved."
     elif body.action == "email":
-        emailed[problem_id] = True
-        msg = "Email sent."
+        from app import mailer
+
+        item = next(item for item in items if item.get("id") == problem_id)
+        to = item.get("email") or ""
+        if not to:
+            raise HTTPException(400, "This problem has no customer email.")
+        if mailer.send(to, item.get("emailSubject") or "A note from Searchify", item.get("emailBody") or ""):
+            emailed[problem_id] = True
+            msg = f"Email sent to {to}."
+        else:
+            # Never claim an email went out when it did not.
+            msg = f"Email isn't set up, so nothing was sent. Contact {to} directly."
     else:
         raise HTTPException(400, "Unknown action")
     _save_feature(db, admin.id, "hq-problems-state", "HQ problems state", {"done": done, "emailed": emailed})
@@ -779,8 +886,33 @@ def put_shareholders(
         state["quarterly"] = body.quarterly
     if body.howard is not None:
         state["howard"] = body.howard
+    if body.holders is not None:
+        clean = []
+        for row in body.holders[:50]:
+            name = " ".join(str(row.get("name") or "").split())[:80]
+            if not name:
+                continue
+            try:
+                pct = float(row.get("pct") or 0)
+                wh = float(row.get("wh") or 0)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"Check the numbers for {name}.")
+            if not 0 < pct <= 1 or not 0 <= wh <= 0.5:
+                raise HTTPException(400, f"{name}: ownership must be above 0% and at most 100%, withholding 0–50%.")
+            clean.append({
+                "name": name,
+                "pct": round(pct, 6),
+                "shares": " ".join(str(row.get("shares") or "").split())[:30],
+                "where": " ".join(str(row.get("where") or "").split())[:40],
+                "wh": round(wh, 4),
+                "note": " ".join(str(row.get("note") or "").split())[:120],
+            })
+        if sum(r["pct"] for r in clean) > 1.0001:
+            raise HTTPException(400, "Ownership adds up to more than 100%.")
+        state["holders"] = clean
     _save_feature(db, admin.id, "hq-shareholders-state", "HQ shareholders state", state)
     rows = hq_live.customer_list(db)
     data = hq_live.shareholders(db, rows)
     data["state"] = {**data["state"], **state}
+    data["holders"] = state.get("holders") or []
     return {"ok": True, "live": True, **data}

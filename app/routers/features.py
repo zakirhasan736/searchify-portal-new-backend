@@ -148,13 +148,13 @@ def delete_feature(kind: str, record_id: int, db: Session = Depends(get_db), use
 
 @router.post("/auth/forgot-password")
 def forgot_password(body: ForgotBody, db: Session = Depends(get_db)):
-    login = body.username.strip().lower()
-    user = db.query(User).filter((func.lower(User.username) == login) | (func.lower(User.email) == login)).one_or_none()
-    if user is None:
-        raise HTTPException(status_code=404, detail="No account uses that username")
-    user.password_hash = hash_password(body.password)
-    db.commit()
-    return {"ok": True}
+    # SECURITY: this used to set any account's password from a username alone. It is closed.
+    # Use POST /api/v1/auth/forgot (emailed link) and /api/v1/auth/reset, or /auth/change-password.
+    _ = (body, db)
+    raise HTTPException(
+        status_code=410,
+        detail="Password reset now uses an emailed link. Use Forgot password on the sign-in page.",
+    )
 
 
 @router.get("/profile")

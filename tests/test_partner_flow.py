@@ -80,7 +80,7 @@ def test_apply_approve_set_password_and_sign_in(env):
     # Cannot sign in before approval: no account exists.
     assert c.post("/api/v1/auth/signin", json={"username": email, "password": "anything"}).status_code == 401
 
-    r = c.post(f"/api/v1/hq/partners/applications/{apps[0]['id']}/approve", json={"rate": 30})
+    r = c.post(f"/api/v1/hq/partners/applications/{apps[0]['id']}/approve", json={"rate": 20})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["emailed"] is False  # SMTP not configured in tests: the admin gets the link instead
@@ -89,7 +89,7 @@ def test_apply_approve_set_password_and_sign_in(env):
     assert env["sent"] and env["sent"][-1][0] == email
     assert [a for a in _hq_apps(env) if a["email"] == email][0]["status"] == "approved"
     real = [p for p in env["client"].get("/api/v1/hq/partners").json()["partners"] if p.get("email") == email]
-    assert real and real[0]["rate"] == 30
+    assert real and real[0]["rate"] == 20
 
     app.dependency_overrides.pop(get_current_user, None)
     token = _token_from(body["setupUrl"], "setup")
@@ -102,7 +102,7 @@ def test_apply_approve_set_password_and_sign_in(env):
     signin = c.post("/api/v1/auth/signin", json={"username": email, "password": "Partner-Pass-1"})
     assert signin.status_code == 200 and signin.json()["userType"] == "partner"
     me = c.get("/api/v1/partners/me", headers={"Authorization": f"Bearer {signin.json()['token']}"})
-    assert me.status_code == 200 and me.json()["profile"]["rate"] == 0.3
+    assert me.status_code == 200 and me.json()["profile"]["rate"] == 0.2
 
 
 def test_decline_and_reset_password(env):
@@ -179,7 +179,7 @@ def test_plan_choice_and_payment_become_commission(env):
         assert partners_router._feature(db, partner.id, "partner-ledger")["refs"][0][2] == "Pro"
         commission = partners_router.record_payment(db, buyer, 79.0, "pro")
         ledger = partners_router._feature(db, partner.id, "partner-ledger")
-    assert commission == 23.7  # 30% of $79
+    assert commission == 15.8  # affiliate program: 20% of $79
     assert ledger["refs"][0][3] == "paying"
     assert ledger["earnings"][0][3] == "hold" and ledger["earnings"][0][4].startswith("Clears ")
-    assert ledger["totals"]["hold"] == 23.7 and ledger["mix"]["Pro"] == 1 and ledger["paying"][-1] == 1
+    assert ledger["totals"]["hold"] == 15.8 and ledger["mix"]["Pro"] == 1 and ledger["paying"][-1] == 1

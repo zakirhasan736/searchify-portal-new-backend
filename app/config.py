@@ -12,6 +12,8 @@ DATABASE_URL = os.getenv(
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-local-secret")
 JWT_HOURS = int(os.getenv("JWT_HOURS", "12"))
 PUBLIC_SITE_URL = os.getenv("PUBLIC_SITE_URL", "http://localhost:3000").rstrip("/")
+# Public marketing site partners link to (?ref=handle). Same domain the partner centre shows.
+MARKETING_SITE_URL = os.getenv("MARKETING_SITE_URL", "https://searchify.io").rstrip("/")
 
 # HQ admin login. When set, the seed creates or updates this admin account with this password.
 ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip().lower()

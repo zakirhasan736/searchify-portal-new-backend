@@ -27,12 +27,18 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(digest.hex(), digest_hex)
 
 
+def password_fingerprint(user: User) -> str:
+    return hashlib.sha256((user.password_hash or "").encode()).hexdigest()[:16]
+
+
 def make_token(user: User) -> str:
     expires = datetime.now(timezone.utc) + timedelta(hours=JWT_HOURS)
     payload = {
         "sub": str(user.id),
         "username": user.username,
         "role": user.role,
+        # Changing the password changes this, which signs out every older session.
+        "fp": password_fingerprint(user),
         "exp": int(expires.timestamp()),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
@@ -86,9 +92,14 @@ def get_current_user(
         user_id = int(payload["sub"])
     except (jwt.PyJWTError, KeyError, ValueError):
         raise HTTPException(status_code=401, detail="Sign in required")
+    if payload.get("pw"):
+        # A set-password / reset link token is not a session.
+        raise HTTPException(status_code=401, detail="Sign in required")
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=401, detail="Sign in required")
+    if payload.get("fp") and payload["fp"] != password_fingerprint(user):
+        raise HTTPException(status_code=401, detail="Your password changed. Sign in again.")
     return user
 
 
@@ -103,4 +114,9 @@ def get_optional_user(
         user_id = int(payload["sub"])
     except (jwt.PyJWTError, KeyError, ValueError):
         return None
-    return db.get(User, user_id)
+    if payload.get("pw"):
+        return None
+    user = db.get(User, user_id)
+    if user is not None and payload.get("fp") and payload["fp"] != password_fingerprint(user):
+        return None
+    return user

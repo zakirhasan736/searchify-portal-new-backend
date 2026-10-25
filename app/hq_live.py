@@ -130,22 +130,9 @@ def _payments(user: User, checkout: dict, status: str, price: int, overlay: dict
         ltv = sum(r["amount"] for r in rows if r["status"] == "Paid")
         ltv -= sum(r["amount"] for r in rows if r["status"] == "Refunded")
         return rows, max(0, round(ltv, 2))
-    if status != "paying" or price <= 0:
-        return [], 0.0
-    start = user.created_at or datetime.utcnow()
-    months = max(1, (datetime.utcnow().year - start.year) * 12 + datetime.utcnow().month - start.month + 1)
-    months = min(months, 24)
-    rows = []
-    cursor = start
-    for _ in range(months):
-        rows.append({"date": _when(cursor, "%b %d, %Y"), "amount": price, "status": "Paid"})
-        month = cursor.month + 1
-        year = cursor.year + (1 if month > 12 else 0)
-        cursor = datetime(year, month if month <= 12 else month - 12, min(cursor.day, 28))
-    if overlay.get("refunded") and rows:
-        rows[-1]["status"] = "Refunded"
-    ltv = sum(r["amount"] for r in rows if r["status"] == "Paid")
-    return rows, float(ltv)
+    # Only payments that really happened (recorded in HQ or by a payment provider). Nothing is estimated.
+    _ = (user, checkout, status, price)
+    return [], 0.0
 
 
 def _sites(journey: dict, cms_rows: list[CmsConnection], google: GoogleConnection | None) -> list[list]:
@@ -340,7 +327,7 @@ def overview(db: Session, rows: list[dict], problems_count: int) -> dict:
 
 
 def partner_rows(db: Session) -> list[dict]:
-    from app.routers.partners import _default_profile, live_ledger
+    from app.routers.partners import _default_profile, live_ledger, program_status, rate_of
 
     rows = []
     for user in db.query(User).filter(User.role == "ROLE_PARTNER").order_by(User.id).all():
@@ -360,12 +347,13 @@ def partner_rows(db: Session) -> list[dict]:
         paid = sum(float(item[1]) for item in (ledger.get("payouts") or []) if isinstance(item, (list, tuple)) and len(item) > 1)
         life = round(paid + cleared + hold, 2)
         founding = profile.get("tier") == "founding"
-        rate = int(round(float(profile.get("rate") or (0.35 if founding else 0.3)) * 100))
+        rate = int(round(rate_of(profile) * 100))
+        program = program_status(profile)
         tax = bool(payout.get("certified") or payout.get("legalName") or payout.get("taxId"))
         method = str(payout.get("method") or "Not set")
         flag = "" if tax else "Tax details missing"
         since = profile.get("since") or _when(user.created_at)
-        label = "Founding partner" if founding else "Partner"
+        label = "Founding partner" if founding else "Affiliate"
         mrr = sum(int(mix.get(name) or 0) * {"Solo": 29, "Pro": 79, "Premium": 399}[name] for name in ("Solo", "Pro", "Premium"))
         rows.append({
             "id": f"u{user.id}",
@@ -376,7 +364,10 @@ def partner_rows(db: Session) -> list[dict]:
             "runType": f"{label} · {rate}%",
             "rate": rate,
             "founding": founding,
-            "qual": signups,
+            "program": program,
+            # Qualified = referred customers who started paying within the last 6 months (drives the step-up).
+            "qual": program["qualified6m"],
+            "signups": signups,
             "paying": paying,
             "life": life,
             "flag": flag,
@@ -413,9 +404,12 @@ def partner_book(db: Session) -> dict:
         {
             "id": person["id"],
             "name": person["name"],
+            "email": person["email"],
+            "handle": person["handle"],
             "type": person["type"],
             "rate": person["rate"],
             "founding": person["founding"],
+            "program": person["program"],
             "qual": person["qual"],
             "paying": person["paying"],
             "life": person["life"],
@@ -437,6 +431,8 @@ def partner_book(db: Session) -> dict:
             "id": person["id"],
             "name": person["name"],
             "qual": person["qual"],
+            "rate": person["rate"],
+            "program": person["program"],
             "mrr": person["mrr"],
             "held": held,
         })
@@ -464,7 +460,13 @@ def problem_items(db: Session) -> list[dict]:
                 "since": _ago(user.created_at),
                 "detail": "The last checkout on this account is marked failed. Access stays until the card is updated.",
                 "primaryLabel": "Email the customer",
-                "doneText": "Payment failure noted and the customer was emailed.",
+                "doneText": "Payment failure noted.",
+                "email": user.email,
+                "emailSubject": "Your Searchify payment did not go through",
+                "emailBody": (
+                    f"Hi {user.username},\n\nThe last payment for your Searchify {PLAN_LABEL.get(key, 'Solo')} plan did not go through. "
+                    "Your access stays on while you update the card. Sign in and open Settings → Plan and billing.\n"
+                ),
             })
         for conn in db.query(CmsConnection).filter(CmsConnection.customer_id == user.id).all():
             if conn.status == "connected":
@@ -479,7 +481,14 @@ def problem_items(db: Session) -> list[dict]:
                 "since": _ago(conn.updated_at or conn.created_at),
                 "detail": conn.last_error or "The site connection is not active, so approved moves cannot ship.",
                 "primaryLabel": "Send reconnect steps",
-                "doneText": "Reconnect steps sent.",
+                "doneText": "Reconnect steps noted.",
+                "email": user.email,
+                "emailSubject": f"Reconnect {host} to Searchify",
+                "emailBody": (
+                    f"Hi {user.username},\n\nThe {conn.provider.title()} connection for {host} stopped working, so approved changes "
+                    "can't be published. Sign in, open Connections, and reconnect the site. For WordPress, create a new "
+                    "Application Password under Users → Profile and paste it in.\n"
+                ),
             })
         google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).one_or_none()
         if google is not None and google.status not in {"", "connected"}:
@@ -492,7 +501,13 @@ def problem_items(db: Session) -> list[dict]:
                 "since": _ago(google.updated_at),
                 "detail": google.last_error or f"Google status is {google.status}. Rankings stop updating until it is connected again.",
                 "primaryLabel": "Send reconnect steps",
-                "doneText": "Reconnect steps sent.",
+                "doneText": "Reconnect steps noted.",
+                "email": user.email,
+                "emailSubject": "Reconnect Google to Searchify",
+                "emailBody": (
+                    f"Hi {user.username},\n\nSearchify lost access to your Google Search Console / Analytics, so rankings and "
+                    "traffic stopped updating. Sign in, open Connections, and connect Google again.\n"
+                ),
             })
     stale = datetime.utcnow() - timedelta(days=1)
     for job in db.query(Job).filter(Job.status.in_(("queued", "running")), Job.created_at < stale).limit(40).all():
@@ -578,7 +593,9 @@ def shareholders(db: Session, rows: list[dict]) -> dict:
     }
 
 
-def apply_customer_action(db: Session, customer_id: str, action: str, plan: str | None, reason: str, who: str) -> dict:
+def apply_customer_action(
+    db: Session, customer_id: str, action: str, plan: str | None, reason: str, who: str, amount: float | None = None
+) -> dict:
     try:
         user = db.get(User, int(customer_id))
     except ValueError:
@@ -610,6 +627,28 @@ def apply_customer_action(db: Session, customer_id: str, action: str, plan: str 
         from app.routers.partners import record_refund
 
         record_refund(db, user, price, key)
+    elif action == "record_payment":
+        key = plan_key(checkout.get("canonical") or user.plan)
+        amount = round(float(amount if amount is not None else PRICE.get(key, 29)), 2)
+        if amount <= 0:
+            return {"error": "Enter the amount that was paid."}
+        payments = list(overlay.get("payments") or [])
+        payments.insert(0, {"date": _when(datetime.utcnow(), "%b %d, %Y"), "amount": amount, "status": "Paid"})
+        overlay["payments"] = payments[:120]
+        overlay["status"] = "paying"
+        checkout["status"] = "paying"
+        checkout.setdefault("canonical", user.plan)
+        _save(db, user.id, "billing-checkout", "Billing checkout", checkout)
+        log.insert(0, {"when": when, "text": f"Recorded a payment of ${amount:.2f} · {reason}", "who": who})
+        from app.routers.partners import record_payment
+
+        commission = record_payment(db, user, amount, key)
+        message = f"Payment of ${amount:.2f} recorded." + (f" Partner commission ${commission:.2f} is in the 30-day hold." if commission else "")
+    elif action == "mark_failed":
+        checkout["status"] = "failed"
+        _save(db, user.id, "billing-checkout", "Billing checkout", checkout)
+        log.insert(0, {"when": when, "text": f"Marked the payment as failed · {reason}", "who": who})
+        message = "Payment marked as failed. It now shows under Problems."
     elif action == "change_plan":
         new_plan = plan_key(plan or user.plan)
         if new_plan not in PRICE or new_plan == "ent":
