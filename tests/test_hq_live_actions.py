@@ -37,7 +37,7 @@ def env(monkeypatch):
     partner = _user("ROLE_PARTNER")
     customer = _user("ROLE_CLIENT", plan="growth")
     with SessionLocal() as db:
-        P._save_feature(db, partner.id, "partner-profile", "Partner profile", {"handle": f"h{partner.id}", "rate": 0.3, "displayName": "Pat"})
+        P._save_feature(db, partner.id, "partner-profile", "Partner profile", {"handle": f"h{partner.id}", "rate": 0.2, "displayName": "Pat"})
         P._save_feature(db, partner.id, "partner-ledger", "Partner ledger", P._empty_ledger())
         P._save_feature(db, partner.id, "partner-payout", "Partner payout", {"method": "paypal", "email": partner.email, "legalName": "Pat LLC", "certified": True})
         P._save_feature(db, customer.id, "referred-by", "Referred by", {"partnerId": partner.id, "at": datetime.utcnow().isoformat() + "Z"})
@@ -61,10 +61,10 @@ def test_no_invented_payment_history(env):
 
 def test_recorded_payment_creates_commission_that_clears_and_pays_out(env):
     c, partner = env["c"], env["partner"]
-    r = c.put(f"/api/v1/hq/customers/{env['customer'].id}", json={"action": "record_payment", "amount": 200})
+    r = c.put(f"/api/v1/hq/customers/{env['customer'].id}", json={"action": "record_payment", "amount": 300})
     assert r.status_code == 200 and "commission $60.00" in r.json()["message"]
     pays = r.json()["customer"]["payments"]
-    assert pays and pays[0]["amount"] == 200 and pays[0]["status"] == "Paid"
+    assert pays and pays[0]["amount"] == 300 and pays[0]["status"] == "Paid"
     with SessionLocal() as db:
         ledger = P._feature(db, partner.id, "partner-ledger")
         assert ledger["totals"]["hold"] == 60.0
@@ -86,9 +86,15 @@ def test_recorded_payment_creates_commission_that_clears_and_pays_out(env):
 
 def test_rate_change_reaches_the_partner_account(env):
     c, partner = env["c"], env["partner"]
-    assert c.put("/api/v1/hq/partners", json={"rates": {f"u{partner.id}": 35}}).status_code == 200
+    assert c.put("/api/v1/hq/partners", json={"rates": {f"u{partner.id}": 25}}).status_code == 200
     with SessionLocal() as db:
-        assert P._feature(db, partner.id, "partner-profile")["rate"] == 0.35
+        assert P._feature(db, partner.id, "partner-profile")["rate"] == 0.25
+    # Affiliates run 20-25%; 35% belongs to the founding program.
+    assert c.put("/api/v1/hq/partners", json={"rates": {f"u{partner.id}": 35}}).status_code == 400
+    assert c.put("/api/v1/hq/partners", json={"programs": {f"u{partner.id}": "founding"}}).status_code == 200
+    with SessionLocal() as db:
+        prof = P._feature(db, partner.id, "partner-profile")
+        assert prof["tier"] == "founding" and prof["rate"] == 0.35
 
 
 def test_problem_email_is_honest_without_smtp(env):

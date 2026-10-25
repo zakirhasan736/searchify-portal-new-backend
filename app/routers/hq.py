@@ -34,6 +34,7 @@ class PartnersStateBody(BaseModel):
     paid: bool | None = None
     apps: dict | None = None
     rates: dict | None = None
+    programs: dict | None = None  # {"u12": "founding" | "standard"}
     cleared: dict | None = None
     grants: dict | None = None
 
@@ -338,10 +339,10 @@ def _demo_partners() -> dict:
             },
         ],
         "partners": [
-            {"id": "sam", "name": "Sam Ortiz", "type": "Partner since May 2026", "rate": 30, "founding": False, "qual": 38, "paying": 41, "life": 5779.7, "flag": ""},
-            {"id": "wp", "name": "WP Agency Collective", "type": "Partner since Jun 2026", "rate": 30, "founding": False, "qual": 15, "paying": 17, "life": 2104.9, "flag": ""},
-            {"id": "lml", "name": "Local Marketing Lab", "type": "Partner since Jul 2026", "rate": 30, "founding": False, "qual": 8, "paying": 9, "life": 744.0, "flag": "Tax details missing"},
-            {"id": "dana", "name": "Dana Kim", "type": "Partner since Aug 2026", "rate": 30, "founding": False, "qual": 4, "paying": 4, "life": 128.4, "flag": "2 sign-ups used Dana's card"},
+            {"id": "sam", "name": "Sam Ortiz", "type": "Affiliate since May 2026", "rate": 20, "founding": False, "qual": 38, "paying": 41, "life": 5779.7, "flag": ""},
+            {"id": "wp", "name": "WP Agency Collective", "type": "Affiliate since Jun 2026", "rate": 20, "founding": False, "qual": 15, "paying": 17, "life": 2104.9, "flag": ""},
+            {"id": "lml", "name": "Local Marketing Lab", "type": "Affiliate since Jul 2026", "rate": 20, "founding": False, "qual": 8, "paying": 9, "life": 744.0, "flag": "Tax details missing"},
+            {"id": "dana", "name": "Dana Kim", "type": "Affiliate since Aug 2026", "rate": 20, "founding": False, "qual": 4, "paying": 4, "life": 128.4, "flag": "2 sign-ups used Dana's card"},
             {"id": "nick", "name": "Nicholas Petitt", "type": "Founding partner", "rate": 35, "founding": True, "qual": 8, "paying": 13, "life": 2502.7, "flag": ""},
             {"id": "emin", "name": "Emin Navasartian", "type": "Founding partner", "rate": 35, "founding": True, "qual": 3, "paying": 4, "life": 188.1, "flag": ""},
             {"id": "howard", "name": "Howard Wang", "type": "Founding partner", "rate": 35, "founding": True, "qual": 2, "paying": 2, "life": 83.3, "flag": ""},
@@ -611,7 +612,7 @@ def _partners_payload(db: Session, admin: User) -> dict:
 
 def _real_partners(db: Session) -> list[dict]:
     """Partner accounts that exist in the database (approved applications and the seeded partner)."""
-    from app.routers.partners import PRICE, _default_profile
+    from app.routers.partners import PRICE, _default_profile, program_status
 
     out = []
     for user in db.query(User).filter(User.role == "ROLE_PARTNER").order_by(User.id).all():
@@ -626,9 +627,10 @@ def _real_partners(db: Session) -> list[dict]:
             "name": profile.get("displayName") or user.username,
             "email": user.email,
             "handle": profile.get("handle") or "",
-            "type": ("Founding partner" if founding else "Partner") + f" since {profile.get('since') or ''}".rstrip(),
-            "rate": int(round(float(profile.get("rate") or 0.3) * 100)),
+            "type": ("Founding partner" if founding else "Affiliate") + f" since {profile.get('since') or ''}".rstrip(),
+            "rate": int(round(rate_of(profile) * 100)),
             "founding": founding,
+            "program": program_status(profile),
             "qual": int(profile.get("qualified") or 0),
             "paying": paying,
             "life": round(life, 2),
@@ -638,9 +640,12 @@ def _real_partners(db: Session) -> list[dict]:
     return out
 
 
+from app.routers.partners import PROGRAMS, program_of, rate_of  # noqa: E402
+
+
 class DecisionBody(BaseModel):
-    rate: float = 30
-    founding: bool = False
+    rate: float | None = None  # percent; default is the program's starting rate
+    founding: bool = False  # True: founding program (investors, developers). False: affiliate program
 
 
 @router.post("/partners/applications/{app_id}/approve")
@@ -650,7 +655,7 @@ def approve_partner(app_id: str, body: DecisionBody | None = None, db: Session =
     from app.routers.partners import approve_application
 
     body = body or DecisionBody()
-    rate = max(1.0, min(60.0, float(body.rate or 30))) / 100
+    rate = None if body.rate is None else float(body.rate) / 100
     return approve_application(db, _admin_owner(db).id, app_id, rate=rate, founding=bool(body.founding))
 
 
@@ -711,12 +716,38 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
                 pct = float(value)
             except (TypeError, ValueError):
                 continue
-            if partner is None or partner.role != "ROLE_PARTNER" or not 1 <= pct <= 60:
+            if partner is None or partner.role != "ROLE_PARTNER":
                 continue
             profile = _feature(db, partner.id, "partner-profile")
-            if profile.get("tier") == "founding" and pct / 100 < float(profile.get("rate") or 0.35):
+            prog = program_of(profile)
+            if not round(prog["base"] * 100, 4) <= pct <= round(prog["top"] * 100, 4):
+                raise HTTPException(
+                    400,
+                    f"{prog['name']} rates run from {int(round(prog['base'] * 100))}% to {int(round(prog['top'] * 100))}%.",
+                )
+            if profile.get("tier") == "founding" and pct / 100 < rate_of(profile):
                 raise HTTPException(400, "A founding partner's rate can only be moved up.")
             profile["rate"] = round(pct / 100, 4)
+            save_partner_feature(db, partner.id, "partner-profile", "Partner profile", profile)
+    if body.programs is not None:
+        # Move a partner between programs: the rate moves to the new program's starting rate
+        # (or stays, when it is already inside the new range).
+        from app.routers.partners import _save_feature as save_partner_feature
+
+        for key, value in body.programs.items():
+            if value not in PROGRAMS:
+                raise HTTPException(400, "Program must be founding or standard.")
+            try:
+                partner = db.get(User, int(str(key).lstrip("u")))
+            except (TypeError, ValueError):
+                continue
+            if partner is None or partner.role != "ROLE_PARTNER":
+                continue
+            profile = _feature(db, partner.id, "partner-profile")
+            new = PROGRAMS[value]
+            current = rate_of(profile)
+            profile["tier"] = value
+            profile["rate"] = current if new["base"] <= current <= new["top"] else new["base"]
             save_partner_feature(db, partner.id, "partner-profile", "Partner profile", profile)
     if body.cleared is not None:
         state["cleared"] = {**state.get("cleared", {}), **body.cleared}
