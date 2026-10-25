@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app import hq_live
 from app.models import FeatureRecord, User
 from app.security import get_current_user
 
@@ -481,20 +482,8 @@ def _demo_shareholders() -> dict:
 
 
 def ensure_hq_demo(db: Session) -> None:
-    """Idempotent HQ demo payloads on the admin account."""
-    admin = db.query(User).filter(User.role == "ROLE_ADMIN").order_by(User.id).first()
-    if admin is None:
-        return
-    if not _feature(db, admin.id, "hq-overview"):
-        _save_feature(db, admin.id, "hq-overview", "HQ overview", _demo_overview())
-    if not _feature(db, admin.id, "hq-customers"):
-        _save_feature(db, admin.id, "hq-customers", "HQ customers", _demo_customers())
-    if not _feature(db, admin.id, "hq-partners"):
-        _save_feature(db, admin.id, "hq-partners", "HQ partners", _demo_partners())
-    if not _feature(db, admin.id, "hq-problems"):
-        _save_feature(db, admin.id, "hq-problems", "HQ problems", _demo_problems())
-    if not _feature(db, admin.id, "hq-shareholders"):
-        _save_feature(db, admin.id, "hq-shareholders", "HQ shareholders", _demo_shareholders())
+    """Kept so older startup code can call it. HQ no longer stores sample books."""
+    _ = db
 
 
 @router.get("/overview")
@@ -504,9 +493,9 @@ def overview(
     user: User = Depends(get_current_user),
 ):
     _require_admin(user)
-    admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    payload = {**_demo_overview(), **_feature(db, admin.id, "hq-overview")}
+    rows = hq_live.customer_list(db)
+    problems = _open_problems(db)
+    payload = hq_live.overview(db, rows, len(problems))
     return {"ok": True, "live": True, "range": range, **payload}
 
 
@@ -518,10 +507,7 @@ def list_customers(
     user: User = Depends(get_current_user),
 ):
     _require_admin(user)
-    admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    data = {**_demo_customers(), **_feature(db, admin.id, "hq-customers")}
-    items = list(data.get("items") or [])
+    items = hq_live.customer_list(db)
     qq = q.strip().lower()
     if status and status != "all":
         items = [c for c in items if c.get("status") == status]
@@ -532,23 +518,15 @@ def list_customers(
             if qq
             in f"{c.get('name','')} {c.get('email','')} {c.get('domain','')} {c.get('owner','')}".lower()
         ]
-    return {
-        "ok": True,
-        "live": True,
-        "total": int(data.get("total") or len(items)),
-        "items": items,
-    }
+    return {"ok": True, "live": True, "total": len(items), "items": items}
 
 
 @router.get("/customers/{customer_id}")
 def get_customer(customer_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_admin(user)
-    admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    data = {**_demo_customers(), **_feature(db, admin.id, "hq-customers")}
-    for c in data.get("items") or []:
-        if c.get("id") == customer_id:
-            return {"ok": True, "live": True, "customer": c}
+    for row in hq_live.customer_list(db):
+        if row.get("id") == customer_id:
+            return {"ok": True, "live": True, "customer": row}
     raise HTTPException(404, "Customer not found")
 
 
@@ -560,65 +538,34 @@ def act_customer(
     user: User = Depends(get_current_user),
 ):
     _require_admin(user)
-    admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    data = {**_demo_customers(), **_feature(db, admin.id, "hq-customers")}
-    items = list(data.get("items") or [])
-    idx = next((i for i, c in enumerate(items) if c.get("id") == customer_id), None)
-    if idx is None:
+    result = hq_live.apply_customer_action(
+        db,
+        customer_id,
+        body.action,
+        body.plan,
+        body.reason or "Customer asked",
+        user.username or "Admin",
+    )
+    if result.get("error") == "Unknown plan":
+        raise HTTPException(400, "Unknown plan")
+    if result.get("error"):
+        raise HTTPException(400, result["error"])
+    if not result.get("customer"):
         raise HTTPException(404, "Customer not found")
-    c = dict(items[idx])
-    plan_key = c.get("plan") or "solo"
-    price = PRICE.get(plan_key, 29)
-    reason = (body.reason or "Customer asked").strip()
-    who = user.username or "Admin"
-    when = datetime.utcnow().strftime("%b %d")
-    log = list(c.get("log") or [])
+    return {"ok": True, "message": result["message"], "customer": result["customer"]}
 
-    action = body.action
-    msg = "Updated."
-    if action == "impersonate":
-        msg = f"Open workspace as {c.get('owner')} (session hand-off is local-only for now)."
-        log.insert(0, {"when": when, "text": f"Opened as customer · reason: {reason}", "who": who})
-    elif action == "free_month":
-        c["freeMonths"] = int(c.get("freeMonths") or 0) + 1
-        c["next"] = "Skipped · then Dec"
-        log.insert(0, {"when": when, "text": f"Gave a free month · reason: {reason}", "who": who})
-        msg = f"Free month added. {c.get('owner')} has been emailed."
-    elif action == "refund":
-        c["refunded"] = True
-        c["ltv"] = max(0, float(c.get("ltv") or 0) - price)
-        log.insert(0, {"when": when, "text": f"Refunded ${price:.2f} · reason: {reason}", "who": who})
-        msg = "Refund sent. The partner commission on it has been reversed."
-    elif action == "change_plan":
-        new_plan = (body.plan or plan_key).lower()
-        if new_plan not in ("solo", "pro", "premium"):
-            raise HTTPException(400, "Unknown plan")
-        c["plan"] = new_plan
-        log.insert(0, {"when": when, "text": f"Moved to {new_plan} · reason: {reason}", "who": who})
-        msg = f"Plan updated to {new_plan}."
-    elif action == "cancel":
-        c["status"] = "cancelled"
-        c["next"] = "None"
-        log.insert(0, {"when": when, "text": f"Cancelled subscription · reason: {reason}", "who": who})
-        msg = "Subscription cancelled."
-    else:
-        raise HTTPException(400, "Unknown action")
 
-    c["log"] = log[:40]
-    items[idx] = c
-    data["items"] = items
-    _save_feature(db, admin.id, "hq-customers", "HQ customers", data)
-    return {"ok": True, "message": msg, "customer": c}
+def _open_problems(db: Session) -> list[dict]:
+    admin = _admin_owner(db)
+    state = _feature(db, admin.id, "hq-problems-state")
+    done = state.get("done") or {}
+    return [item for item in hq_live.problem_items(db) if not done.get(item.get("id"))]
 
 
 def _partners_payload(db: Session, admin: User) -> dict:
-    ensure_hq_demo(db)
-    base = _demo_partners()
-    stored = _feature(db, admin.id, "hq-partners")
-    merged = {**base, **stored}
-    state = {**(base.get("state") or {}), **(stored.get("state") or {})}
-    merged["state"] = state
+    merged = hq_live.partner_book(db)
+    stored = _feature(db, admin.id, "hq-partners-state")
+    state = {**(merged.get("state") or {}), **stored}
     # Applications are the real inbox from the partner apply form (never sample rows).
     inbox = _feature(db, admin.id, "partner-applications")
     rows = list(inbox.get("rows") or [])
@@ -652,7 +599,6 @@ def _partners_payload(db: Session, admin: User) -> dict:
     # Decisions come from the application record, not from a UI flag.
     state["apps"] = {row["id"]: decided[row["status"]] for row in rows if row.get("status") in decided}
     merged["state"] = state
-    merged["partners"] = [*_real_partners(db), *[p for p in (merged.get("partners") or []) if not str(p.get("id", "")).startswith("u")]]
     return merged
 
 
@@ -740,8 +686,7 @@ def get_partners(db: Session = Depends(get_db), user: User = Depends(get_current
 def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_admin(user)
     admin = _admin_owner(db)
-    data = _partners_payload(db, admin)
-    state = dict(data.get("state") or {})
+    state = dict(_feature(db, admin.id, "hq-partners-state") or {})
     if body.run is not None:
         state["run"] = {**state.get("run", {}), **body.run}
     if body.paid is not None:
@@ -754,8 +699,8 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
         state["cleared"] = {**state.get("cleared", {}), **body.cleared}
     if body.grants is not None:
         state["grants"] = {**state.get("grants", {}), **body.grants}
-    data["state"] = state
-    _save_feature(db, admin.id, "hq-partners", "HQ partners", data)
+    _save_feature(db, admin.id, "hq-partners-state", "HQ partners state", state)
+    data = _partners_payload(db, admin)
     return {"ok": True, "live": True, **data}
 
 
@@ -763,14 +708,12 @@ def put_partners(body: PartnersStateBody, db: Session = Depends(get_db), user: U
 def get_problems(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_admin(user)
     admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    base = _demo_problems()
-    stored = _feature(db, admin.id, "hq-problems")
-    data = {**base, **stored}
-    data["done"] = {**(base.get("done") or {}), **(stored.get("done") or {})}
-    data["emailed"] = {**(base.get("emailed") or {}), **(stored.get("emailed") or {})}
-    open_n = len([i for i in (data.get("items") or []) if not data["done"].get(i.get("id"))])
-    return {"ok": True, "live": True, "openCount": open_n, **data}
+    state = _feature(db, admin.id, "hq-problems-state")
+    items = hq_live.problem_items(db)
+    done = state.get("done") or {}
+    emailed = state.get("emailed") or {}
+    open_n = len([item for item in items if not done.get(item.get("id"))])
+    return {"ok": True, "live": True, "openCount": open_n, "items": items, "done": done, "emailed": emailed}
 
 
 @router.put("/problems/{problem_id}")
@@ -782,38 +725,36 @@ def act_problem(
 ):
     _require_admin(user)
     admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    base = _demo_problems()
-    stored = _feature(db, admin.id, "hq-problems")
-    data = {**base, **stored}
-    data["done"] = {**(base.get("done") or {}), **(stored.get("done") or {})}
-    data["emailed"] = {**(base.get("emailed") or {}), **(stored.get("emailed") or {})}
-    ids = {i.get("id") for i in (data.get("items") or [])}
-    if problem_id not in ids:
+    items = hq_live.problem_items(db)
+    if problem_id not in {item.get("id") for item in items}:
         raise HTTPException(404, "Problem not found")
+    state = _feature(db, admin.id, "hq-problems-state")
+    done = dict(state.get("done") or {})
+    emailed = dict(state.get("emailed") or {})
     if body.action == "resolve":
-        data["done"][problem_id] = True
+        done[problem_id] = True
         msg = "Resolved."
     elif body.action == "email":
-        data["emailed"][problem_id] = True
+        emailed[problem_id] = True
         msg = "Email sent."
     else:
         raise HTTPException(400, "Unknown action")
-    _save_feature(db, admin.id, "hq-problems", "HQ problems", data)
-    open_n = len([i for i in (data.get("items") or []) if not data["done"].get(i.get("id"))])
-    return {"ok": True, "message": msg, "openCount": open_n, "done": data["done"], "emailed": data["emailed"]}
+    _save_feature(db, admin.id, "hq-problems-state", "HQ problems state", {"done": done, "emailed": emailed})
+    open_n = len([item for item in items if not done.get(item.get("id"))])
+    return {"ok": True, "message": msg, "openCount": open_n, "done": done, "emailed": emailed}
 
 
 @router.get("/shareholders")
 def get_shareholders(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_admin(user)
     admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    base = _demo_shareholders()
-    stored = _feature(db, admin.id, "hq-shareholders")
-    data = {**base, **stored}
-    data["state"] = {**(base.get("state") or {}), **(stored.get("state") or {})}
-    data["scenarios"] = {**(base.get("scenarios") or {}), **(stored.get("scenarios") or {})}
+    rows = hq_live.customer_list(db)
+    data = hq_live.shareholders(db, rows)
+    stored = _feature(db, admin.id, "hq-shareholders-state")
+    if stored:
+        data["state"] = {**data["state"], **stored}
+        if stored.get("holders"):
+            data["holders"] = stored["holders"]
     return {"ok": True, "live": True, **data}
 
 
@@ -825,11 +766,7 @@ def put_shareholders(
 ):
     _require_admin(user)
     admin = _admin_owner(db)
-    ensure_hq_demo(db)
-    base = _demo_shareholders()
-    stored = _feature(db, admin.id, "hq-shareholders")
-    data = {**base, **stored}
-    state = {**(base.get("state") or {}), **(stored.get("state") or {})}
+    state = dict(_feature(db, admin.id, "hq-shareholders-state") or {})
     if body.scenario is not None:
         state["scenario"] = body.scenario
     if body.amount is not None:
@@ -842,6 +779,8 @@ def put_shareholders(
         state["quarterly"] = body.quarterly
     if body.howard is not None:
         state["howard"] = body.howard
-    data["state"] = state
-    _save_feature(db, admin.id, "hq-shareholders", "HQ shareholders", data)
+    _save_feature(db, admin.id, "hq-shareholders-state", "HQ shareholders state", state)
+    rows = hq_live.customer_list(db)
+    data = hq_live.shareholders(db, rows)
+    data["state"] = {**data["state"], **state}
     return {"ok": True, "live": True, **data}

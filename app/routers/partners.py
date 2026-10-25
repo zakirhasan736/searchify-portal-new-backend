@@ -113,8 +113,41 @@ def _empty_ledger() -> dict:
         "hold": 0,
         "refs": [],
         "earnings": [],
+        "totals": {"cleared": 0, "hold": 0, "rev": 0, "paid": 0},
         "refSummary": "0 sign-ups · 0 paying · 0 in free trial",
     }
+
+
+_DEMO_LEDGER_BITS = ("Tampa", "Leeds", "Phoenix", "Calgary", "Melbourne", "Denver", "Austin, TX")
+
+
+def live_ledger(stored: dict | None) -> dict:
+    """Drop the seeded Sam Ortiz sample book. Rows tied to a real customer id stay."""
+    ledger = {**_empty_ledger(), **(stored or {})}
+    refs = [row for row in (ledger.get("refs") or []) if isinstance(row, list)]
+    real_refs = [row for row in refs if len(row) > 4 and str(row[4]).startswith("c")]
+    weekly = ledger.get("weekly") or {}
+    blob = " ".join(str(cell) for row in refs for cell in row[:3])
+    earnings = [row for row in (ledger.get("earnings") or []) if isinstance(row, list)]
+    blob += " " + " ".join(str(cell) for row in earnings for cell in row[:3])
+    demoish = any(bit in blob for bit in _DEMO_LEDGER_BITS) or float(ledger.get("hold") or 0) == 214.5
+    if not real_refs and not weekly and demoish:
+        return _empty_ledger()
+    if real_refs:
+        ledger["refs"] = real_refs
+    if demoish:
+        ledger["earnings"] = [
+            row for row in earnings if not any(bit in " ".join(map(str, row[:3])) for bit in _DEMO_LEDGER_BITS)
+        ]
+        if not real_refs:
+            ledger["payouts"] = []
+            ledger["mix"] = {"Solo": 0, "Pro": 0, "Premium": 0}
+            ledger["hold"] = 0
+            ledger["totals"] = {"cleared": 0, "hold": 0, "rev": 0, "paid": 0}
+            ledger["clicks"] = _series(weekly, "clicks") if weekly else []
+            ledger["signups"] = _series(weekly, "signups") if weekly else []
+            ledger["paying"] = _series(weekly, "paying") if weekly else []
+    return ledger
 
 
 def _demo_ledger() -> dict:
@@ -199,7 +232,7 @@ def ensure_partner_account(db: Session) -> User:
         )
     ledger = _feature(db, user.id, "partner-ledger")
     if not ledger:
-        _save_feature(db, user.id, "partner-ledger", "Partner ledger", _demo_ledger())
+        _save_feature(db, user.id, "partner-ledger", "Partner ledger", _empty_ledger())
     payout = _feature(db, user.id, "partner-payout")
     if not payout:
         _save_feature(
@@ -423,6 +456,27 @@ def record_payment(db: Session, customer: User, amount: float, plan: str, paid_a
     return commission
 
 
+def record_refund(db: Session, customer: User, amount: float, plan: str) -> float:
+    """Reverse a referred customer's commission when HQ records a refund."""
+    partner, _referred = _referrer(db, customer)
+    if partner is None or amount <= 0:
+        return 0.0
+    profile = {**_default_profile(partner), **_feature(db, partner.id, "partner-profile")}
+    rate = float(profile.get("rate") or 0.3)
+    commission = round(float(amount) * rate, 2)
+    label = PLAN_LABEL.get(str(plan or "").lower(), str(plan or "").title())
+    ledger = live_ledger(_feature(db, partner.id, "partner-ledger"))
+    when = datetime.utcnow().strftime("%b %d").replace(" 0", " ")
+    ledger["earnings"] = [[when, "New customer", label, "reversed", "Customer refunded"], *(ledger.get("earnings") or [])][:500]
+    totals = dict(ledger.get("totals") or {"cleared": 0, "hold": 0, "rev": 0, "paid": 0})
+    totals["rev"] = round(float(totals.get("rev") or 0) + commission, 2)
+    totals["hold"] = round(max(0, float(totals.get("hold") or 0) - commission), 2)
+    ledger["totals"] = totals
+    ledger["hold"] = totals["hold"]
+    _save_feature(db, partner.id, "partner-ledger", "Partner ledger", ledger)
+    return commission
+
+
 # --- HQ decisions (called from the HQ router) --------------------------------------------------------
 
 
@@ -530,7 +584,7 @@ def me(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
 def overview(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_partner(user)
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
-    ledger = {**_empty_ledger(), **_feature(db, user.id, "partner-ledger")}
+    ledger = live_ledger(_feature(db, user.id, "partner-ledger"))
     rate = float(profile.get("rate") or 0.3)
     mix = ledger.get("mix") or {"Solo": 0, "Pro": 0, "Premium": 0}
     monthly = sum(int(mix.get(k) or 0) * PRICE[k] * rate for k in PRICE)
@@ -562,7 +616,7 @@ def overview(db: Session = Depends(get_db), user: User = Depends(get_current_use
 def earnings(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_partner(user)
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
-    ledger = {**_empty_ledger(), **_feature(db, user.id, "partner-ledger")}
+    ledger = live_ledger(_feature(db, user.id, "partner-ledger"))
     rate = float(profile.get("rate") or 0.3)
     totals = ledger.get("totals") or {
         "cleared": 0,
