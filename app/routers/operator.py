@@ -1961,10 +1961,12 @@ def propose_from_gsc(
             heads = " | ".join(heads) if isinstance(heads, list) else str(heads or "")
             topic_seed = str(page_info.get("h1") or page_info.get("schemaName") or page_info.get("title") or "").split("|")[0].strip()
             page_terms = [str(r.get("query")) for r in ((job.get("gsc") or {}).get("queries") or []) if isinstance(r, dict) and r.get("query")]
+            support_page = job.get("kind") in {"contact", "about", "legal"}
             job["contentSeed"] = dfs_meta.draft_from_research(
                 db,
                 user,
-                keyword=(page_terms[0] if page_terms else (query_terms[0] if query_terms else topic_seed)),
+                # A contact/about page is about its purpose; never seed it with a site-wide service query.
+                keyword=topic_seed if support_page else (page_terms[0] if page_terms else (query_terms[0] if query_terms else topic_seed)),
                 topic=topic_seed,
                 offers=site_offers,
                 current_title=str(page_info.get("title") or ""),

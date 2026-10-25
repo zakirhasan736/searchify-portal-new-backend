@@ -64,7 +64,7 @@ def business_offers(db, user_id: int, host: str) -> list[str]:
             offers.append(text[:80])
     if not offers and business.get("business"):
         offers.append(" ".join(str(business["business"]).split())[:80])
-    return offers[:8]
+    return offers[:15]
 
 
 def business_places(db, user_id: int, host: str) -> list[str]:
