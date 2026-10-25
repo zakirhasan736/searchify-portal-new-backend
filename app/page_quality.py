@@ -18,6 +18,9 @@ PRODUCT = re.compile(r"(/products?/|/shop/|/store/|/item/)", re.I)
 SERVICE = re.compile(r"(/services?/|/solutions?/|/offerings?/)", re.I)
 LOCATION = re.compile(r"(/locations?/|/areas?-we-serve|/near-me|/in-[a-z-]+)", re.I)
 CATEGORY = re.compile(r"(/categor(?:y|ies)/|/collections?/|/topics?/)", re.I)
+# Supporting pages: their listing is about the page's purpose and the business as a whole, not one service.
+CONTACT = re.compile(r"(^|/)(contact|contacts|contact-us|contact-inquiry|inquiry|inquiries|enquiry|enquiries|get-in-touch|lets-talk|let-s-talk|talk-to-us|reach-us)(/|$|-)", re.I)
+ABOUT = re.compile(r"(^|/)(about|about-us|our-story|who-we-are|our-team|team|company|our-company|mission)(/|$|-)", re.I)
 
 NUMBER_CLAIM = re.compile(
     r"(?<![\w.])(\$?\d[\d,]*(?:\.\d+)?\+?%?)(?:\s*(years?|yrs?|clients?|customers?|projects?|reviews?|stars?|locations?|cities|hours?|days?|minutes?|mins?))?",
@@ -39,6 +42,10 @@ def page_type(url: str, role: str = "", page: dict | None = None) -> str:
         return "case_study"
     if LEGAL.search(path):
         return "legal"
+    if CONTACT.search(path):
+        return "contact"
+    if ABOUT.search(path):
+        return "about"
     if BLOG.search(f"/{path}/"):
         return "blog"
     if PRODUCT.search(f"/{path}/") or "product" in schema:

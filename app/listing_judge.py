@@ -215,7 +215,9 @@ JUDGE_SYSTEM = (
     "You are a strict senior SEO reviewer. You score Google search listings (title + meta description) for one page. "
     "You do not know which listing is currently live; judge each on its own merits against the page evidence. "
     "Score each criterion 0–10:\n"
-    "- relevance: describes THIS page and matches the searcher's intent\n"
+    "- relevance: describes THIS page's purpose and matches the searcher's intent. A homepage, contact or about page "
+    "represents the whole business (its full range of offers), so narrowing it to one or two services scores low; "
+    "a service page stays on its one service\n"
     "- keyword: the target keyword or a natural variant appears early in the title and reads naturally\n"
     "- click_appeal: next to the competitor titles, a searcher would pick this one; clear benefit in the first words\n"
     "- specificity: includes a concrete, page-true detail (place, audience, service, outcome) instead of generic wording\n"
@@ -328,9 +330,13 @@ def judge_evidence(
     rival_titles: list[str],
     research: str = "",
     search_console: str = "",
+    purpose: str = "",
+    site_concept: str = "",
 ) -> str:
     return "\n".join(
         [
+            f"Whole-site concept: {site_concept or '(not read)'}",
+            f"Page purpose: {purpose or '(the page topic)'}",
             f"Keyword research (DataForSEO, matched to this page):\n{research.strip()[:900] or '(none)'}",
             f"Search Console for this URL: {search_console or '(not connected)'}",
             f"URL: {url}",

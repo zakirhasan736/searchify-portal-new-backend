@@ -1004,7 +1004,33 @@ def city_lead_problem(title: str, place: str, keyword: str, offers: list[str] | 
     return not (rest & anchors)
 
 
-def topic_issues(title: str, desc: str, topic: str, keyword: str, offers: list[str] | None = None) -> list[str]:
+SUPPORT_KINDS = {"contact", "about", "legal"}
+_PURPOSE_WORDS = {"contact": ("contact", "inquiry", "enquiry", "talk", "touch"), "about": ("about", "story", "team", "who"), "legal": ()}
+
+
+def support_purpose(scraped: dict, kind: str, brand: str) -> str:
+    """What a contact/about/legal page is for, in the page's own words (from its live title or H1)."""
+    words = _PURPOSE_WORDS.get(kind, ())
+    for candidate in (scraped.get("title"), scraped.get("h1"), scraped.get("ogTitle")):
+        text = str(candidate or "")
+        for part in re.split(r"\s+[|–—-]\s+|:\s+", text):
+            part = part.strip()
+            if not part or (brand and _has_brand(part, brand) and len(part.split()) <= len(brand.split()) + 1):
+                continue
+            low = part.lower()
+            if kind == "legal" or any(word in low for word in words):
+                return _clean(part, 40)
+    return {"contact": "Contact", "about": "About", "legal": "Legal"}.get(kind, kind.title())
+
+
+def topic_issues(
+    title: str,
+    desc: str,
+    topic: str,
+    keyword: str,
+    offers: list[str] | None = None,
+    desc_anchors: list[str] | None = None,
+) -> list[str]:
     """Reject a listing that left the page concept or dropped the keyword.
 
     The topic often comes from a slogan H1 (“We Build Websites That Grow Your Business”). A title that
@@ -1021,7 +1047,8 @@ def topic_issues(title: str, desc: str, topic: str, keyword: str, offers: list[s
     if len(keyword_words) >= 2 and len(title_words & keyword_words) < max(1, (len(keyword_words) + 1) // 2):
         issues.append(f"The title misses the keyword “{keyword}”. Use those words near the front.")
     desc_words = _content_tokens(desc)
-    if topic_words and desc_words and not (desc_words & topic_words) and not (desc_words & anchor_words):
+    desc_ok_words = anchor_words | _content_tokens(" ".join(str(a) for a in (desc_anchors or [])))
+    if topic_words and desc_words and not (desc_words & topic_words) and not (desc_words & desc_ok_words):
         issues.append(f"The description is about a different topic than “{topic}”.")
     return issues
 
@@ -1108,7 +1135,9 @@ def _site_block(site: dict | None) -> str:
     if business.get("brand"):
         lines.append(f"Brand name: {business['brand']}")
     if business.get("offers"):
-        lines.append("Offers on the site: " + ", ".join(map(str, business["offers"][:10])))
+        lines.append("Offers on the site: " + ", ".join(map(str, business["offers"][:15])))
+    if business.get("category"):
+        lines.append(f"Umbrella category: {business['category']}")
     if business.get("audience"):
         lines.append(f"Who buys: {business['audience']}")
     if business.get("places"):
@@ -1217,6 +1246,10 @@ def write_title_description(
     places = [str(item).strip() for item in (business.get("places") or []) if str(item).strip()]
     if not places and (profile.get("areas") or profile.get("locations")):
         places = [part.strip() for part in str(profile.get("areas") or profile.get("locations")).split(",") if part.strip()]
+    # The whole site's concept: every offer, the umbrella category, and the one-line summary.
+    site_offers = list(offers)
+    site_category = " ".join(str(business.get("category") or "").split())[:80]
+    site_summary = " ".join(str(business.get("business") or "").split())[:240]
     from app.listing_research import keyword_fits_page
 
     research_best, research_alts = best_keyword_from_research(
@@ -1292,6 +1325,29 @@ def write_title_description(
         topic = offers[0] if offers else keyword
     rivals = conceptual_rivals(rivals, offers, keyword=keyword)
     meet = rival_to_meet(rivals, keyword, offers)
+    page_purpose = ""
+    page_terms_lower = {term.lower() for term in page_query_terms}
+    if kind in SUPPORT_KINDS and not user_keyword:
+        # A contact/about page is found by people looking for this business's page, not a service.
+        # Its keyword is the page purpose (or this page's own Search Console query), never the first offer.
+        page_purpose = support_purpose(scraped, kind, brand)
+        own = [
+            term for term in page_query_terms
+            if any(w in term.lower() for w in _PURPOSE_WORDS.get(kind, ())) or (brand and _has_brand(term, brand))
+        ]
+        keyword = own[0] if own else page_purpose
+        options = [keyword]
+        matched = own
+        topic = page_purpose
+        keyword_evidence_insufficient = not own
+        offers = []  # gates must not force a service into this title
+        rivals, meet = [], {}
+    elif kind == "home" and not user_keyword and site_category and len(site_offers) >= 2:
+        # A multi-service homepage leads with the umbrella category, not the first service it lists,
+        # unless this page's own Search Console data names a better search.
+        if not (matched and matched[0].lower() in page_terms_lower):
+            keyword = site_category
+            options = [site_category, *[o for o in options if o.lower() != site_category.lower()]][:4]
     query_block = "\n".join(f"- {q}" for q in (options or matched or research_alts)) or "(No Search Console query matches this business yet. Use the business offer as the keyword.)"
     schema_types = ", ".join(scraped.get("schemaTypes") or []) or "(none found)"
     current_listing = (
@@ -1386,7 +1442,7 @@ def write_title_description(
 
         def dfs_hard_checks(t: str, d: str) -> list[str]:
             found = _issues(t, d, live_title, page_bits, taken or [], rivals)
-            found.extend(topic_issues(t, d, topic, keyword, offers))
+            found.extend(topic_issues(t, d, topic, keyword, offers, [brand, *site_offers] if kind in SUPPORT_KINDS else None))
             found.extend(listing_fluff_problems(t, d, evidence=evidence_text))
             claims = page_quality.validate_claims(t, d, evidence=evidence_text, places=places)
             for claim in claims["claims"]:
@@ -1611,9 +1667,12 @@ def write_title_description(
         f"- URL: {scraped.get('url') or url}\n"
         f"- Page type: {kind or 'page'}\n"
         f"- Page topic: {topic or '(derive from H1 and offers on this page)'}\n"
-        f"- Search intent: {'commercial / transactional for service or product pages' if kind in {'service', 'product', 'category', 'location'} else 'navigational / brand for homepage' if kind == 'home' else 'informational or commercial as the copy supports'}\n"
+        f"- Search intent: {'commercial / transactional for service or product pages' if kind in {'service', 'product', 'category', 'location'} else 'navigational / brand for homepage' if kind == 'home' else ('navigational: people looking for this business’s ' + kind + ' page') if kind in SUPPORT_KINDS else 'informational or commercial as the copy supports'}\n"
+        f"- Page purpose: {page_purpose or '(the page topic above)'}\n"
         f"- Verified brand: {brand or '(none found)'}\n"
-        f"- Offers confirmed on site: {', '.join(offers[:8]) or '(none)'}\n"
+        f"- WHOLE-SITE CONCEPT (read from every page of the site): {site_summary or '(not read yet)'}\n"
+        f"- Umbrella category: {site_category or '(not stated)'}\n"
+        f"- Everything this site offers: {', '.join(site_offers[:15]) or '(none)'}\n"
         f"- Places named: {', '.join(places[:6]) or '(none)'}\n"
         f"- Existing title: {scraped.get('title') or '(none)'}\n"
         f"- {title_format_line(title_format(str(scraped.get('title') or ''), brand))}\n"
@@ -1669,11 +1728,20 @@ def write_title_description(
     page_body = str(scraped.get("text") or "")
     page_heads = str(headings or "")
     portfolio_clients = page_quality.portfolio_client_names(
-        page_body, page_heads, brand=brand, places=places, offers=offers,
+        page_body, page_heads, brand=brand, places=places, offers=site_offers,
     )
+    if kind in SUPPORT_KINDS:
+        brief += (
+            f"\nThis is the {kind.upper()} page. Its title names the page purpose ({page_purpose}) and follows the "
+            "TITLE FORMAT. Do not lead with, or narrow to, a single service. The description says what a visitor can "
+            "do on this page, in this page's own words, and describes the business by its WHOLE-SITE CONCEPT "
+            "(the umbrella category or the full range of offers), never by one or two services picked from the list.\n"
+        )
     if kind == "home":
         brief += (
-            "\nThis is the HOMEPAGE. Describe the business offer and place — not a portfolio piece. "
+            "\nThis is the HOMEPAGE. It represents the WHOLE business: lead with the umbrella category (or the full "
+            "range of offers) — never narrow it to the first one or two services. "
+            "Describe the business offer and place — not a portfolio piece. "
             "The business concept chooses the keyword, not the current title. "
             "Lead with the best keyword. Put one alternative keyword in the description. "
             "Start with a city only when that best keyword contains the city. "
@@ -1715,7 +1783,7 @@ def write_title_description(
     def hard_checks(t: str, d: str) -> list[str]:
         """Factual and relevance gates shared by every candidate source."""
         found = _issues(t, d, current, page_bits, taken, rivals)
-        found.extend(topic_issues(t, d, topic, keyword, offers))
+        found.extend(topic_issues(t, d, topic, keyword, offers, [brand, *site_offers] if kind in SUPPORT_KINDS else None))
         found.extend(listing_fluff_problems(t, d, evidence=evidence_text))
         claims = page_quality.validate_claims(t, d, evidence=evidence_text, places=places)
         for claim in claims["claims"]:
@@ -1885,10 +1953,13 @@ def write_title_description(
     clean = survivors()
     if clean:
         evidence_brief = judge_evidence(
-            url=page_url, kind=kind, topic=topic, keyword=keyword, brand=brand, offers=offers, places=places,
+            url=page_url, kind=kind, topic=topic, keyword=keyword, brand=brand, offers=site_offers, places=places,
             h1=str(scraped.get("h1") or ""), headings=str(headings or ""), page_text=page_body,
+            # offers here are the whole site's, so the judge can see when a draft narrows the business.
             queries=[*matched, *queries][:8], rival_titles=[str(r.get("title") or "") for r in rivals if r.get("title")],
             research=research_lines(research, page_url, topic, offers),
+            purpose=page_purpose,
+            site_concept="; ".join(part for part in (site_summary, f"category: {site_category}" if site_category else "", f"offers: {', '.join(site_offers[:15])}" if site_offers else "") if part),
             search_console=(
                 f"clicks {gsc.get('clicks')}, impressions {gsc.get('impressions')}, CTR {gsc.get('ctr') or '—'}, "
                 f"position {gsc.get('position')}" if gsc.get("impressions") not in (None, "", "—") else ""
@@ -1960,6 +2031,10 @@ def write_title_description(
             best_pair = min(clean, key=lambda pair: score_candidate(*pair))
             if score_candidate(*best_pair) < score_candidate(title, desc):
                 title, desc = best_pair
+        elif current.strip() and live_desc.strip():
+            # No draft passed the checks (facts, topic, the site's title format): keep what is published
+            # rather than surfacing an unchecked draft.
+            title, desc = _keep_published(current), _keep_published(live_desc, 320)
         recommend_keep = False
 
     # Never invent a stronger_listing replacement when a candidate fails — keep published instead.
