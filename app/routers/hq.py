@@ -619,27 +619,113 @@ def _partners_payload(db: Session, admin: User) -> dict:
     merged = {**base, **stored}
     state = {**(base.get("state") or {}), **(stored.get("state") or {})}
     merged["state"] = state
-    # Merge partner applications inbox from partners.apply
-    apps_inbox = _feature(db, admin.id, "partner-applications")
-    pending = [
+    # Applications are the real inbox from the partner apply form (never sample rows).
+    inbox = _feature(db, admin.id, "partner-applications")
+    rows = list(inbox.get("rows") or [])
+    changed = False
+    for row in rows:
+        if not row.get("id"):
+            # Older rows were keyed by list position; give them a stable id once.
+            import secrets
+
+            row["id"] = f"app-{secrets.token_hex(6)}"
+            changed = True
+    if changed:
+        _save_feature(db, admin.id, "partner-applications", "Partner applications", {"rows": rows})
+    decided = {"approved": "ok", "declined": "no"}
+    merged["applications"] = [
         {
-            "id": f"inbox-{i}",
+            "id": row["id"],
             "name": row.get("name") or "",
             "email": row.get("email") or "",
             "country": row.get("country") or "",
             "when": (row.get("at") or "")[:10] or "Recent",
-            "where": row.get("channel") or "Application",
-            "note": "From partner apply form.",
-            "noteColor": "#4DA3FF",
+            "where": row.get("channel") or "(not given)",
+            "note": "",
+            "noteColor": "#9AA1AB",
+            "status": row.get("status") or "pending",
+            "emailed": row.get("emailed"),
+            "partnerId": f"u{row['partnerId']}" if row.get("partnerId") else "",
         }
-        for i, row in enumerate(apps_inbox.get("rows") or [])
-        if row.get("status") == "pending"
+        for row in rows
     ]
-    if pending:
-        known = {a.get("email") for a in (merged.get("applications") or [])}
-        extra = [p for p in pending if p["email"] not in known]
-        merged["applications"] = list(merged.get("applications") or []) + extra
+    # Decisions come from the application record, not from a UI flag.
+    state["apps"] = {row["id"]: decided[row["status"]] for row in rows if row.get("status") in decided}
+    merged["state"] = state
+    merged["partners"] = [*_real_partners(db), *[p for p in (merged.get("partners") or []) if not str(p.get("id", "")).startswith("u")]]
     return merged
+
+
+def _real_partners(db: Session) -> list[dict]:
+    """Partner accounts that exist in the database (approved applications and the seeded partner)."""
+    from app.routers.partners import PRICE, _default_profile
+
+    out = []
+    for user in db.query(User).filter(User.role == "ROLE_PARTNER").order_by(User.id).all():
+        profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
+        ledger = _feature(db, user.id, "partner-ledger")
+        weekly = ledger.get("weekly") or {}
+        paying = sum(int(b.get("paying") or 0) for b in weekly.values()) or sum(int(v or 0) for v in (ledger.get("mix") or {}).values())
+        life = sum(float(p[1]) for p in (ledger.get("payouts") or []) if isinstance(p, (list, tuple)) and len(p) > 1)
+        founding = profile.get("tier") == "founding"
+        out.append({
+            "id": f"u{user.id}",
+            "name": profile.get("displayName") or user.username,
+            "email": user.email,
+            "handle": profile.get("handle") or "",
+            "type": ("Founding partner" if founding else "Partner") + f" since {profile.get('since') or ''}".rstrip(),
+            "rate": int(round(float(profile.get("rate") or 0.3) * 100)),
+            "founding": founding,
+            "qual": int(profile.get("qualified") or 0),
+            "paying": paying,
+            "life": round(life, 2),
+            "flag": "",
+            "real": True,
+        })
+    return out
+
+
+class DecisionBody(BaseModel):
+    rate: float = 30
+    founding: bool = False
+
+
+@router.post("/partners/applications/{app_id}/approve")
+def approve_partner(app_id: str, body: DecisionBody | None = None, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Create the partner account and send the set-password link. Returns the link when email is not set up."""
+    _require_admin(user)
+    from app.routers.partners import approve_application
+
+    body = body or DecisionBody()
+    rate = max(1.0, min(60.0, float(body.rate or 30))) / 100
+    return approve_application(db, _admin_owner(db).id, app_id, rate=rate, founding=bool(body.founding))
+
+
+@router.post("/partners/applications/{app_id}/decline")
+def decline_partner(app_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app.routers.partners import decline_application
+
+    return decline_application(db, _admin_owner(db).id, app_id)
+
+
+@router.post("/partners/{partner_key}/invite")
+def resend_invite(partner_key: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """New set-password link for an approved partner (lost email, expired link)."""
+    _require_admin(user)
+    from app import config, mailer
+    from app.routers.partners import SETUP_MINUTES
+    from app.security import make_password_token
+
+    try:
+        partner = db.get(User, int(partner_key.lstrip("u")))
+    except ValueError:
+        partner = None
+    if partner is None or partner.role != "ROLE_PARTNER":
+        raise HTTPException(404, "Partner not found")
+    setup = f"{config.PUBLIC_SITE_URL}/partners/login?setup={make_password_token(partner, 'setup', SETUP_MINUTES)}"
+    emailed = mailer.send(partner.email, "Set your Searchify partner password", f"Set your password here (works for 3 days):\n{setup}\n")
+    return {"ok": True, "emailed": emailed, "setupUrl": setup}
 
 
 @router.get("/partners")

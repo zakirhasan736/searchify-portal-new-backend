@@ -20,7 +20,8 @@ class SignUpBody(BaseModel):
     username: str
     password: str
     email: str
-    roles: list[str] = ["ROLE_CLIENT"]
+    roles: list[str] = ["ROLE_CLIENT"]  # ignored: public sign-up never grants admin or partner
+    ref: str = ""  # partner handle from a ?ref= link
 
 
 @router.post("/signin")
@@ -71,16 +72,21 @@ def sign_up(body: SignUpBody, db: Session = Depends(get_db)):
                 detail="This email already has an account. Sign in, or use Forgot password to set a new one.",
             )
         raise HTTPException(status_code=409, detail="That username is taken. Choose another, or sign in.")
-    role = "ROLE_ADMIN" if "ROLE_ADMIN" in body.roles else "ROLE_CLIENT"
+    # Security: the request body must never choose the role. Admin accounts come from ADMIN_EMAIL /
+    # ADMIN_PASSWORD (seed) and partner accounts from HQ approval.
     user = User(
         username=username,
         email=email,
         password_hash=hash_password(body.password),
-        role=role,
-        plan="scale" if role == "ROLE_ADMIN" else "starter",
-        site_limit=15 if role == "ROLE_ADMIN" else 5,
+        role="ROLE_CLIENT",
+        plan="starter",
+        site_limit=5,
     )
     db.add(user)
     db.commit()
     db.refresh(user)
+    if body.ref.strip():
+        from app.routers.partners import record_signup
+
+        record_signup(db, body.ref, user)
     return _session(db, user)
