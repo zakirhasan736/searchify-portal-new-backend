@@ -13,7 +13,8 @@ from sqlalchemy.orm import Session
 from app import approval, cms_connectors, markets, quotas, site_profiles
 from app.database import get_db
 from app.models import CmsConnection, Draft, FeatureRecord, GoogleConnection, Job, SiteChange, User
-from app.routers.google_connect import _connection_payload
+from app.routers.google_connect import _connection_payload, connection_for_site
+from app.site_scope import host_key, matches_site, payload_host
 from app import ai_visibility
 from app.openai_client import chat_text, generate_draft_body, openai_configured
 from app.security import get_current_user
@@ -411,7 +412,7 @@ HOT_FEATURE_KINDS = (
 
 
 @router.get("/workspace")
-def workspace_bootstrap(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def workspace_bootstrap(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """One round-trip for shell + first screens: Google, CMS, queue, hot features."""
     google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     cms = db.query(CmsConnection).filter(CmsConnection.customer_id == user.id).order_by(CmsConnection.id.desc()).all()
@@ -430,13 +431,16 @@ def workspace_bootstrap(db: Session = Depends(get_db), user: User = Depends(get_
         _clear_user_queue(db, user.id)
     if stale or not (google and (google.access_token or google.refresh_token)):
         db.commit()
+    wanted = host_key(site)
     changes = (
         db.query(SiteChange)
         .filter(SiteChange.customer_id == user.id)
         .order_by(SiteChange.id.desc())
-        .limit(40)
+        .limit(200)
         .all()
     )
+    if wanted:
+        changes = [row for row in changes if host_key(row.target_url or "") == wanted][:40]
 
     features: dict[str, dict] = {}
     recs = (
@@ -453,6 +457,8 @@ def workspace_bootstrap(db: Session = Depends(get_db), user: User = Depends(get_
     ]
     recs.sort(key=lambda r: -r.id)
     for row in recs:
+        if wanted and not matches_site(row.kind, row.payload, wanted):
+            continue
         if row.kind in features:
             continue
         features[row.kind] = {
@@ -464,7 +470,7 @@ def workspace_bootstrap(db: Session = Depends(get_db), user: User = Depends(get_
             "createdAt": row.created_at.isoformat(),
         }
     return {
-        "google": {"configured": True, "connection": _connection_payload(google)},
+        "google": {"configured": True, "connection": connection_for_site(google, site)},
         "cms": {
             "providers": list(cms_connectors.PROVIDERS),
             "connections": [_conn_row(r) for r in cms],
@@ -655,10 +661,13 @@ def reset_workspace(db: Session = Depends(get_db), user: User = Depends(get_curr
 
 
 @router.get("/changes")
-def list_changes(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def list_changes(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _purge_queue_without_google(db, user)
-    rows = db.query(SiteChange).filter(SiteChange.customer_id == user.id).order_by(SiteChange.id.desc()).limit(100).all()
-    return [_change_row(r) for r in rows]
+    rows = db.query(SiteChange).filter(SiteChange.customer_id == user.id).order_by(SiteChange.id.desc()).limit(200).all()
+    wanted = host_key(site)
+    if wanted:
+        rows = [row for row in rows if host_key(row.target_url or "") == wanted]
+    return [_change_row(r) for r in rows[:100]]
 
 
 def _create_change(db: Session, user: User, body: ChangeBody) -> SiteChange:
@@ -1129,24 +1138,33 @@ def ask_assistant(body: AssistantBody, db: Session = Depends(get_db), user: User
     return {"reply": text.strip(), "model": model, "source": "model"}
 
 
+def _payload_for_site(db: Session, user_id: int, kind: str, url: str) -> dict:
+    """Latest stored report whose website matches this page. Never another site's report."""
+    want = host_key(url)
+    recs = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind)
+        .order_by(FeatureRecord.id.desc())
+        .limit(30)
+        .all()
+    )
+    for rec in recs:
+        payload = rec.payload or {}
+        if want and payload_host(payload) != want:
+            continue
+        source = str(payload.get("source") or "")
+        if payload.get("seedVersion") != LIVE and not source.startswith("google") and source != "searchify_operator":
+            continue
+        return payload
+    return {}
+
+
 def _analytics_for_page(db: Session, user_id: int, url: str) -> dict:
     """Compact GA4 evidence for one page. Empty when Analytics was never synced."""
     from urllib.parse import urlparse
 
     def latest(kind: str) -> dict:
-        rec = (
-            db.query(FeatureRecord)
-            .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind)
-            .order_by(FeatureRecord.id.desc())
-            .first()
-        )
-        if rec is None:
-            return {}
-        payload = rec.payload or {}
-        source = str(payload.get("source") or "")
-        if payload.get("seedVersion") != LIVE and not source.startswith("google"):
-            return {}
-        return payload
+        return _payload_for_site(db, user_id, kind, url)
 
     traffic = latest("traffic-analytics")
     channels = latest("traffic-distribution")
@@ -1185,14 +1203,9 @@ def _gsc_for_page(db: Session, user_id: int, url: str, evidence: dict | None = N
     base = dict(evidence or {})
     if base.get("clicks") not in (None, "") and base.get("impressions") not in (None, ""):
         return base
-    rec = (
-        db.query(FeatureRecord)
-        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "top-pages")
-        .order_by(FeatureRecord.id.desc())
-        .first()
-    )
+    payload = _payload_for_site(db, user_id, "top-pages", url)
     want = _norm_path(url)
-    for row in ((rec.payload if rec else {}) or {}).get("rows") or []:
+    for row in (payload or {}).get("rows") or []:
         if not isinstance(row, (list, tuple)) or not row:
             continue
         if _norm_path(str(row[0])) != want:
@@ -1211,12 +1224,8 @@ def _gsc_for_page(db: Session, user_id: int, url: str, evidence: dict | None = N
 
 def _speed_for_page(db: Session, user_id: int, url: str) -> dict:
     """Speed Index and Lighthouse scores. Stored PageSpeed first, then a short live read."""
-    rec = (
-        db.query(FeatureRecord)
-        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "site-audit")
-        .order_by(FeatureRecord.id.desc())
-        .first()
-    )
+    rec_payload = _payload_for_site(db, user_id, "site-audit", url)
+    rec = type("Audit", (), {"payload": rec_payload})()
     labels = {
         "Speed Index": "speedIndex",
         "LCP": "lcp",

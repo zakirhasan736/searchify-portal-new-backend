@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -8,6 +8,7 @@ from app.catalog_data import DRAFT_SEEDS, EXTRA, PANELS, SCREENS, SEED_VERSION, 
 from app.database import get_db
 from app.models import Domain, FeatureRecord, Tag, User
 from app.security import get_current_user, hash_password
+from app.site_scope import matches_site
 
 router = APIRouter(prefix="/api/v1", tags=["features"])
 
@@ -87,7 +88,12 @@ def _is_live_payload(payload: dict | None) -> bool:
 
 
 @router.get("/features/{kind}")
-def list_features(kind: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def list_features(
+    kind: str,
+    site: str = Query(""),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     kind = KIND_ALIASES.get(kind, kind)
     if kind not in KINDS:
         raise HTTPException(status_code=404, detail="Unknown feature")
@@ -95,10 +101,10 @@ def list_features(kind: str, db: Session = Depends(get_db), user: User = Depends
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == kind)
         .order_by(FeatureRecord.id.desc())
-        .limit(24)
+        .limit(40)
         .all()
     )
-    live = [record for record in records if _is_live_payload(record.payload)]
+    live = [record for record in records if _is_live_payload(record.payload) and matches_site(kind, record.payload, site)]
     live.sort(key=lambda record: -record.id)
     return [row(record) for record in live[:8]]
 

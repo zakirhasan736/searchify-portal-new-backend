@@ -16,6 +16,7 @@ from app.database import get_db
 from app import google_ads as gads
 from app import google_oauth as goauth
 from app.models import CmsConnection, FeatureRecord, GoogleConnection, Job, SiteChange, User
+from app.site_scope import host_key, payload_host
 from app.security import get_current_user
 
 router = APIRouter(prefix="/api/v1", tags=["google"])
@@ -32,6 +33,11 @@ class SelectBody(BaseModel):
 
 class SyncBody(BaseModel):
     cms_connection_id: int | None = None
+    site: str | None = None
+
+
+class ActivateSiteBody(BaseModel):
+    site: str = ""
 
 
 class GoogleAccountBody(BaseModel):
@@ -238,8 +244,15 @@ def _ga4_with_streams(token: str, properties: list[dict]) -> list[dict]:
 
 def _upsert_feature(db: Session, user_id: int, kind: str, title: str, payload: dict, status: str = "stored"):
     cms_id = db.info.get("cms_connection_id")
-    if cms_id and isinstance(payload, dict) and "cmsConnectionId" not in payload:
+    payload = dict(payload or {})
+    if cms_id and "cmsConnectionId" not in payload:
         payload = {**payload, "cmsConnectionId": cms_id}
+    host = payload_host(payload) or host_key(str(db.info.get("site_host") or ""))
+    if host:
+        payload["siteHost"] = host
+        marker = f" · {host}"
+        if marker not in title:
+            title = f"{title}{marker}"[:200]
     row = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind, FeatureRecord.title == title)
@@ -255,14 +268,147 @@ def _upsert_feature(db: Session, user_id: int, kind: str, title: str, payload: d
     db.commit()
 
 
+def _binding_for(row: GoogleConnection | None, host: str) -> dict | None:
+    if row is None or not host:
+        return None
+    saved = ((row.meta or {}).get("byHost") or {}).get(host)
+    if isinstance(saved, dict):
+        return saved
+    if host_key(row.gsc_site_url or "") == host:
+        return {
+            "gscSiteUrl": row.gsc_site_url or "",
+            "ga4PropertyId": row.ga4_property_id or "",
+            "ga4PropertyName": row.ga4_property_name or "",
+        }
+    return None
+
+
+def _save_binding(row: GoogleConnection, host: str, binding: dict) -> None:
+    meta = dict(row.meta or {})
+    by_host = dict(meta.get("byHost") or {})
+    by_host[host] = {
+        "gscSiteUrl": binding.get("gscSiteUrl") or "",
+        "ga4PropertyId": binding.get("ga4PropertyId") or "",
+        "ga4PropertyName": binding.get("ga4PropertyName") or "",
+    }
+    meta["byHost"] = by_host
+    meta["activeHost"] = host
+    row.meta = meta
+    flag_modified(row, "meta")
+
+
+def _remember_current_binding(row: GoogleConnection) -> None:
+    host = host_key(row.gsc_site_url or "") or host_key(str((row.meta or {}).get("activeHost") or ""))
+    if not host or not (row.gsc_site_url or row.ga4_property_id):
+        return
+    _save_binding(row, host, {
+        "gscSiteUrl": row.gsc_site_url or "",
+        "ga4PropertyId": row.ga4_property_id or "",
+        "ga4PropertyName": row.ga4_property_name or "",
+    })
+
+
+def connection_for_site(row: GoogleConnection | None, site: str = "") -> dict:
+    payload = _connection_payload(row)
+    host = host_key(site)
+    if not host or row is None:
+        return payload
+    binding = _binding_for(row, host) or {}
+    validated = (row.meta or {}).get("validated") or {}
+    gsc = binding.get("gscSiteUrl") or ""
+    ga4 = binding.get("ga4PropertyId") or ""
+    name = binding.get("ga4PropertyName") or ""
+
+    def prop_status(selected: str, key: str) -> str:
+        account = payload["account"]["status"]
+        if account != "connected":
+            return account if selected else "not_selected"
+        if not selected:
+            return "not_selected"
+        stamp = validated.get(key) or {}
+        return "connected" if stamp.get("value") == selected else "unverified"
+
+    payload = dict(payload)
+    payload["gscSiteUrl"] = gsc
+    payload["ga4PropertyId"] = ga4
+    payload["ga4PropertyName"] = name
+    payload["gsc"] = {"status": prop_status(gsc, "gsc"), "siteUrl": gsc, "checkedAt": (validated.get("gsc") or {}).get("at")}
+    payload["ga4"] = {
+        "status": prop_status(ga4, "ga4"),
+        "propertyId": ga4,
+        "propertyName": name,
+        "checkedAt": (validated.get("ga4") or {}).get("at"),
+    }
+    return payload
+
+
+def _has_kind_for_host(db: Session, user_id: int, kind: str, host: str) -> bool:
+    rows = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind)
+        .order_by(FeatureRecord.id.desc())
+        .limit(24)
+        .all()
+    )
+    return any(payload_host(row.payload) == host for row in rows)
+
+
+def activate_site_row(db: Session, user: User, site: str) -> dict:
+    host = host_key(site)
+    if not host:
+        raise HTTPException(status_code=400, detail="Enter a website address first.")
+    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    if row is None:
+        return {"ok": True, "host": host, "matched": False, "needsSync": False, "connection": _connection_payload(None)}
+    _remember_current_binding(row)
+    binding = _binding_for(row, host)
+    if binding is None and (row.access_token or row.refresh_token):
+        token = _valid_access_token(db, row)
+        gsc = google_match.match_gsc(f"https://{host}/", goauth.list_gsc_sites(token))
+        ga = google_match.match_ga4(f"https://{host}/", _ga4_with_streams(token, goauth.list_ga4_properties(token)))
+        binding = {
+            "gscSiteUrl": gsc.get("selected") if gsc.get("status") == "matched" else "",
+            "ga4PropertyId": ga.get("selected") if ga.get("status") == "matched" else "",
+            "ga4PropertyName": (ga.get("selectedName") or "") if ga.get("status") == "matched" else "",
+        }
+    if binding:
+        _save_binding(row, host, binding)
+        row.gsc_site_url = binding.get("gscSiteUrl") or ""
+        row.ga4_property_id = binding.get("ga4PropertyId") or ""
+        row.ga4_property_name = binding.get("ga4PropertyName") or ""
+        if row.gsc_site_url:
+            _stamp_validated(row, "gsc", row.gsc_site_url)
+        if row.ga4_property_id:
+            _stamp_validated(row, "ga4", row.ga4_property_id)
+    db.info["site_host"] = host
+    db.commit()
+    needs = False
+    if binding and binding.get("gscSiteUrl") and not _has_kind_for_host(db, user.id, "organic-search", host):
+        needs = True
+    if binding and binding.get("ga4PropertyId") and not _has_kind_for_host(db, user.id, "traffic-analytics", host):
+        needs = True
+    return {
+        "ok": True,
+        "host": host,
+        "matched": bool(binding and (binding.get("gscSiteUrl") or binding.get("ga4PropertyId"))),
+        "needsSync": needs,
+        "connection": connection_for_site(row, host),
+    }
+
+
 @router.get("/oauth/google/status")
-def google_status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def google_status(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     return {
         "configured": goauth.google_configured(),
         "redirectUri": config.GOOGLE_OAUTH_REDIRECT_URI,
-        "connection": _connection_payload(row),
+        "connection": connection_for_site(row, site),
     }
+
+
+@router.post("/oauth/google/activate-site")
+def google_activate_site(body: ActivateSiteBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return activate_site_row(db, user, body.site)
 
 
 @router.get("/oauth/google/start")
@@ -660,13 +806,29 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
         cms.meta = meta
         flag_modified(cms, "meta")
         cms.updated_at = datetime.utcnow()
+        cms_host = host_key(cms.site_url or "")
+        if cms_host:
+            _save_binding(row, cms_host, {
+                "gscSiteUrl": row.gsc_site_url or "",
+                "ga4PropertyId": row.ga4_property_id or "",
+                "ga4PropertyName": row.ga4_property_name or "",
+            })
+    chosen = host_key(row.gsc_site_url or "")
+    if chosen:
+        _save_binding(row, chosen, {
+            "gscSiteUrl": row.gsc_site_url or "",
+            "ga4PropertyId": row.ga4_property_id or "",
+            "ga4PropertyName": row.ga4_property_name or "",
+        })
     db.commit()
-    return _connection_payload(row)
+    return connection_for_site(row, chosen)
 
 
 @router.post("/oauth/google/sync")
 def google_sync(body: SyncBody = SyncBody(), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    return sync_user_google(db, user.id, body.cms_connection_id)
+    if body.site:
+        activate_site_row(db, user, body.site)
+    return sync_user_google(db, user.id, None if body.site else body.cms_connection_id)
 
 
 def _apply_site_google(db: Session, user_id: int, row: GoogleConnection, cms_connection_id: int | None) -> int | None:
@@ -701,6 +863,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
     if row is None:
         raise HTTPException(status_code=404, detail="Connect Google first")
     _apply_site_google(db, user.id, row, cms_connection_id)
+    db.info["site_host"] = host_key(row.gsc_site_url or "") or host_key(str((row.meta or {}).get("activeHost") or ""))
     token = _valid_access_token(db, row)
     synced = {"gsc": False, "ga4": False, "pagespeed": False, "places": False, "ads": False}
     overview_rows: list[list] = []
@@ -1644,20 +1807,26 @@ def google_pagespeed(body: PageSpeedBody, db: Session = Depends(get_db), user: U
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)[:300]) from exc
 
-    # Attach recent GSC rows if available
+    # Attach Search Console rows stored for this website only.
     gsc_pages = gsc_queries = None
-    page_rec = (
-        db.query(FeatureRecord)
-        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "top-pages")
-        .order_by(FeatureRecord.id.desc())
-        .first()
-    )
-    query_rec = (
-        db.query(FeatureRecord)
-        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "organic-search")
-        .order_by(FeatureRecord.id.desc())
-        .first()
-    )
+    speed_host = host_key(url)
+    db.info["site_host"] = speed_host
+
+    def _for_host(kind: str):
+        rows = (
+            db.query(FeatureRecord)
+            .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == kind)
+            .order_by(FeatureRecord.id.desc())
+            .limit(24)
+            .all()
+        )
+        for rec in rows:
+            if payload_host(rec.payload) == speed_host:
+                return rec
+        return None
+
+    page_rec = _for_host("top-pages")
+    query_rec = _for_host("organic-search")
     if page_rec and (page_rec.payload or {}).get("rows"):
         gsc_pages = page_rec.payload["rows"]
     if query_rec and (query_rec.payload or {}).get("rows"):
