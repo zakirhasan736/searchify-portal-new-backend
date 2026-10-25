@@ -31,6 +31,64 @@ def offer_fit(term: str, offers: list[str]) -> tuple[float, str]:
     return best_score, best_offer
 
 
+def _site_scan(db, user_id: int, host: str) -> dict:
+    if db is None or not user_id or not host:
+        return {}
+    from app.models import FeatureRecord
+
+    row = (
+        db.query(FeatureRecord)
+        .filter(
+            FeatureRecord.customer_id == user_id,
+            FeatureRecord.kind == "site-scan",
+            FeatureRecord.title == f"Site scan {host}",
+        )
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    return dict(getattr(row, "payload", None) or {}) if row else {}
+
+
+def site_concept(db, user_id: int, host: str) -> dict:
+    """What the AI site read understood: the business, its umbrella category, every offer, and each
+    page's own concept (role + the search it should win)."""
+    scan = _site_scan(db, user_id, host)
+    business = dict(scan.get("business") or {})
+    pages = []
+    for url, info in (scan.get("pageMap") or {}).items():
+        if isinstance(info, dict) and str(info.get("target") or "").strip():
+            pages.append({"url": url, "role": str(info.get("role") or ""), "target": " ".join(str(info["target"]).split())})
+    return {
+        "summary": " ".join(str(business.get("business") or "").split()),
+        "category": " ".join(str(business.get("category") or "").split()),
+        "offers": business_offers(db, user_id, host),
+        "pages": pages,
+    }
+
+
+def match_keyword(keyword: str, concept: dict) -> dict:
+    """Which part of the business a search belongs to, and which page of the site should rank for it.
+
+    Uses only the site read: the offers, the umbrella category, and each page's own target search.
+    """
+    offers = [o for o in (concept.get("offers") or []) if o]
+    category = concept.get("category") or ""
+    score, offer = offer_fit(keyword, [*offers, *([category] if category else [])])
+    best_page, best_fit = {}, 0.0
+    for page in concept.get("pages") or []:
+        if page.get("role") in {"legal", "contact", "about"}:
+            continue
+        fit, _ = offer_fit(keyword, [page["target"]])
+        if fit > best_fit:
+            best_page, best_fit = page, fit
+    return {
+        "fit": max(score, best_fit),
+        "concept": offer or (best_page.get("target") if best_page else ""),
+        "page": best_page.get("url", "") if best_fit >= 0.34 else "",
+        "pageTarget": best_page.get("target", "") if best_fit >= 0.34 else "",
+    }
+
+
 def _site_business(db, user_id: int, host: str) -> dict:
     if db is None or not user_id or not host:
         return {}
@@ -64,7 +122,7 @@ def business_offers(db, user_id: int, host: str) -> list[str]:
             offers.append(text[:80])
     if not offers and business.get("business"):
         offers.append(" ".join(str(business["business"]).split())[:80])
-    return offers[:8]
+    return offers[:15]
 
 
 def business_places(db, user_id: int, host: str) -> list[str]:

@@ -410,19 +410,26 @@ def crawl(home: str, limit: int = 40) -> dict:
     return {"home": home, "host": home_host, "pages": pages, "failed": failed, "error": "" if pages else "No readable pages were found."}
 
 
+# 2: reads every offer + umbrella category, more copy per page, navigation.
+READER_VERSION = 2
+
 UNDERSTAND = (
     "You are an SEO strategist reading a whole website before writing any Google listing. "
     "Use only what the pages and the owner's brief say. Do not invent awards, prices, years, reviews, or locations. "
     "Return JSON only, no prose, with this shape:\n"
-    '{"business":"one sentence: who they are and what they sell",'
-    '"offers":["the main services a customer would search for. Not a single case study, not the brand, and not the city by itself"],'
+    "Read EVERY page before deciding what the business is: the homepage, navigation, every service/product page, "
+    "about and contact pages. A business that lists several services must be described by all of them, never by "
+    "only the first one you read.\n"
+    '{"business":"one sentence: who they are and the full range of what they sell",'
+    '"category":"the umbrella term that covers ALL of the offers, in the words the site itself uses",'
+    '"offers":["EVERY distinct service or product the site lists, merged where two names mean the same thing. Not a single case study, not the brand, and not the city by itself"],'
     '"audience":"who buys",'
     '"places":["cities or regions the site serves, only if stated"],'
     '"proof":["concrete facts on the site a listing may use, e.g. same-day service, free quote, 24/7"],'
     '"voice":"how the brand talks, 3-6 words",'
     '"brand":"the brand name as written on the site",'
     '"pages":[{"url":"...","role":"home|service|product|category|location|about|contact|blog|legal|other",'
-    '"target":"the search a customer types for this page, 2-6 words. Homepage: the main service, not the brand and not the city alone. Include a city only when this page is about that place. Do not copy the current title.",'
+    '"target":"the search a customer types for this page, 2-6 words. Homepage: the umbrella category that covers all offers, not one service, not the brand and not the city alone. Service page: that one service. Contact or about page: the page purpose with the brand (what a person searching for that page types), never a service. Include a city only when this page is about that place. Do not copy the current title.",'
     '"angle":"what makes this page different from the other pages on the site"}]}'
 )
 
@@ -443,16 +450,19 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
     if not pages or not openai_configured():
         return {}
     digest = []
-    for page in pages[:45]:
+    for index, page in enumerate(pages[:45]):
         schema = ", ".join(page.get("schemaTypes") or []) or "-"
+        # The homepage and the first pages carry the service list; give them more copy.
+        copy_room = 1600 if index == 0 else 700
         digest.append(
             f"URL: {page['url']}\nTITLE: {page.get('title') or '-'}\n"
             f"META DESCRIPTION: {page.get('description') or '-'}\n"
             f"OPEN GRAPH: {page.get('ogTitle') or '-'} — {page.get('ogDescription') or '-'}\n"
             f"JSON-LD: {schema}; name {page.get('schemaName') or '-'}\n"
             f"H1: {page.get('h1') or '-'}\n"
-            f"HEADINGS: {' | '.join(page.get('headings') or [])[:300] or '-'}\n"
-            f"COPY: {(page.get('text') or '')[:420]}"
+            f"NAVIGATION: {', '.join(page.get('nav') or [])[:300] or '-'}\n"
+            f"HEADINGS: {' | '.join(page.get('headings') or [])[:500] or '-'}\n"
+            f"COPY: {(page.get('text') or '')[:copy_room]}"
         )
     owner = "\n".join(
         f"{label}: {value}"
@@ -469,7 +479,7 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
     ) or "(The owner did not fill the setup questions.)"
     user = f"Owner's setup answers:\n{owner}\n\nPages on the site ({len(pages)} read):\n\n" + "\n\n".join(digest)
     try:
-        text, _model, _role = chat_text(system=UNDERSTAND, user=user[:30000], kind="seo", writing_type="Site understanding", tokens=1800, max_tokens=4000)
+        text, _model, _role = chat_text(system=UNDERSTAND, user=user[:60000], kind="seo", writing_type="Site understanding", tokens=2400, max_tokens=9000)
     except RuntimeError:
         return {}
     return _json_block(text)
@@ -601,6 +611,8 @@ def scan_site(
         "scannedAt": datetime.utcnow().isoformat(timespec="seconds"),
         "pages": pages,
         "business": {k: v for k, v in understanding.items() if k != "pages"},
+        # Bump when the site reader changes so stored scans are re-read once (operator._scan_fresh).
+        "readerVersion": READER_VERSION,
         "pageMap": page_map,
         "competitors": competitors,
         "brief": brief,
