@@ -171,11 +171,46 @@ def _clean(value: str, limit: int) -> str:
     return cut or text[:limit].rstrip()
 
 
-def _brand_tail(title: str) -> str:
+_LEGAL_SUFFIX = {"inc", "llc", "ltd", "limited", "corp", "corporation", "company", "co", "plc", "gmbh", "pty", "group"}
+
+
+def _brand_words(brand: str) -> set[str]:
+    words = {part for part in re.findall(r"[a-z0-9]+", str(brand or "").lower()) if len(part) > 1}
+    core = words - _LEGAL_SUFFIX
+    return core or words
+
+
+def _has_brand(text: str, brand: str) -> bool:
+    """Brand present in text, tolerant of “Inc.”/“LLC” and punctuation differences."""
+    if not brand:
+        return False
+    if str(brand).strip().lower() in str(text or "").lower():
+        return True
+    need = _brand_words(brand)
+    have = {part for part in re.findall(r"[a-z0-9]+", str(text or "").lower())}
+    return bool(need) and need <= have
+
+
+def _brand_tail(title: str, brand: str = "") -> str:
+    """The brand segment at the END of a title, or "".
+
+    A brand-first title such as “Brand | Web Design, SEO & Marketing in Calgary” has no brand tail:
+    the last segment is the offer, not the brand. Treating it as the brand forced every suggestion to
+    carry that service phrase as a suffix and rejected any draft without it.
+    """
     text = str(title or "")
     for sep in (" | ", " – ", " — ", " - "):
-        if sep in text:
-            return text.split(sep)[-1].strip()
+        if sep not in text:
+            continue
+        head, last = text.rsplit(sep, 1)
+        last = last.strip()
+        if brand:
+            if _has_brand(last, brand) and len(last.split()) <= len(str(brand).split()) + 2:
+                return last
+            continue  # e.g. “Offer | Proof - Brand”: try the next separator
+        # No known brand: a short final segment is the usual brand slot.
+        if 0 < len(last.split()) <= 3 and len(last) <= 30:
+            return last
     return ""
 
 
@@ -321,9 +356,9 @@ def seo_choice_score(
         score += 6
     brand_name = " ".join(str(brand or "").split())
     if brand_name:
-        if brand_name.lower() in (title or "").lower():
+        if _has_brand(title, brand_name):
             score += 12
-        elif current_title and brand_name.lower() in current_title.lower():
+        elif current_title and _has_brand(current_title, brand_name):
             score -= 18
     if desc_words - title_words:
         score += 8
@@ -449,8 +484,16 @@ def _parse_target(text: str) -> str:
     return ""
 
 
+def _fold(word: str) -> str:
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+        return word[:-1]
+    return word
+
+
 def _tokens(value: str) -> set[str]:
-    return {part for part in re.findall(r"[a-z0-9]+", (value or "").lower()) if len(part) > 2}
+    return {_fold(part) for part in re.findall(r"[a-z0-9]+", (value or "").lower()) if len(part) > 2}
 
 
 def _overlap(left: str, right: str) -> float:
@@ -861,7 +904,7 @@ def listing_is_stronger(
         name = str(place or "").strip()
         if not name or name.lower() in (keyword or "").lower():
             continue
-        if title.split("|")[0].strip().lower().startswith(name.lower()):
+        if city_lead_problem(title, name, keyword, offers):
             return False
     if rival and not meets_competitor(title, rival, keyword):
         return False
@@ -879,15 +922,15 @@ def listing_is_stronger(
                 break
         if not fresh and not alt_hit:
             return False
-    tail = _brand_tail(current)
-    if tail and tail.lower() not in (title or "").lower():
+    tail = _brand_tail(current, brand)
+    if tail and not _has_brand(title, tail):
         return False
     # Do not treat a thinner rewrite as stronger when the live title already names brand + offers.
-    if current and brand and brand.lower() in current.lower():
+    if current and brand and _has_brand(current, brand):
         live_offers = sum(1 for offer in (offers or []) if _content_tokens(offer) & current_words)
         draft_offers = sum(1 for offer in (offers or []) if _content_tokens(offer) & title_words)
         if live_offers >= 2:
-            if brand.lower() not in (title or "").lower():
+            if not _has_brand(title, brand):
                 return False
             if draft_offers < live_offers:
                 return False
@@ -897,18 +940,39 @@ def listing_is_stronger(
     return True
 
 
-def topic_issues(title: str, desc: str, topic: str, keyword: str) -> list[str]:
-    """Reject a listing that left the page concept or dropped the keyword."""
+def city_lead_problem(title: str, place: str, keyword: str, offers: list[str] | None = None) -> bool:
+    """True when a title opens with a city but the lead is NOT “city + this page's service”.
+
+    “Calgary Web Design & SEO Agency” is the standard local pattern and must pass. “Calgary's Favourite Team”
+    leads with a place and no offer, so it still fails.
+    """
+    name = str(place or "").strip().lower()
+    lead = str(title or "").split("|")[0].strip().lower()
+    if not name or name in (keyword or "").lower() or not lead.startswith(name):
+        return False
+    rest = _content_tokens(lead[len(name):])
+    anchors = _content_tokens(keyword) | _content_tokens(" ".join(str(o) for o in (offers or [])))
+    return not (rest & anchors)
+
+
+def topic_issues(title: str, desc: str, topic: str, keyword: str, offers: list[str] | None = None) -> list[str]:
+    """Reject a listing that left the page concept or dropped the keyword.
+
+    The topic often comes from a slogan H1 (“We Build Websites That Grow Your Business”). A title that
+    leads with the page keyword or the page's own offer is on-topic even if it shares no slogan words.
+    """
     issues = []
     title_words = _content_tokens(title)
     topic_words = _content_tokens(topic)
-    if topic_words and len(title_words & topic_words) < min(2, len(topic_words)):
+    anchor_words = _content_tokens(keyword) | _content_tokens(" ".join(str(o) for o in (offers or [])))
+    on_offer = bool(anchor_words) and len(title_words & anchor_words) >= min(2, len(_content_tokens(keyword)) or 1)
+    if topic_words and len(title_words & topic_words) < min(2, len(topic_words)) and not on_offer:
         issues.append(f"The title left the page topic “{topic}”. The concept of this page must stay in the title.")
     keyword_words = _content_tokens(keyword)
     if len(keyword_words) >= 2 and len(title_words & keyword_words) < max(1, (len(keyword_words) + 1) // 2):
         issues.append(f"The title misses the keyword “{keyword}”. Use those words near the front.")
     desc_words = _content_tokens(desc)
-    if topic_words and desc_words and not (desc_words & topic_words):
+    if topic_words and desc_words and not (desc_words & topic_words) and not (desc_words & anchor_words):
         issues.append(f"The description is about a different topic than “{topic}”.")
     return issues
 
@@ -1255,7 +1319,7 @@ def write_title_description(
 
         def dfs_hard_checks(t: str, d: str) -> list[str]:
             found = _issues(t, d, live_title, page_bits, taken or [], rivals)
-            found.extend(topic_issues(t, d, topic, keyword))
+            found.extend(topic_issues(t, d, topic, keyword, offers))
             found.extend(listing_fluff_problems(t, d, evidence=evidence_text))
             claims = page_quality.validate_claims(t, d, evidence=evidence_text, places=places)
             for claim in claims["claims"]:
@@ -1297,7 +1361,7 @@ def write_title_description(
                 found.append("The title left the business concept. Use the best keyword from the offers, not the current title.")
             for place in places:
                 name = str(place or "").strip()
-                if name and name.lower() not in (keyword or "").lower() and t.split("|")[0].strip().lower().startswith(name.lower()):
+                if name and city_lead_problem(t, name, keyword, offers):
                     found.append(f"Do not start the title with {name}. The best keyword does not lead with that city.")
                     break
             return [item for item in found if is_hard_issue(item)][:8]
@@ -1583,7 +1647,7 @@ def write_title_description(
     def hard_checks(t: str, d: str) -> list[str]:
         """Factual and relevance gates shared by every candidate source."""
         found = _issues(t, d, current, page_bits, taken, rivals)
-        found.extend(topic_issues(t, d, topic, keyword))
+        found.extend(topic_issues(t, d, topic, keyword, offers))
         found.extend(listing_fluff_problems(t, d, evidence=evidence_text))
         claims = page_quality.validate_claims(t, d, evidence=evidence_text, places=places)
         for claim in claims["claims"]:
@@ -1621,7 +1685,7 @@ def write_title_description(
             found.append("The title left the business concept. Use the best keyword from the offers, not the current title.")
         for place in places:
             name = str(place or "").strip()
-            if name and name.lower() not in (keyword or "").lower() and t.split("|")[0].strip().lower().startswith(name.lower()):
+            if name and city_lead_problem(t, name, keyword, offers):
                 found.append(f"Do not start the title with {name}. The best keyword does not lead with that city.")
                 break
         return [item for item in found if is_hard_issue(item)][:8]
@@ -1642,8 +1706,8 @@ def write_title_description(
         return found[:8]
 
     kept_options: list[tuple[str, str]] = []
-    tail = _brand_tail(current)
-    live_has_brand = bool(brand and brand.lower() in current.lower())
+    tail = _brand_tail(current, brand)
+    live_has_brand = _has_brand(current, brand)
 
     def keep_option(cand_title: str, cand_desc: str) -> None:
         t = fit_title_strict(cand_title or "", tail or brand) or _fit_title(cand_title or "", tail)
@@ -1675,7 +1739,7 @@ def write_title_description(
         for t, d in pool:
             if hard_checks(t, d):
                 continue
-            if live_has_brand and brand.lower() not in t.lower():
+            if live_has_brand and not _has_brand(t, brand):
                 continue
             rows.append((t, d))
         return rows
@@ -1752,6 +1816,11 @@ def write_title_description(
             url=page_url, kind=kind, topic=topic, keyword=keyword, brand=brand, offers=offers, places=places,
             h1=str(scraped.get("h1") or ""), headings=str(headings or ""), page_text=page_body,
             queries=[*matched, *queries][:8], rival_titles=[str(r.get("title") or "") for r in rivals if r.get("title")],
+            research=research_lines(research, page_url, topic, offers),
+            search_console=(
+                f"clicks {gsc.get('clicks')}, impressions {gsc.get('impressions')}, CTR {gsc.get('ctr') or '—'}, "
+                f"position {gsc.get('position')}" if gsc.get("impressions") not in (None, "", "—") else ""
+            ),
         )
         has_live = bool(current.strip() and live_desc.strip())
 

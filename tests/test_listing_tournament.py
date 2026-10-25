@@ -157,3 +157,62 @@ def test_candidates_dropping_brand_or_inventing_facts_never_reach_judge():
 
     _run(judge, ask_text=bad)
     assert all("Award" not in t for t in seen)
+
+
+BRAND_FIRST = {
+    **HOME,
+    "url": "https://sovereignstandard.ca/",
+    "title": "Sovereign Standard | Web Design, SEO & Digital Marketing Agency in Calgary",
+    "description": "Sovereign Standard helps businesses grow.",
+    "h1": "We Build Brands That Grow",
+    "headings": "Our Work | Free Consultation | Small Business Owners",
+    "text": (
+        "Sovereign Standard is a Calgary web design and SEO agency. We build fast websites and run SEO and "
+        "Google Ads for Calgary businesses. See our work for clients. Free Consultation for Small Business Owners."
+    ),
+}
+BRAND_FIRST_SITE = {"business": {"brand": "Sovereign Standard Inc.", "offers": ["web design", "SEO", "Google Ads"], "places": ["Calgary"]}, "page": {"role": ""}}
+BRAND_FIRST_DRAFTS = (
+    "TITLE: Calgary Web Design & SEO Agency | Sovereign Standard\n"
+    "DESCRIPTION: Fast websites, SEO and Google Ads for Calgary businesses. Book a free consultation with Sovereign Standard.\n"
+)
+
+
+def test_brand_first_live_title_with_slogan_h1_still_gets_a_suggestion():
+    """Regression: brand-first live title made the offer phrase look like the brand and blocked every draft."""
+    seen = []
+
+    def judge(evidence, listings, salt=""):
+        seen.extend(row["title"] for row in listings)
+        return [{**row, "scores": {}, "score": 40.0 if i == 0 else 85.0, "accurate": True, "note": "n"} for i, row in enumerate(listings)]
+
+    with (
+        patch("app.meta_writer.openai_configured", return_value=True),
+        patch("app.meta_writer._ask", return_value=(BRAND_FIRST_DRAFTS, "test", "writer")),
+        patch("app.meta_writer.scrape_page", return_value=BRAND_FIRST),
+        patch("app.dfs_meta.draft_from_research", return_value={}),
+        patch("app.meta_writer.judge_listings", side_effect=judge),
+    ):
+        out = write_title_description(url=BRAND_FIRST["url"], profile={"business": "Sovereign Standard Inc."}, page=BRAND_FIRST, site=BRAND_FIRST_SITE, kind="home")
+    assert "Calgary Web Design & SEO Agency | Sovereign Standard" in seen
+    assert out["recommendKeep"] is False
+    assert out["title"] == "Calgary Web Design & SEO Agency | Sovereign Standard"
+    assert "Digital Marketing Agency in Calgary" not in out["title"]
+
+
+def test_long_single_sentence_description_is_trimmed_at_a_clause():
+    long = ("Fast websites, technical SEO audits and Google Ads campaigns for Calgary service businesses that want more "
+            "calls and booked jobs, with clear monthly reporting on every lead and every dollar.")
+    fitted = fit_desc_strict(long)
+    assert fitted and len(fitted) <= 160 and fitted.endswith(".")
+
+
+def test_judge_partial_scores_drop_only_unscored_drafts():
+    from app import listing_judge
+
+    reply = '{"items": [{"id": "L1", "relevance": 8, "keyword": 8, "click_appeal": 8, "specificity": 8, "brand_trust": 8, "readability": 8, "accuracy": 9, "note": "ok"}]}'
+    rows = [{"title": "Live | Brand", "description": "Live."}, {"title": "Draft | Brand", "description": "Draft."}]
+    with patch.object(listing_judge, "_order", return_value=[0, 1]), patch.object(listing_judge, "chat_text", return_value=(reply, "m", "r")):
+        out = listing_judge.judge_listings("evidence", rows)
+    assert out is not None and out[0]["score"] == 80.5
+    assert out[1]["accurate"] is False

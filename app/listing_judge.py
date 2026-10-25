@@ -110,10 +110,12 @@ def _norm(value: str) -> str:
 def _split_brand(title: str, brand_tail: str) -> tuple[str, str, str]:
     """(head, separator, brand) when the title ends with the brand; otherwise (title, '', '')."""
     tail = (brand_tail or "").strip().lower()
+    tail_words = set(re.findall(r"[a-z0-9]+", tail)) - {"inc", "llc", "ltd", "co", "corp", "company"}
     for sep in _SEPS:
         if sep in title:
             left, right = title.rsplit(sep, 1)
-            if not tail or right.strip().lower() == tail:
+            right_words = set(re.findall(r"[a-z0-9]+", right.lower()))
+            if not tail or right.strip().lower() == tail or (tail_words and tail_words <= right_words):
                 if tail or len(right.split()) <= 4:
                     return left.strip(), sep, right.strip()
     return title, "", ""
@@ -164,6 +166,14 @@ def fit_desc_strict(desc: str) -> str:
         cut = max(cut, len(window) - 1)
     if cut >= 100:
         return window[: cut + 1].strip()
+    # One long sentence: end it at the last clause break that keeps a useful description.
+    room = text[: DESC_MAX]
+    for marker in (" — ", " – ", "; ", ", ", " with ", " and "):
+        at = room.rfind(marker)
+        if at >= 110:
+            clause = room[:at].rstrip(" ,;:–—-")
+            if not _DANGLING.search(clause):
+                return clause + "."
     return ""
 
 
@@ -252,7 +262,7 @@ def judge_listings(evidence: str, listings: list[dict], *, salt: str = "") -> li
         )
         data = _extract_json(text)
     except Exception as exc:  # noqa: BLE001
-        log.info("listing judge unavailable: %s", exc)
+        log.warning("listing judge unavailable, falling back to heuristic rules: %s", exc)
         return None
     out: list[dict | None] = [None] * len(listings)
     for item in data.get("items") or []:
@@ -273,9 +283,14 @@ def judge_listings(evidence: str, listings: list[dict], *, salt: str = "") -> li
             "accurate": accuracy >= 6,
             "note": str(item.get("note") or "")[:200],
         }
-    if any(row is None for row in out):
+    # The live listing (index 0 when present) must be scored; unscored drafts are dropped, not fatal.
+    if out[0] is None:
+        log.warning("listing judge skipped the first listing; falling back to heuristic rules")
         return None
-    return out  # type: ignore[return-value]
+    return [
+        row if row is not None else {**listings[i], "scores": {}, "score": 0.0, "accurate": False, "note": "not scored"}
+        for i, row in enumerate(out)
+    ]
 
 
 def judge_evidence(
@@ -292,9 +307,13 @@ def judge_evidence(
     page_text: str,
     queries: list[str],
     rival_titles: list[str],
+    research: str = "",
+    search_console: str = "",
 ) -> str:
     return "\n".join(
         [
+            f"Keyword research (DataForSEO, matched to this page):\n{research.strip()[:900] or '(none)'}",
+            f"Search Console for this URL: {search_console or '(not connected)'}",
             f"URL: {url}",
             f"Page type: {kind or 'page'}",
             f"Page topic: {topic or '(unknown)'}",
