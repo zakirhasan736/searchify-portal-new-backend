@@ -16,7 +16,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app import config, llm_requests, locations, markets, quotas
-from app.concept_reads import backlink_concepts, business_offers, keyword_concepts, offer_fit, seed_phrase, visibility_reading
+from app.concept_reads import backlink_concepts, business_offers, keyword_concepts, match_keyword, site_concept, offer_fit, seed_phrase, visibility_reading
 from app.models import FeatureRecord, User
 
 log = logging.getLogger("searchify.research")
@@ -435,19 +435,38 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         )
     cost += c
     idea_calls = 1
-    for item in ((site_res or [{}])[0] or {}).get("items") or []:
+    concept = site_concept(db, user.id, host)
+    understood = bool(concept["offers"] or concept["category"] or concept["pages"])
+    for position, item in enumerate(((site_res or [{}])[0] or {}).get("items") or []):
         row = _kw_row(item)
         key = (row.get("keyword") or "").lower()
         if not key or key in known:
             continue
         known.add(key)
         intent = row.get("intent") or ""
+        where = match_keyword(row["keyword"], concept) if understood else {"fit": 0.0, "concept": "", "page": "", "pageTarget": ""}
         ideas.append({
             **row,
             "source": f"Searchify SEO keywords for site · DataForSEO read of {host}",
             # Grouping comes from DataForSEO's own search-intent label, not a Searchify seed.
             "seed": intent,
+            # Which part of the business this search belongs to and which page should rank for it,
+            # from the AI read of every page of the site.
+            "concept": where["concept"],
+            "page": where["page"],
+            "pageTarget": where["pageTarget"],
+            "_fit": where["fit"],
+            "_order": position,
         })
+    if understood:
+        # Keep what this business actually sells; DataForSEO relevance order breaks ties.
+        on_business = [row for row in ideas if row["_fit"] >= 0.34]
+        if on_business:
+            ideas = on_business
+        ideas.sort(key=lambda row: (-round(row["_fit"], 1), row["_order"]))
+    for row in ideas:
+        row.pop("_fit", None)
+        row.pop("_order", None)
     paid_calls = 1 + bool(clean) + idea_calls
     _spend(db, user, paid_calls, cost)
     quotas.consume(db, user, "keywords")

@@ -103,3 +103,51 @@ def test_all_failed_drafts_keep_the_published_listing():
         out, _seen, _brief = _run(CONTACT, drafts, "contact")
     assert out["title"] == CONTACT["title"]
     assert out["recommendKeep"] is True
+
+
+def test_keyword_ideas_are_matched_to_the_business_and_its_pages(monkeypatch):
+    from app import research
+
+    concept = {
+        "summary": SITE["business"]["business"],
+        "category": "digital agency",
+        "offers": SITE["business"]["offers"],
+        "pages": [
+            {"url": "https://sovereignstandard.ca/", "role": "home", "target": "calgary digital agency"},
+            {"url": "https://sovereignstandard.ca/seo", "role": "service", "target": "seo services calgary"},
+            {"url": "https://sovereignstandard.ca/ui-ux", "role": "service", "target": "ui ux design agency"},
+            {"url": "https://sovereignstandard.ca/contact-inquiry", "role": "contact", "target": "contact sovereign standard"},
+        ],
+    }
+
+    def fake_call(method, path, payload, timeout=60):
+        if "keywords_for_site" in path:
+            return [{"items": [
+                {"keyword": "sovereign standard calgary", "keyword_info": {"search_volume": 50}},
+                {"keyword": "seo services calgary", "keyword_info": {"search_volume": 700}},
+                {"keyword": "free stock photos", "keyword_info": {"search_volume": 90000}},
+                {"keyword": "ui ux design agency", "keyword_info": {"search_volume": 300}},
+            ]}], 0.0
+        return [{"items": []}], 0.0
+
+    monkeypatch.setattr(research, "_call", fake_call)
+    monkeypatch.setattr(research, "site_concept", lambda *a: concept)
+    monkeypatch.setattr(research, "_place_for", lambda *a, **k: (research.locations.Location(country="Canada", iso="CA", language="en"), {}))
+    monkeypatch.setattr(research, "business_offers", lambda *a: concept["offers"])
+    monkeypatch.setattr(research, "cached", lambda *a, **k: None)
+    for name in ("_budget", "_spend", "_save"):
+        monkeypatch.setattr(research, name, lambda *a, **k: None)
+    monkeypatch.setattr(research.quotas, "check", lambda *a, **k: None)
+    monkeypatch.setattr(research.quotas, "consume", lambda *a, **k: None)
+    monkeypatch.setattr(research.quotas, "tracked_keyword_limit", lambda *a: None)
+    monkeypatch.setattr(research.quotas, "keyword_idea_limit", lambda *a: 20)
+
+    class U:
+        id, role, plan = 1, "ROLE_CLIENT", "starter"
+
+    out = research.keywords(None, U(), site="https://sovereignstandard.ca", terms=[])
+    by_kw = {row["keyword"]: row for row in out["ideas"]}
+    assert "free stock photos" not in by_kw  # not something this business sells
+    assert by_kw["seo services calgary"]["page"] == "https://sovereignstandard.ca/seo"
+    assert by_kw["ui ux design agency"]["page"] == "https://sovereignstandard.ca/ui-ux"
+    assert by_kw["seo services calgary"]["concept"] == "SEO"
