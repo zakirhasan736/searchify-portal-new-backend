@@ -29,6 +29,7 @@ class SelectBody(BaseModel):
     ga4_property_id: str | None = None
     ga4_property_name: str | None = None
     cms_connection_id: int | None = None
+    site: str | None = None  # the website this choice is for (binds the choice to that site)
 
 
 class SyncBody(BaseModel):
@@ -286,10 +287,13 @@ def _binding_for(row: GoogleConnection | None, host: str) -> dict | None:
 def _save_binding(row: GoogleConnection, host: str, binding: dict) -> None:
     meta = dict(row.meta or {})
     by_host = dict(meta.get("byHost") or {})
+    previous = by_host.get(host) if isinstance(by_host.get(host), dict) else {}
     by_host[host] = {
         "gscSiteUrl": binding.get("gscSiteUrl") or "",
         "ga4PropertyId": binding.get("ga4PropertyId") or "",
         "ga4PropertyName": binding.get("ga4PropertyName") or "",
+        # When Searchify last looked for missing properties, so a failed match is retried later, not never.
+        "checkedAt": binding.get("checkedAt") or previous.get("checkedAt") or "",
     }
     meta["byHost"] = by_host
     meta["activeHost"] = host
@@ -358,6 +362,46 @@ def _has_kind_for_host(db: Session, user_id: int, kind: str, host: str) -> bool:
     return any(payload_host(row.payload) == host for row in rows)
 
 
+RECHECK_AFTER = timedelta(minutes=10)
+
+
+def _google_lists(token: str) -> tuple[list[dict], list[dict]]:
+    """Search Console properties and GA4 properties (with web streams) this Google account can read."""
+    return goauth.list_gsc_sites(token), _ga4_with_streams(token, goauth.list_ga4_properties(token))
+
+
+def _matched_binding(host: str, gsc_sites: list[dict], ga4_props: list[dict]) -> dict:
+    """Only unambiguous matches are filled in; anything else is left empty for the owner to choose."""
+    gsc = google_match.match_gsc(f"https://{host}/", gsc_sites)
+    ga = google_match.match_ga4(f"https://{host}/", ga4_props)
+    return {
+        "gscSiteUrl": gsc.get("selected") if gsc.get("status") == "matched" else "",
+        "ga4PropertyId": ga.get("selected") if ga.get("status") == "matched" else "",
+        "ga4PropertyName": (ga.get("selectedName") or "") if ga.get("status") == "matched" else "",
+    }
+
+
+def _merge_binding(current: dict | None, found: dict, now: datetime) -> dict:
+    """The owner's choice always wins; a match only fills what is still empty."""
+    current = current or {}
+    gsc = current.get("gscSiteUrl") or found.get("gscSiteUrl") or ""
+    ga4 = current.get("ga4PropertyId") or found.get("ga4PropertyId") or ""
+    name = current.get("ga4PropertyName") if current.get("ga4PropertyId") else found.get("ga4PropertyName")
+    return {"gscSiteUrl": gsc, "ga4PropertyId": ga4, "ga4PropertyName": name or "", "checkedAt": now.isoformat(timespec="seconds")}
+
+
+def _needs_recheck(binding: dict | None, now: datetime) -> bool:
+    if binding is None:
+        return True
+    if binding.get("gscSiteUrl") and binding.get("ga4PropertyId"):
+        return False
+    try:
+        last = datetime.fromisoformat(str(binding.get("checkedAt") or ""))
+    except ValueError:
+        return True
+    return now - last >= RECHECK_AFTER
+
+
 def activate_site_row(db: Session, user: User, site: str) -> dict:
     host = host_key(site)
     if not host:
@@ -367,15 +411,18 @@ def activate_site_row(db: Session, user: User, site: str) -> dict:
         return {"ok": True, "host": host, "matched": False, "needsSync": False, "connection": _connection_payload(None)}
     _remember_current_binding(row)
     binding = _binding_for(row, host)
-    if binding is None and (row.access_token or row.refresh_token):
-        token = _valid_access_token(db, row)
-        gsc = google_match.match_gsc(f"https://{host}/", goauth.list_gsc_sites(token))
-        ga = google_match.match_ga4(f"https://{host}/", _ga4_with_streams(token, goauth.list_ga4_properties(token)))
-        binding = {
-            "gscSiteUrl": gsc.get("selected") if gsc.get("status") == "matched" else "",
-            "ga4PropertyId": ga.get("selected") if ga.get("status") == "matched" else "",
-            "ga4PropertyName": (ga.get("selectedName") or "") if ga.get("status") == "matched" else "",
-        }
+    now = datetime.utcnow()
+    if (row.access_token or row.refresh_token) and _needs_recheck(binding, now):
+        # Look for this site's properties by its domain. A miss is retried after RECHECK_AFTER,
+        # so a property added in Google later is still picked up automatically.
+        try:
+            token = _valid_access_token(db, row)
+            gsc_sites, ga4_props = _google_lists(token)
+            binding = _merge_binding(binding, _matched_binding(host, gsc_sites, ga4_props), now)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Google being down must not break opening the site
+            log.warning("google_match_failed", extra={"user_id": user.id, "host": host, "error": type(exc).__name__})
     if binding:
         _save_binding(row, host, binding)
         row.gsc_site_url = binding.get("gscSiteUrl") or ""
@@ -420,6 +467,7 @@ def google_activate_site(body: ActivateSiteBody, db: Session = Depends(get_db), 
 def google_start(
     services: str = Query(default="gsc,ga4,ads"),
     add: str = Query(default=""),
+    next: str = Query(default="", alias="next"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -434,7 +482,9 @@ def google_start(
             "adsScope": True,
             "services": services,
         }
-    state = goauth.make_oauth_state(user.id, services=services)
+    # Where to come back to after Google (e.g. onboarding at /app/start). Only portal app paths are allowed.
+    back = next if re.fullmatch(r"/app(/[A-Za-z0-9_-]+)*", next or "") else ""
+    state = goauth.make_oauth_state(user.id, services=services, next_path=back)
     prompt = "select_account consent" if adding else ""
     return {
         "authUrl": goauth.auth_url(state, services=services, force_consent=not already or adding, prompt=prompt),
@@ -449,6 +499,12 @@ def google_start(
 def google_callback(code: str | None = None, state: str | None = None, error: str | None = None, db: Session = Depends(get_db)):
     portal = config.PUBLIC_SITE_URL.rstrip("/")
     fail = f"{portal}/app/connections?google=error"
+    try:
+        back = str(goauth.parse_oauth_state(state or "").get("next") or "")
+        if re.fullmatch(r"/app(/[A-Za-z0-9_-]+)*", back):
+            fail = f"{portal}{back}?google=error"
+    except Exception:  # noqa: BLE001
+        pass
 
     if error:
         return RedirectResponse(f"{fail}&detail={error}")
@@ -518,34 +574,50 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
     services = str(payload.get("services") or "")
     flag = "ads-connected" if "ads" in services else "connected"
     q = urlencode({"google": flag, "email": row.google_email or ""})
-    dest = f"{portal}/app/connections/ads" if flag == "ads-connected" else f"{portal}/app/connections"
+    back = str(payload.get("next") or "")
+    if not re.fullmatch(r"/app(/[A-Za-z0-9_-]+)*", back):
+        back = ""
+    dest = f"{portal}/app/connections/ads" if flag == "ads-connected" else f"{portal}{back or '/app/connections'}"
     return RedirectResponse(f"{dest}?{q}")
 
 
 def _auto_match_after_connect(db: Session, row: GoogleConnection) -> None:
-    """If the workspace has exactly one website and no property is chosen, pick the property only when the match is unambiguous."""
-    if row.gsc_site_url and row.ga4_property_id:
-        return
+    """Right after Google sign-in: find each workspace site's Search Console and GA4 property by its domain.
+
+    Covers sites still in setup too (Google is usually connected during onboarding). Only unambiguous matches
+    are saved; the rest wait for the owner to choose on the Plug in screen.
+    """
     try:
         from app import site_profiles
 
-        journey = site_profiles.get_journey(db, row.customer_id) or {}
-        sites = [s for s in (journey.get("state") or {}).get("sites") or [] if s.get("status") == "ready" and (s.get("answers") or {}).get("site")]
-        if len(sites) != 1:
+        state = (site_profiles.get_journey(db, row.customer_id) or {}).get("state") or {}
+        sites = [s for s in state.get("sites") or [] if (s.get("answers") or {}).get("site")]
+        hosts: list[str] = []
+        for item in sites:
+            host = host_key(item["answers"]["site"])
+            if host and host not in hosts:
+                hosts.append(host)
+        if not hosts:
             return
-        site = sites[0]["answers"]["site"]
-        token = row.access_token
-        if not row.gsc_site_url:
-            found = google_match.match_gsc(site, goauth.list_gsc_sites(token))
-            if found["status"] == "matched":
-                row.gsc_site_url = found["selected"]
-                _stamp_validated(row, "gsc", found["selected"])
-        if not row.ga4_property_id:
-            found = google_match.match_ga4(site, _ga4_with_streams(token, goauth.list_ga4_properties(token)))
-            if found["status"] == "matched":
-                row.ga4_property_id = found["selected"]
-                row.ga4_property_name = found.get("selectedName") or ""
-                _stamp_validated(row, "ga4", found["selected"])
+        active = next((s for s in sites if s.get("id") == state.get("activeId")), None)
+        active_host = host_key(((active or {}).get("answers") or {}).get("site") or "") or hosts[0]
+        gsc_sites, ga4_props = _google_lists(row.access_token)
+        now = datetime.utcnow()
+        for host in hosts[:10]:
+            binding = _merge_binding(_binding_for(row, host), _matched_binding(host, gsc_sites, ga4_props), now)
+            _save_binding(row, host, binding)
+        chosen = _binding_for(row, active_host) or {}
+        row.gsc_site_url = chosen.get("gscSiteUrl") or ""
+        row.ga4_property_id = chosen.get("ga4PropertyId") or ""
+        row.ga4_property_name = chosen.get("ga4PropertyName") or ""
+        if row.gsc_site_url:
+            _stamp_validated(row, "gsc", row.gsc_site_url)
+        if row.ga4_property_id:
+            _stamp_validated(row, "ga4", row.ga4_property_id)
+        meta = dict(row.meta or {})
+        meta["activeHost"] = active_host
+        row.meta = meta
+        flag_modified(row, "meta")
         _remember_account(row)
         db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -818,7 +890,7 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
                 "ga4PropertyId": row.ga4_property_id or "",
                 "ga4PropertyName": row.ga4_property_name or "",
             })
-    chosen = host_key(row.gsc_site_url or "")
+    chosen = host_key(body.site or "") or host_key(row.gsc_site_url or "")
     if chosen:
         _save_binding(row, chosen, {
             "gscSiteUrl": row.gsc_site_url or "",

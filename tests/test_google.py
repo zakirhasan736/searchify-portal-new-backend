@@ -123,3 +123,87 @@ def test_no_connection_uses_the_same_status_shape():
     assert payload["connected"] is False
     assert payload["account"] == {"status": "disconnected", "email": ""}
     assert payload["gsc"]["status"] == "not_selected" and payload["ga4"]["status"] == "not_selected"
+
+
+# --- Property detection by the site's domain -------------------------------------------------------------
+
+def _row(user_id):
+    with SessionLocal() as db:
+        return db.query(GoogleConnection).filter(GoogleConnection.customer_id == user_id).first()
+
+
+def test_missed_match_is_retried_later(env, monkeypatch):
+    """A site whose property did not exist yet is matched once it appears, not stuck empty forever."""
+    c, uid = env["client"], env["user"].id
+    monkeypatch.setattr(goauth, "list_gsc_sites", lambda token: [])
+    monkeypatch.setattr(goauth, "list_ga4_properties", lambda token: [])
+    first = c.post("/api/v1/oauth/google/activate-site", json={"site": "https://acme.com"}).json()
+    assert first["matched"] is False
+    monkeypatch.setattr(goauth, "list_gsc_sites", lambda token: SITES)
+    monkeypatch.setattr(goauth, "list_ga4_properties", lambda token: [{"propertyId": "1", "displayName": "Acme", "accountName": "A"}])
+    # Within the retry window nothing is asked of Google again.
+    assert c.post("/api/v1/oauth/google/activate-site", json={"site": "https://acme.com"}).json()["matched"] is False
+    with SessionLocal() as db:  # the retry window has passed
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == uid).first()
+        meta = dict(row.meta)
+        meta["byHost"]["acme.com"]["checkedAt"] = (datetime.utcnow() - timedelta(minutes=11)).isoformat()
+        row.meta = meta
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(row, "meta")
+        db.commit()
+    again = c.post("/api/v1/oauth/google/activate-site", json={"site": "https://acme.com"}).json()
+    assert again["matched"] is True
+    assert again["connection"]["gsc"]["status"] == "connected"
+    assert again["connection"]["gscSiteUrl"] == "sc-domain:acme.com"
+
+
+def test_owner_choice_is_never_overwritten(env):
+    c = env["client"]
+    assert c.post("/api/v1/oauth/google/select", json={"gsc_site_url": "https://www.acme.com/", "site": "acme.com"}).status_code == 200
+    r = c.post("/api/v1/oauth/google/activate-site", json={"site": "acme.com"}).json()
+    assert r["connection"]["gscSiteUrl"] == "https://www.acme.com/"  # not replaced by the sc-domain match
+    assert r["connection"]["ga4PropertyId"] == "1"  # the missing GA4 part was filled by the match
+
+
+def test_ga4_only_choice_is_kept_for_its_site(env):
+    c = env["client"]
+    assert c.post("/api/v1/oauth/google/select", json={"ga4_property_id": "1", "site": "https://shop.example/"}).status_code == 200
+    conn = c.get("/api/v1/oauth/google/status", params={"site": "shop.example"}).json()["connection"]
+    assert conn["ga4"]["status"] == "connected" and conn["ga4PropertyId"] == "1"
+
+
+def test_connect_during_setup_matches_the_draft_site(env):
+    from app import site_profiles
+    from app.routers.google_connect import _auto_match_after_connect
+
+    uid = env["user"].id
+    with SessionLocal() as db:
+        site_profiles.save_journey(db, uid, {"sites": [{"id": "s1", "status": "draft", "answers": {"site": "https://www.acme.com"}}], "activeId": "s1"})
+        db.commit()
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == uid).first()
+        _auto_match_after_connect(db, row)
+    conn = env["client"].get("/api/v1/oauth/google/status", params={"site": "acme.com"}).json()["connection"]
+    assert conn["gsc"]["status"] == "connected" and conn["gscSiteUrl"] == "sc-domain:acme.com"
+    assert conn["ga4"]["status"] == "connected" and conn["ga4PropertyId"] == "1"
+
+
+def test_google_error_does_not_break_opening_a_site(env, monkeypatch):
+    def down(token):
+        raise RuntimeError("GSC sites failed: 503")
+
+    monkeypatch.setattr(goauth, "list_gsc_sites", down)
+    r = env["client"].post("/api/v1/oauth/google/activate-site", json={"site": "acme.com"})
+    assert r.status_code == 200 and r.json()["matched"] is False
+
+
+def test_google_sign_in_returns_to_where_it_started(env, monkeypatch):
+    monkeypatch.setattr(goauth, "google_configured", lambda: True)
+    monkeypatch.setattr("app.routers.google_connect._ensure_google_config", lambda: None)
+    import urllib.parse as up
+
+    url = env["client"].get("/api/v1/oauth/google/start", params={"services": "gsc,ga4", "next": "/app/start", "add": "1"}).json()["authUrl"]
+    state = up.parse_qs(up.urlparse(url).query)["state"][0]
+    assert goauth.parse_oauth_state(state)["next"] == "/app/start"
+    url = env["client"].get("/api/v1/oauth/google/start", params={"services": "gsc,ga4", "next": "https://evil.example/", "add": "1"}).json()["authUrl"]
+    state = up.parse_qs(up.urlparse(url).query)["state"][0]
+    assert goauth.parse_oauth_state(state)["next"] == ""

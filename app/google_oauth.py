@@ -33,10 +33,11 @@ def google_configured() -> bool:
     return bool(config.GOOGLE_OAUTH_CLIENT_ID and config.GOOGLE_OAUTH_CLIENT_SECRET)
 
 
-def make_oauth_state(user_id: int, services: str = "gsc,ga4") -> str:
+def make_oauth_state(user_id: int, services: str = "gsc,ga4", next_path: str = "") -> str:
     payload = {
         "uid": user_id,
         "services": services,
+        "next": next_path,
         "exp": int((datetime.now(timezone.utc) + timedelta(minutes=15)).timestamp()),
     }
     return jwt.encode(payload, config.JWT_SECRET, algorithm="HS256")
