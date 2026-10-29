@@ -61,6 +61,8 @@ def env(monkeypatch):
     monkeypatch.setattr(goauth, "list_gsc_sites", lambda token: SITES)
     monkeypatch.setattr(goauth, "list_ga4_properties", lambda token: [{"propertyId": "1", "displayName": "Acme", "accountName": "A"}])
     monkeypatch.setattr(goauth, "list_ga4_streams", lambda token, pid: ["https://acme.com"] if pid == "1" else [])
+    # Never call Google from tests: the access probe succeeds for properties in SITES.
+    monkeypatch.setattr(goauth, "probe_gsc_access", lambda token, site_url, email="": {"ok": True, "siteUrl": site_url})
     yield {"client": TestClient(app), "user": user}
     app.dependency_overrides.pop(get_current_user, None)
     drop_user(user.id)
@@ -123,3 +125,87 @@ def test_no_connection_uses_the_same_status_shape():
     assert payload["connected"] is False
     assert payload["account"] == {"status": "disconnected", "email": ""}
     assert payload["gsc"]["status"] == "not_selected" and payload["ga4"]["status"] == "not_selected"
+
+
+def test_select_overwrites_stale_property_on_the_website(env):
+    """Regression: website meta kept sc-domain:… and sync used it instead of the saved https:// choice."""
+    from app.models import CmsConnection
+    from app.routers.google_connect import _apply_site_google
+
+    with SessionLocal() as db:
+        cms = CmsConnection(customer_id=env["user"].id, provider="wordpress", site_url="https://acme.com",
+                            status="connected", credentials={}, meta={"gscSiteUrl": "sc-domain:acme.com"})
+        db.add(cms)
+        db.commit()
+        cms_id = cms.id
+    # Saved from the Connect screen: no website id is sent.
+    r = env["client"].post("/api/v1/oauth/google/select", json={"gsc_site_url": "https://www.acme.com/"})
+    assert r.status_code == 200, r.text
+    with SessionLocal() as db:
+        assert db.get(CmsConnection, cms_id).meta["gscSiteUrl"] == "https://www.acme.com/"
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == env["user"].id).first()
+        _apply_site_google(db, env["user"].id, row, None)
+        assert row.gsc_site_url == "https://www.acme.com/"
+
+
+def test_select_denied_returns_problem_with_help(env):
+    r = env["client"].post("/api/v1/oauth/google/select", json={"gsc_site_url": "sc-domain:not-mine.com"})
+    body = r.json()
+    assert r.status_code == 422
+    assert body["detail"]["code"] == "gsc_no_access"  # old shape kept
+    problem = body["problem"]
+    assert problem["code"] == "gsc_property_no_access" and problem["area"] == "search_console"
+    assert problem["steps"] and problem["action"]["href"].startswith("https://search.google.com/search-console/users")
+
+
+def test_sync_403_suggests_the_property_the_account_can_read(env):
+    from app.routers.google_connect import _google_problem
+
+    with SessionLocal() as db:
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == env["user"].id).first()
+        row.gsc_site_url = "sc-domain:acme.com"
+        sites = [
+            {"siteUrl": "sc-domain:acme.com", "permissionLevel": "siteUnverifiedUser"},
+            {"siteUrl": "https://acme.com/", "permissionLevel": "siteOwner"},
+        ]
+        goauth_list = goauth.list_gsc_sites
+        goauth.list_gsc_sites = lambda token: sites
+        try:
+            exc = goauth.GoogleApiError("denied", service="gsc", status=403, resource="sc-domain:acme.com", raw="403 PERMISSION_DENIED")
+            problem = _google_problem(exc, row, "token")
+        finally:
+            goauth.list_gsc_sites = goauth_list
+    assert problem["code"] == "gsc_property_no_access"
+    assert problem["action"] == {"label": "Use https://acme.com/", "do": "open_property_picker", "value": "https://acme.com/"}
+    assert "Owner" in problem["message"] and problem["alternatives"][0]["siteUrl"] == "https://acme.com/"
+    assert "403 PERMISSION_DENIED" in problem["technical"]
+
+
+def test_ga4_403_is_an_analytics_problem(env):
+    from app.routers.google_connect import _google_problem
+
+    with SessionLocal() as db:
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == env["user"].id).first()
+        exc = goauth.GoogleApiError("GA4 report failed", service="ga4", status=403, resource="123")
+        problem = _google_problem(exc, row, "")
+    assert problem["code"] == "ga4_no_access" and problem["area"] == "analytics"
+    assert "owner@acme.com" in " ".join(problem["steps"])
+
+
+def test_sync_denied_returns_problem_and_status_keeps_it(env, monkeypatch):
+    with SessionLocal() as db:
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == env["user"].id).first()
+        row.gsc_site_url = "https://acme.com/"
+        db.commit()
+
+    def denied(token, site_url, **kwargs):
+        raise goauth.GoogleApiError("no", service="gsc", status=403, resource=site_url, raw="User does not have sufficient permission")
+
+    monkeypatch.setattr(goauth, "fetch_gsc_top_queries", denied)
+    r = env["client"].post("/api/v1/oauth/google/sync", json={})
+    body = r.json()
+    assert r.status_code == 502 and isinstance(body["detail"], str)
+    assert body["problem"]["code"] == "gsc_property_no_access"
+    assert body["problem"]["action"]["value"] == "sc-domain:acme.com"  # Owner beats Full
+    conn = env["client"].get("/api/v1/oauth/google/status").json()["connection"]
+    assert conn["problem"]["code"] == "gsc_property_no_access" and conn["lastError"]

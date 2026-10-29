@@ -39,9 +39,11 @@ PROVIDER_ERRORS = {
 
 
 class ResearchError(Exception):
-    def __init__(self, message: str, *, code: str = "research_error"):
+    def __init__(self, message: str, *, code: str = "research_error", technical: str = ""):
         super().__init__(message)
         self.code = code
+        # Raw provider text (status code + message) for the "details" section of the help panel.
+        self.technical = technical
 
 
 def configured() -> bool:
@@ -49,15 +51,13 @@ def configured() -> bool:
 
 
 def _provider_error(code: int, fallback: str) -> ResearchError:
+    from app.problems import research_code_for_provider
+
     message = PROVIDER_ERRORS.get(code) or fallback
-    if code in (40200, 40210):
+    problem_code = research_code_for_provider(code)
+    if problem_code == "provider_balance":
         _STATUS.clear()
-        return ResearchError(message, code="provider_balance")
-    if code in (40100, 40104):
-        return ResearchError(message, code="provider_auth")
-    if code == 40204:
-        return ResearchError(message, code="provider_api_disabled")
-    return ResearchError(message, code="provider_error")
+    return ResearchError(message, code=problem_code, technical=f"provider status {code}: {fallback}"[:300])
 
 
 def host_of(value: str) -> str:
@@ -152,7 +152,12 @@ def _task(method: str, path: str, payload: list | None = None, timeout: float = 
             )
         data = response.json()
     except (httpx.HTTPError, ValueError) as exc:
-        raise ResearchError(f"Searchify SEO could not be reached. {str(exc)[:120]}", code="provider_unreachable") from exc
+        timed_out = isinstance(exc, httpx.TimeoutException)
+        raise ResearchError(
+            "Searchify SEO did not answer in time." if timed_out else "Searchify SEO could not be reached.",
+            code="provider_timeout" if timed_out else "provider_unreachable",
+            technical=f"{type(exc).__name__}: {str(exc)[:200]}",
+        ) from exc
     code = int(data.get("status_code") or 0)
     if code != 20000:
         raise _provider_error(code, f"Searchify SEO: {data.get('status_message') or 'request failed'}")

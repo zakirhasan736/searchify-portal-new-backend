@@ -11,7 +11,7 @@ from sqlalchemy import text as sql_text
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import approval, cms_connectors, markets, quotas, site_profiles
+from app import approval, cms_connectors, markets, problems, quotas, site_profiles
 from app.database import get_db
 from app.models import CmsConnection, Draft, FeatureRecord, GoogleConnection, Job, SiteChange, User
 from app.routers.google_connect import _connection_payload, connection_for_site
@@ -1662,11 +1662,14 @@ def _home_for(db: Session, user: User, site: str = "") -> str:
 def run_site_scan(body: SiteScanBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     home = _home_for(db, user, body.site)
     if not home:
-        raise HTTPException(status_code=400, detail="Add the website address in setup or connect WordPress first.")
+        message = "Add the website address in setup or connect WordPress first."
+        raise problems.ProblemError(400, problems.make("site_required", "site_scan", message=message), message)
     scan, ran = _ensure_scan(db, user, home, _stored_brief(db, user, home, body.brief), force=body.force)
     if not scan.get("pages"):
-        raise HTTPException(status_code=422, detail=scan.get("error") or "No readable pages were found on this website.")
-    return {"ok": True, "ran": ran, "scan": _scan_summary(scan, _open_urls(db, user.id))}
+        message = scan.get("error") or "No readable pages were found on this website."
+        raise problems.ProblemError(422, problems.scan_error_problem(message, scan.get("failed")), message)
+    summary = _scan_summary(scan, _open_urls(db, user.id))
+    return {"ok": True, "ran": ran, "scan": summary, "warnings": problems.scan_warnings(summary)}
 
 
 @router.get("/site-scan")
@@ -1677,7 +1680,8 @@ def get_site_scan(site: str = "", db: Session = Depends(get_db), user: User = De
     scan = _latest_scan(db, user.id, site_scan.host_of(home)) if home else {}
     if not scan:
         return {"ok": True, "scan": None}
-    return {"ok": True, "scan": _scan_summary(scan, _open_urls(db, user.id))}
+    summary = _scan_summary(scan, _open_urls(db, user.id))
+    return {"ok": True, "scan": summary, "warnings": problems.scan_warnings(summary)}
 
 
 def _site_context(scan: dict, url: str) -> tuple[dict | None, dict, list[dict]]:
@@ -2857,19 +2861,25 @@ def undo_change(change_id: int, db: Session = Depends(get_db), user: User = Depe
 @router.get("/ai-visibility")
 def get_ai_visibility(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     payload = ai_visibility.latest_report(db, user.id)
-    return {"ok": True, "report": payload or None, "engines": ai_visibility.ENGINES}
+    return {"ok": True, "report": payload or None, "engines": ai_visibility.ENGINES, "warnings": problems.ai_report_warnings(payload)}
 
 
 @router.post("/ai-visibility")
 def run_ai_visibility(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     profile = _profile_for(db, user.id)
     if not (profile.get("business") or "").strip() or not (profile.get("services") or "").strip():
-        raise HTTPException(
-            status_code=400,
-            detail="Add your business name and services first (Profile), then run the AI visibility report.",
-        )
-    report = ai_visibility.run_visibility_report(db, user, profile)
-    return {"ok": True, "report": report, "engines": ai_visibility.ENGINES}
+        message = "Add your business name and services first (Profile), then run the AI visibility report."
+        raise problems.ProblemError(400, problems.make("profile_required", "ai_visibility", message=message), message)
+    try:
+        report = ai_visibility.run_visibility_report(db, user, profile)
+    except Exception as exc:  # noqa: BLE001 - show a helpful message instead of a bare 500
+        message = "The AI visibility report could not finish."
+        raise problems.ProblemError(
+            502,
+            problems.make("research_error", "ai_visibility", message=message, technical=f"{type(exc).__name__}: {str(exc)[:300]}"),
+            message,
+        ) from exc
+    return {"ok": True, "report": report, "engines": ai_visibility.ENGINES, "warnings": problems.ai_report_warnings(report)}
 
 
 @router.post("/ai-visibility/queue")
@@ -2887,7 +2897,8 @@ def queue_ai_visibility(body: VisibilityQueueBody, db: Session = Depends(get_db)
         )
         target = (cms.site_url if cms else "") or ""
     if not target:
-        raise HTTPException(status_code=400, detail="Connect WordPress or pick a page URL before sending this fix to the work queue.")
+        message = "Connect WordPress or pick a page URL before sending this fix to the work queue."
+        raise problems.ProblemError(400, problems.make("wordpress_required", "ai_visibility", message=message), message)
     title = (body.title or solution.get("titleDraft") or "").strip()[:70]
     desc = (body.description or solution.get("descriptionDraft") or "").strip()[:170]
     opportunity = (

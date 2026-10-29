@@ -9,6 +9,7 @@ from app.auto_sync import auto_sync_loop
 from app.config import CORS_ORIGINS, PUBLIC_SITE_URL
 from app.database import Base, SessionLocal, engine, ensure_indexes
 from app.routers import account, auth, billing, catalog, crawl, features, google_connect, hq, operator, partners, product, projects, public_scan, push, research, social_auth, workflow
+from app.problems import ProblemError, problem_exception_handler
 from app.seed import seed
 
 
@@ -35,6 +36,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Searchify API", version="1.0.0", lifespan=lifespan)
+app.add_exception_handler(ProblemError, problem_exception_handler)
 app.add_middleware(GZipMiddleware, minimum_size=800)
 app.add_middleware(
     CORSMiddleware,
