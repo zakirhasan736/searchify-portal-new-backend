@@ -8,7 +8,8 @@ from datetime import datetime, timedelta
 
 from app import config
 from app.database import SessionLocal
-from app.models import FeatureRecord, GoogleConnection, OpsNotice
+from app.models import FeatureRecord, GoogleConnection
+from app.ops_notices import open_notice
 
 log = logging.getLogger("searchify.auto_sync")
 
@@ -70,14 +71,8 @@ def run_due_syncs() -> dict:
                 fail += 1
                 row.last_error = str(exc)[:500]
                 row.status = "error"
-                db.add(
-                    OpsNotice(
-                        customer_id=row.customer_id,
-                        kind="sync",
-                        title="Scheduled Google sync failed",
-                        detail=str(exc)[:500],
-                    )
-                )
+                # One open notice per failure, not a new one every run.
+                open_notice(db, row.customer_id, "sync", "Scheduled Google sync failed", str(exc)[:500])
                 db.commit()
                 log.warning("auto-sync fail user=%s err=%s", row.customer_id, exc)
     finally:

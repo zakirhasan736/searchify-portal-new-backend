@@ -1038,12 +1038,40 @@ def _apply_site_google(db: Session, user_id: int, row: GoogleConnection, cms_con
     cms = db.get(CmsConnection, cms_connection_id)
     if cms is None or cms.customer_id != user_id:
         raise HTTPException(status_code=404, detail="Website not found")
-    meta = cms.meta or {}
-    if meta.get("gscSiteUrl"):
-        row.gsc_site_url = str(meta["gscSiteUrl"])
-    if meta.get("ga4PropertyId"):
-        row.ga4_property_id = str(meta["ga4PropertyId"])
-        row.ga4_property_name = str(meta.get("ga4PropertyName") or row.ga4_property_name or "")
+    meta = dict(cms.meta or {})
+    validated = (row.meta or {}).get("validated") or {}
+    site_host = host_key(cms.site_url or "")
+
+    def keep_current(key: str, current: str, stored: str) -> bool:
+        # The website remembers the property chosen when it was connected. If the user later picked
+        # and verified a different property for the same site (e.g. the URL-prefix property instead of
+        # an unreadable Domain property), that verified choice wins; using the old one made every
+        # scheduled sync fail with "cannot read Search Console data".
+        if not current or current == stored:
+            return False
+        same_site = key == "ga4" or host_key(current) == site_host
+        return same_site and (validated.get(key) or {}).get("value") == current and (validated.get(key) or {}).get("value") != stored
+
+    repaired = False
+    stored_gsc = str(meta.get("gscSiteUrl") or "")
+    if stored_gsc:
+        if keep_current("gsc", row.gsc_site_url or "", stored_gsc):
+            meta["gscSiteUrl"] = row.gsc_site_url
+            repaired = True
+        else:
+            row.gsc_site_url = stored_gsc
+    stored_ga4 = str(meta.get("ga4PropertyId") or "")
+    if stored_ga4:
+        if keep_current("ga4", row.ga4_property_id or "", stored_ga4):
+            meta["ga4PropertyId"] = row.ga4_property_id
+            meta["ga4PropertyName"] = row.ga4_property_name or ""
+            repaired = True
+        else:
+            row.ga4_property_id = stored_ga4
+            row.ga4_property_name = str(meta.get("ga4PropertyName") or row.ga4_property_name or "")
+    if repaired:
+        cms.meta = meta
+        flag_modified(cms, "meta")
     db.info["cms_connection_id"] = cms.id
     return cms.id
 
@@ -1868,6 +1896,10 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         row.last_sync_at = datetime.utcnow()
         row.last_error = ""
         row.status = "connected"
+        # The problem is gone: close the "sync failed" notices instead of leaving them on the command centre.
+        from app.ops_notices import resolve as _resolve_notices
+
+        _resolve_notices(db, user.id, ("sync", "retry"))
 
         overview_rows = [
             [site_label, "Search Console", "Connected" if synced["gsc"] else "Not synced", row.gsc_site_url or "—"],
