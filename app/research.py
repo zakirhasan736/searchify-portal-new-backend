@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import re
 from datetime import datetime, timedelta
 
@@ -923,6 +924,18 @@ PAGE_CHECKS = {
     "duplicate_meta_tags": ("Pages repeat the same meta tags", "Warning", "Keep one title and one description. Searchify can draft the single listing.", True),
     "duplicate_title_tag": ("Pages have more than one title tag", "Warning", "Keep one title tag. Searchify can draft the title to keep.", True),
     "no_favicon": ("The site has no favicon", "Notice", "Add a small site icon in the WordPress customizer.", False),
+    "no_doctype": ("Pages have no <!DOCTYPE html>", "Notice", "Add <!DOCTYPE html> as the first line of the theme template so browsers render in standards mode.", False),
+    "no_encoding_meta_tag": ("Pages don't declare a character encoding", "Notice", "Add <meta charset=\"utf-8\"> in the <head> so text and symbols display correctly.", False),
+    "meta_charset_consistency": ("Character encoding in the page and the server header disagree", "Notice", "Make the server Content-Type charset and the <meta charset> both UTF-8.", False),
+    "has_meta_refresh_redirect": ("Pages use a meta refresh redirect", "Warning", "Replace the meta refresh with a 301 redirect on the server.", False),
+    "frame": ("Pages use frames", "Warning", "Replace frames with normal page content. Google may not index content inside frames.", False),
+    "flash": ("Pages use Flash", "Warning", "Remove Flash content. No browser or search engine supports it any more.", False),
+    "is_link_relation_conflict": ("Links mix follow and nofollow to the same page", "Notice", "Use the same rel attribute on every internal link to a page.", False),
+    "has_links_to_redirects": ("Pages link to URLs that redirect", "Notice", "Update the links to point straight at the final URL.", False),
+    "canonical_chain": ("Canonical tags chain through several pages", "Warning", "Point each canonical straight to the final main URL.", False),
+    "high_waiting_time": ("The server is slow to answer (high waiting time)", "Warning", "Turn on page caching and ask the host to check server response time (TTFB).", False),
+    "size_greater_than_3mb": ("Pages are larger than 3 MB", "Warning", "Compress images and remove unused scripts so the page is well under 3 MB.", False),
+    "no_content_encoding": ("Pages are sent without compression", "Notice", "Turn on gzip or Brotli compression at the host or CDN.", False),
 }
 SEVERITY_ORDER = {"Critical": 0, "Warning": 1, "Notice": 2}
 
@@ -1271,9 +1284,25 @@ def _fetch_checked_pages(task_id: str, key: str, limit: int = 25) -> list[dict]:
     return list(((result or [{}])[0] or {}).get("items") or [])
 
 
+AUDIT_REPORT_VERSION = 2
+
+
+def _optional_items(path: str, body: dict, timeout: float = 60) -> list[dict]:
+    """Extra On-Page endpoints. A failure here must never drop the whole report."""
+    try:
+        result, _ = _call("POST", path, [body], timeout=timeout)
+    except ResearchError as exc:
+        log.warning("audit_optional_failed", extra={"path": path, "error": str(exc)[:160]})
+        return []
+    return list(((result or [{}])[0] or {}).get("items") or [])
+
+
 def _audit_report(task_id: str, summary: dict) -> dict:
+    from app import audit_checks
+
     pages_res, _ = _call("POST", "/on_page/pages", [{"id": task_id, "limit": 1000}], timeout=90)
-    items = [i for i in (((pages_res or [{}])[0] or {}).get("items") or []) if i.get("resource_type") == "html"]
+    all_items = list(((pages_res or [{}])[0] or {}).get("items") or [])
+    items = [i for i in all_items if i.get("resource_type") == "html"]
     broken_res, _ = _call("POST", "/on_page/links", [{"id": task_id, "filters": ["is_broken", "=", True], "limit": 100}], timeout=60)
     broken = [
         {"from": link.get("link_from") or "", "to": link.get("link_to") or "", "status": link.get("page_to_status_code")}
@@ -1282,9 +1311,38 @@ def _audit_report(task_id: str, summary: dict) -> dict:
 
     metrics = summary.get("page_metrics") or {}
     metric_checks = metrics.get("checks") if isinstance(metrics.get("checks"), dict) else {}
+    domain_name = str((summary.get("domain_info") or {}).get("name") or "")
+    site_host = domain_name.lower().removeprefix("www.")
+
+    # Exact status codes (404 / 410 / 403 / 500 / 502 / 503 …). 4xx/5xx pages come back as
+    # resource_type "broken", so they are read from all_items, not the html-only list.
+    if metric_checks.get("is_4xx_code") or metric_checks.get("is_5xx_code") or any(
+        isinstance(i.get("status_code"), int) and i["status_code"] >= 400 for i in all_items
+    ):
+        known = {i.get("url") for i in all_items}
+        extra = _optional_items("/on_page/pages", {"id": task_id, "limit": 500, "filters": [["status_code", ">", 399]]})
+        all_items.extend(i for i in extra if i.get("url") not in known)
+    extra_issues = audit_checks.status_code_issues(all_items, broken)
+    # Reading finished-task results is not charged, so these always run.
+    extra_issues += audit_checks.redirect_chain_issues(_optional_items("/on_page/redirect_chains", {"id": task_id, "limit": 100}))
+    extra_issues += audit_checks.non_indexable_issues(_optional_items("/on_page/non_indexable", {"id": task_id, "limit": 200}))
+    extra_issues += audit_checks.canonical_issues(items, site_host)
+    brand = {part for part in re.split(r"[.\-]", site_host) if part}
+    extra_issues += audit_checks.spelling_issues(items, brand)
+    extra_issues += audit_checks.heading_duplicate_issues(items)
+    resources = []
+    if any(i.get("broken_resources") is True for i in items) or metrics.get("broken_resources"):
+        resources = _optional_items("/on_page/resources", {"id": task_id, "limit": 200, "filters": [["status_code", ">", 399]]})
+    extra_issues += audit_checks.broken_resource_issues(items, resources)
+    replaced = set()
+    if any(i["key"].startswith("status_") for i in extra_issues):
+        replaced |= {"is_4xx_code", "is_5xx_code"}
+    if any(i["key"].startswith("redirect_") for i in extra_issues):
+        replaced.add("redirect_chain")
+
     issues = []
     for key, (name, severity, fix, meta) in PAGE_CHECKS.items():
-        if key in {"low_content_rate", "low_character_count"}:
+        if key in {"low_content_rate", "low_character_count"} or key in replaced:
             continue
         hit = _pages_with_check(items, key)
         counted = metric_checks.get(key)
@@ -1315,6 +1373,7 @@ def _audit_report(task_id: str, summary: dict) -> dict:
             "urlsMissing": bool(count_hint and not pages),
             "countSource": "pages" if pages else "summary_metric",
         })
+    issues.extend(extra_issues)
     issues.extend(_listing_gaps(items))
     issues.extend(_content_findings(items))
     from app.page_weight import weight_issues
@@ -1351,7 +1410,15 @@ def _audit_report(task_id: str, summary: dict) -> dict:
     raw_score = metrics.get("onpage_score")
     score = round(float(raw_score), 1) if raw_score is not None else None
     critical_count = sum(1 for row in issues if row["severity"] == "Critical")
+    status_counts: dict[str, int] = {}
+    for item in all_items:
+        code = item.get("status_code")
+        if isinstance(code, int):
+            bucket = f"{code // 100}xx" if code not in (404, 410, 500, 502, 503) else str(code)
+            status_counts[bucket] = status_counts.get(bucket, 0) + 1
     return {
+        "reportVersion": AUDIT_REPORT_VERSION,
+        "statusCounts": status_counts,
         "score": score,
         "seoScore": score,
         "criticalCount": critical_count,
@@ -1415,11 +1482,19 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
 
     if saved.get("state") == "ready" and not force and age(saved.get("fetchedAt")) < WINDOWS["audit"]:
         report = saved.get("report") or {}
-        # Rebuild once for older crawls that stored a score but dropped critical findings.
-        if saved.get("taskId") and report.get("criticalCount") is None:
-            summary = _summary(saved["taskId"])
+        # Rebuild once for older crawls (dropped critical findings, or built before the
+        # status-code / redirect / canonical / spelling checks). Reading results is free.
+        outdated = report.get("criticalCount") is None or int(report.get("reportVersion") or 1) < AUDIT_REPORT_VERSION
+        if saved.get("taskId") and outdated:
+            try:
+                summary = _summary(saved["taskId"])
+            except ResearchError:
+                summary = None  # task results expired: keep the stored report
             if summary and summary.get("crawl_progress") == "finished":
-                rebuilt = _audit_report(saved["taskId"], summary)
+                try:
+                    rebuilt = _audit_report(saved["taskId"], summary)
+                except ResearchError:
+                    return {**saved, "cached": True}
                 payload = {**saved, "state": "ready", "report": rebuilt, "fetchedAt": now.isoformat(timespec="seconds")}
                 _save(db, user.id, "dfs-audit", title, payload)
                 return {**payload, "cached": False}
@@ -1442,7 +1517,8 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
             "load_resources": True,
             "enable_javascript": False,
             "store_raw_html": False,
-            "check_spell": False,
+            # Spelling for the "Typos" report (meta.spell.misspelled). Set AUDIT_CHECK_SPELL=0 to turn off.
+            "check_spell": os.getenv("AUDIT_CHECK_SPELL", "1") != "0",
         }],
         ok=(20000, 20100),
     )
