@@ -36,6 +36,12 @@ class SyncBody(BaseModel):
     site: str | None = None
 
 
+class InspectBody(BaseModel):
+    cms_connection_id: int | None = None
+    urls: list[str] = []
+    limit: int = 20
+
+
 class ActivateSiteBody(BaseModel):
     site: str = ""
 
@@ -2170,3 +2176,118 @@ def google_disconnect(db: Session = Depends(get_db), user: User = Depends(get_cu
         "featuresCleared": removed,
         "queueCleared": queue_cleared,
     }
+
+
+def _in_property(url: str, prop: str) -> bool:
+    if prop.lower().startswith("sc-domain:"):
+        domain = prop.split(":", 1)[1].strip("/").lower()
+        host = host_key(url)
+        return host == domain.removeprefix("www.") or host.endswith(f".{domain}")
+    return url.startswith(prop) or url.startswith(prop.rstrip("/"))
+
+
+def _inspect_candidates(db: Session, user_id: int, prop: str, limit: int) -> list[str]:
+    """Home page + the pages with the most Search Console impressions + crawl pages with errors."""
+    host = host_key(prop)
+    home = f"https://{prop.split(':', 1)[1].strip('/')}/" if prop.lower().startswith("sc-domain:") else prop
+    urls: list[str] = [home]
+
+    def latest(kind: str):
+        for rec in (
+            db.query(FeatureRecord)
+            .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == kind)
+            .order_by(FeatureRecord.id.desc())
+            .limit(24)
+            .all()
+        ):
+            if payload_host(rec.payload) == host or host_key(str((rec.payload or {}).get("host") or "")) == host:
+                return rec.payload or {}
+        return {}
+
+    def impressions(row: list) -> float:
+        try:
+            return float(str(row[2]).replace(",", ""))
+        except (IndexError, TypeError, ValueError):
+            return 0.0
+
+    rows = latest("top-pages").get("rows") or []
+    ranked = sorted((r for r in rows if isinstance(r, list) and r and isinstance(r[0], str)), key=impressions, reverse=True)
+    urls += [r[0] for r in ranked]
+    audit = latest("dfs-audit")
+    for found in ((audit.get("report") or {}).get("issues") or []):
+        if found.get("severity") == "Critical" or str(found.get("key", "")).startswith(("status_", "non_indexable")):
+            urls += [p.get("url") for p in found.get("pages") or [] if p.get("url")]
+    out: list[str] = []
+    for url in urls:
+        if url and url not in out and _in_property(url, prop):
+            out.append(url)
+        if len(out) >= limit:
+            break
+    return out
+
+
+@router.post("/oauth/google/inspect")
+def google_inspect(body: InspectBody = InspectBody(), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Google's own view of important URLs: indexed or not and why, canonical Google chose,
+    fetch errors (404/5xx/redirect/soft 404) and rich-result (schema) errors."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app import audit_checks
+
+    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    if row is None or not (row.access_token or row.refresh_token):
+        message = "Connect Google first."
+        raise problems.ProblemError(404, problems.make("google_not_connected", "search_console", message=message), message)
+    _apply_site_google(db, user.id, row, body.cms_connection_id)
+    prop = row.gsc_site_url or ""
+    if not prop:
+        message = "Choose the Search Console property for this website first."
+        raise problems.ProblemError(422, problems.make("gsc_not_selected", "search_console", message=message), message)
+    db.info["site_host"] = host_key(prop)
+    token = _valid_access_token(db, row)
+    limit = max(1, min(int(body.limit or 20), 40))
+    urls = [u for u in (body.urls or []) if isinstance(u, str) and u.startswith("http")][:limit] or _inspect_candidates(db, user.id, prop, limit)
+    if not urls:
+        message = "No URLs to inspect for this property yet. Sync Search Console first."
+        raise problems.ProblemError(422, problems.make("gsc_no_data", "search_console", message=message), message)
+
+    def one(url: str) -> dict:
+        try:
+            return {"url": url, "result": goauth.inspect_url(token, prop, url)}
+        except goauth.GoogleApiError as exc:
+            return {"url": url, "error": str(exc)[:300], "status": exc.status, "exc": exc}
+        except Exception as exc:  # noqa: BLE001
+            return {"url": url, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        results = list(pool.map(one, urls))
+    denied = [r for r in results if r.get("status") == 403]
+    if denied and len(denied) == len(results):
+        raise problems.ProblemError(502, _google_problem(denied[0]["exc"], row, token), str(denied[0]["error"])[:500])
+    for r in results:
+        r.pop("exc", None)
+
+    issues = audit_checks.inspection_issues(results)
+    table = []
+    indexed = 0
+    for r in results:
+        idx = (((r.get("result") or {}).get("inspectionResult") or {}).get("indexStatusResult") or {})
+        if idx.get("verdict") == "PASS":
+            indexed += 1
+        table.append([r["url"], idx.get("coverageState") or (r.get("error") or "—"), idx.get("verdict") or "—",
+                      str(idx.get("lastCrawlTime") or "")[:10] or "—", idx.get("googleCanonical") or "—"])
+    payload = {
+        "siteUrl": prop,
+        "host": host_key(prop),
+        "inspected": len(results),
+        "indexed": indexed,
+        "issues": issues,
+        "columns": ["URL", "Google coverage", "Verdict", "Last crawl", "Google canonical"],
+        "rows": table,
+        "checkedAt": datetime.utcnow().isoformat(timespec="seconds"),
+        "source": "google_gsc_url_inspection",
+        "seedVersion": LIVE,
+        "summary": f"Search Console URL Inspection: {indexed} of {len(results)} URLs indexed.",
+    }
+    _upsert_feature(db, user.id, "gsc-index-inspection", "Search Console URL inspection", payload)
+    return {"ok": True, **payload}

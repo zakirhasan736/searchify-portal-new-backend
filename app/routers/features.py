@@ -23,6 +23,7 @@ KINDS = {item[0] for item in list(SCREENS) + list(EXTRA)} | {
     "gsc-countries",
     "gsc-devices",
     "ga4-landing-pages",
+    "gsc-index-inspection",
     "ai-visibility",
     "local-listings",
     "local-seo",

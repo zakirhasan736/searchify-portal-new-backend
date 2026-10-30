@@ -245,6 +245,12 @@ def read_page(client: httpx.Client, url: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
     text = " ".join(reader.text)
+    try:
+        from app.audit_checks import analyze_html
+
+        audit = analyze_html(response.text[:600_000], final, text)
+    except Exception:  # noqa: BLE001 - audit facts are extra; never fail the page read
+        audit = None
     title = " ".join(reader.title)[:200]
     description = (reader.description or reader.og_description).strip()[:400]
     schema = summarize_json_ld(reader.json_ld)
@@ -275,6 +281,8 @@ def read_page(client: httpx.Client, url: str) -> dict:
             f"{title}\n{description}\n{reader.og_title}\n{schema.get('schemaName')}\n{text}".encode()
         ).hexdigest()[:32],
         "links": reader.links[:400],
+        # Heading outline, schema validation, accordion and image facts for the site audit.
+        "audit": audit,
         "error": "",
         **schema,
         "faqs": faqs,
@@ -589,6 +597,12 @@ def scan_site(
 ) -> dict:
     crawled = crawl(home, limit=limit)
     pages = crawled.get("pages") or []
+    try:
+        from app.audit_checks import run_site_checks
+
+        site_checks = run_site_checks(crawled.get("home") or home, [p["url"] for p in pages[:15]])
+    except Exception:  # noqa: BLE001
+        site_checks = {}
     understanding = understand(pages, brief, profile)
     page_map = {normalize(item.get("url") or ""): item for item in understanding.get("pages") or [] if isinstance(item, dict)}
     targets = [
@@ -617,6 +631,8 @@ def scan_site(
         "competitors": competitors,
         "brief": brief,
         "failed": crawled.get("failed") or [],
+        # robots.txt, sitemap and http/https/www redirect checks for the site audit.
+        "siteChecks": site_checks,
         "error": crawled.get("error") or "",
     }
 
