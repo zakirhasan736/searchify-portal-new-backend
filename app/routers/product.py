@@ -184,6 +184,9 @@ def _ensure_owner_seat(db: Session, user: User) -> None:
 
 
 def _refresh_notices(db: Session, user: User) -> None:
+    from app.ops_notices import tidy
+
+    tidy(db, user.id)
     google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     if google and (google.last_error or google.status == "error"):
         open_sync = (
