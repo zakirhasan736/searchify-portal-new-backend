@@ -2959,10 +2959,80 @@ def undo_change(change_id: int, db: Session = Depends(get_db), user: User = Depe
     return {"ok": True, "change": _change_row(row), "execution": result}
 
 
+AI_CHECKS_MAX_AGE_HOURS = 12
+
+
+def _ai_context(db: Session, user: User, report: dict | None, *, refresh: bool = False) -> dict:
+    """Reasons behind the AI visibility result: model errors, AI crawler access, llms.txt,
+    indexing (scan noindex + Search Console URL Inspection) and entity/content signals."""
+    from app import ai_readiness, site_scan
+    from app.provenance import is_live_payload
+
+    home = _home_for(db, user, "")
+    host = site_scan.host_of(home) if home else ""
+    scan = _latest_scan(db, user.id, host) if host else {}
+    title = f"AI readiness {host}"
+    row = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "ai-readiness", FeatureRecord.title == title)
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    ) if host else None
+    checks = dict((row.payload if row else {}) or {}) or dict(scan.get("aiChecks") or {})
+    stale = True
+    try:
+        stale = (datetime.utcnow() - datetime.fromisoformat(checks.get("checkedAt") or "")).total_seconds() > AI_CHECKS_MAX_AGE_HOURS * 3600
+    except ValueError:
+        pass
+    if home and (refresh or not checks or stale):
+        try:
+            checks = ai_readiness.run_ai_checks(home, [p.get("url") or "" for p in (scan.get("pages") or [])[:12]])
+            if not checks.get("error"):
+                _upsert_feature(db, user.id, "ai-readiness", title, checks)
+        except Exception:  # noqa: BLE001 - reasons are best-effort
+            log.exception("ai_readiness_failed")
+    inspection_row = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "gsc-index-inspection")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    inspection = dict((inspection_row.payload if inspection_row else {}) or {})
+    if inspection and (not is_live_payload(inspection) or (host and inspection.get("host") and str(inspection["host"]).lower().removeprefix("sc-domain:").removeprefix("www.") != host)):
+        inspection = {}
+    organic = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user.id, FeatureRecord.kind == "organic-search")
+        .order_by(FeatureRecord.id.desc())
+        .first()
+    )
+    gsc_synced = bool(organic and is_live_payload(organic.payload or {}) and (organic.payload or {}).get("rows"))
+    reasons = ai_readiness.visibility_reasons(
+        report=report, checks=checks, scan=scan, inspection=inspection, profile=_profile_for(db, user.id), gsc_synced=gsc_synced
+    )
+    return {
+        "reasons": reasons,
+        "crawlers": ai_readiness.crawler_table(checks),
+        "llmsTxt": checks.get("llms") or {},
+        "checkedAt": checks.get("checkedAt") or "",
+        "host": host,
+        "scanAt": scan.get("scannedAt") or "",
+        "inspectedAt": inspection.get("checkedAt") or "",
+    }
+
+
 @router.get("/ai-visibility")
 def get_ai_visibility(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     payload = ai_visibility.latest_report(db, user.id)
-    return {"ok": True, "report": payload or None, "engines": ai_visibility.ENGINES, "warnings": problems.ai_report_warnings(payload)}
+    return {"ok": True, "report": payload or None, "engines": ai_visibility.ENGINES, "warnings": problems.ai_report_warnings(payload),
+            "readiness": _ai_context(db, user, payload)}
+
+
+@router.post("/ai-visibility/readiness")
+def recheck_ai_readiness(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Re-run the AI crawler / llms.txt / indexing checks without re-running the model report."""
+    payload = ai_visibility.latest_report(db, user.id)
+    return {"ok": True, "readiness": _ai_context(db, user, payload, refresh=True)}
 
 
 @router.post("/ai-visibility")
@@ -2980,7 +3050,8 @@ def run_ai_visibility(db: Session = Depends(get_db), user: User = Depends(get_cu
             problems.make("research_error", "ai_visibility", message=message, technical=f"{type(exc).__name__}: {str(exc)[:300]}"),
             message,
         ) from exc
-    return {"ok": True, "report": report, "engines": ai_visibility.ENGINES, "warnings": problems.ai_report_warnings(report)}
+    return {"ok": True, "report": report, "engines": ai_visibility.ENGINES, "warnings": problems.ai_report_warnings(report),
+            "readiness": _ai_context(db, user, report, refresh=True)}
 
 
 @router.post("/ai-visibility/queue")

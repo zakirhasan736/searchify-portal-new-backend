@@ -603,6 +603,12 @@ def scan_site(
         site_checks = run_site_checks(crawled.get("home") or home, [p["url"] for p in pages[:15]])
     except Exception:  # noqa: BLE001
         site_checks = {}
+    try:
+        from app.ai_readiness import run_ai_checks
+
+        ai_checks = run_ai_checks(crawled.get("home") or home, [p["url"] for p in pages[:12]])
+    except Exception:  # noqa: BLE001
+        ai_checks = {}
     understanding = understand(pages, brief, profile)
     page_map = {normalize(item.get("url") or ""): item for item in understanding.get("pages") or [] if isinstance(item, dict)}
     targets = [
@@ -633,6 +639,8 @@ def scan_site(
         "failed": crawled.get("failed") or [],
         # robots.txt, sitemap and http/https/www redirect checks for the site audit.
         "siteChecks": site_checks,
+        # AI crawler access (robots.txt per bot, firewall probe), llms.txt, nosnippet (AI search topic).
+        "aiChecks": ai_checks,
         "error": crawled.get("error") or "",
     }
 
