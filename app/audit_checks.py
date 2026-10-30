@@ -984,6 +984,12 @@ def scan_issues(scan: dict | None) -> list[dict]:
         out.append(issue(f"scan_broken_{status}", f"Internal links lead to {status} {STATUS_TEXT.get(status, 'errors')}",
                          "Critical", "Links", fix, steps, rows, help_url=DOC["status"], source="scan"))
     out.extend(site_issues(scan.get("siteChecks") or {}))
+    try:
+        from app.ai_readiness import ai_audit_issues
+
+        out.extend(ai_audit_issues(scan.get("aiChecks") or {}, scan))
+    except Exception:  # noqa: BLE001 - AI findings are extra; never break the audit
+        pass
     out.sort(key=lambda row: (SEVERITY_ORDER.get(row["severity"], 3), -row["count"]))
     return out
 
