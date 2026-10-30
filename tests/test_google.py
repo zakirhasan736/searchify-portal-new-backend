@@ -209,3 +209,29 @@ def test_sync_denied_returns_problem_and_status_keeps_it(env, monkeypatch):
     assert body["problem"]["action"]["value"] == "sc-domain:acme.com"  # Owner beats Full
     conn = env["client"].get("/api/v1/oauth/google/status").json()["connection"]
     assert conn["problem"]["code"] == "gsc_property_no_access" and conn["lastError"]
+
+
+def test_inspect_endpoint_reports_google_issues_and_stores_feature(env, monkeypatch):
+    with SessionLocal() as db:
+        row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == env["user"].id).first()
+        row.gsc_site_url = "sc-domain:acme.com"
+        db.commit()
+
+    def fake_inspect(token, site_url, url, language="en-US"):
+        if url.endswith("/old"):
+            return {"inspectionResult": {"indexStatusResult": {"verdict": "FAIL", "coverageState": "Not found (404)", "pageFetchState": "NOT_FOUND"}}}
+        return {"inspectionResult": {"indexStatusResult": {"verdict": "PASS", "coverageState": "Submitted and indexed"}}}
+
+    monkeypatch.setattr(goauth, "inspect_url", fake_inspect)
+    r = env["client"].post("/api/v1/oauth/google/inspect", json={"urls": ["https://acme.com/", "https://acme.com/old"]})
+    body = r.json()
+    assert r.status_code == 200, body
+    assert body["inspected"] == 2 and body["indexed"] == 1
+    assert body["issues"][0]["severity"] == "Critical" and body["issues"][0]["area"] == "Search Console"
+    stored = env["client"].get("/api/v1/features/gsc-index-inspection").json()
+    assert stored  # feature saved for the audit page
+
+
+def test_inspect_requires_property(env):
+    r = env["client"].post("/api/v1/oauth/google/inspect", json={})
+    assert r.status_code == 422 and r.json()["problem"]["code"] == "gsc_not_selected"

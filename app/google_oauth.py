@@ -205,6 +205,27 @@ def probe_gsc_access(access_token: str, site_url: str, *, email: str = "") -> di
     return {"ok": True, "siteUrl": site_url}
 
 
+URL_INSPECT = "https://searchconsole.googleapis.com/v1/urlInspection/index:inspect"
+
+
+def inspect_url(access_token: str, site_url: str, url: str, language: str = "en-US") -> dict:
+    """Search Console URL Inspection for one URL (quota: 2,000/day, 600/min per property)."""
+    with httpx.Client(timeout=45.0) as client:
+        response = client.post(
+            URL_INSPECT,
+            headers={"Authorization": f"Bearer {access_token}"},
+            json={"inspectionUrl": url, "siteUrl": site_url, "languageCode": language},
+        )
+    if response.status_code >= 400:
+        raise GoogleApiError(
+            explain_gsc_http_error(response.status_code, response.text, site_url=site_url)
+            if response.status_code == 403
+            else f"URL Inspection failed ({response.status_code}): {response.text[:200]}",
+            service="gsc", status=response.status_code, resource=site_url, raw=response.text,
+        )
+    return response.json()
+
+
 def list_ga4_properties(access_token: str) -> list[dict]:
     with httpx.Client(timeout=30.0) as client:
         response = client.get(

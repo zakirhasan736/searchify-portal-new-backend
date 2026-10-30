@@ -1591,7 +1591,20 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
         "skipped": (scan.get("skipped") or [])[:40],
         "conflicts": site_profiles.conflicts(scan.get("brief") or {}, scan),
         "stale": bool(scan.get("stale")),
+        # Headings by section, schema validation, robots.txt, sitemap, redirects (audit page).
+        "auditIssues": _scan_audit_issues(scan),
+        "siteChecksAt": (scan.get("siteChecks") or {}).get("checkedAt") or "",
     }
+
+
+def _scan_audit_issues(scan: dict) -> list[dict]:
+    try:
+        from app.audit_checks import scan_issues
+
+        return scan_issues(scan)
+    except Exception:  # noqa: BLE001 - never break the scan summary
+        log.exception("scan_audit_issues_failed")
+        return []
 
 
 OPEN_OR_DONE = [
