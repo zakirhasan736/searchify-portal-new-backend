@@ -1256,6 +1256,82 @@ def _norm_path(url: str) -> str:
     return (path or "/").split("?")[0].rstrip("/") or "/"
 
 
+def _expected_gain_from_gsc(gsc: dict | None, judge_score=None, live_score=None) -> dict:
+    """Honest this-month click range from page Search Console totals + blind-review gap.
+
+    Never invents a fixed +10–30 when the page has no stored clicks/impressions.
+    """
+    from datetime import datetime
+
+    month = datetime.utcnow().strftime("%B")
+    full_month = datetime.utcnow().strftime("%B %Y")
+    data = dict(gsc or {})
+
+    def _num(value):
+        if value in (None, "", "—"):
+            return None
+        try:
+            return float(str(value).replace("%", "").replace(",", "").strip())
+        except (TypeError, ValueError):
+            return None
+
+    clicks = _num(data.get("clicks"))
+    impressions = _num(data.get("impressions"))
+    ctr_raw = _num(data.get("ctr"))
+    if ctr_raw is not None:
+        ctr = ctr_raw / 100.0 if ctr_raw > 1 else ctr_raw
+    elif clicks is not None and impressions and impressions > 0:
+        ctr = clicks / impressions
+    else:
+        ctr = None
+
+    try:
+        judge = float(judge_score) if judge_score not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        judge = 0.0
+    try:
+        live = float(live_score) if live_score not in (None, "") else 0.0
+    except (TypeError, ValueError):
+        live = 0.0
+    score_gap = max(0.0, judge - live) / 100.0
+
+    if impressions is not None and impressions > 0:
+        current_ctr = ctr if ctr is not None else (clicks / impressions if clicks is not None else 0.02)
+        lift = min(0.045, max(0.004, current_ctr * (0.12 + score_gap * 0.55) + score_gap * 0.01))
+        low = max(1, int(round(impressions * lift * 0.55)))
+        high = max(low + 1, int(round(impressions * lift * 1.25)))
+        if clicks is not None and clicks > 0:
+            high = min(high, max(low + 1, int(round(clicks * 0.6) + low)))
+        basis = (
+            f"{int(round(clicks)):,} clicks · {int(round(impressions)):,} impressions on this page in Search Console ({full_month})"
+            if clicks is not None
+            else f"{int(round(impressions)):,} impressions on this page in Search Console ({full_month})"
+        )
+        return {
+            "expectedGain": f"+{low}–{high} clicks this month",
+            "gainBasis": basis,
+            "gainMid": int(round((low + high) / 2)),
+        }
+
+    if clicks is not None and clicks > 0:
+        low = max(1, int(round(clicks * (0.06 + score_gap * 0.1))))
+        high = max(low + 1, int(round(clicks * (0.18 + score_gap * 0.2))))
+        return {
+            "expectedGain": f"+{low}–{high} clicks this month",
+            "gainBasis": f"{int(round(clicks)):,} Search Console clicks on this page · {full_month}",
+            "gainMid": int(round((low + high) / 2)),
+        }
+
+    return {
+        "expectedGain": f"Clicks measured after ship · {month}",
+        "gainBasis": (
+            f"No Search Console clicks or impressions are stored for this page yet ({full_month}). "
+            "The gain fills in from live data after you ship."
+        ),
+        "gainMid": 0,
+    }
+
+
 def _gsc_for_page(db: Session, user_id: int, url: str, evidence: dict | None = None) -> dict:
     """Page-level Search Console numbers, falling back to the card's stored evidence."""
     base = dict(evidence or {})
@@ -2081,6 +2157,11 @@ def propose_from_gsc(
                 "seoScore": drafted.get("seoScore") or 0,
                 "judgeScore": drafted.get("judgeScore"),
                 "liveScore": drafted.get("liveScore"),
+                **_expected_gain_from_gsc(
+                    job["gsc"],
+                    judge_score=drafted.get("judgeScore"),
+                    live_score=drafted.get("liveScore"),
+                ),
                 "aiAlternatives": [
                     {
                         "title": drafted.get("title") or "",
@@ -2694,6 +2775,13 @@ def generate_meta(change_id: int, body: GenerateMetaBody, db: Session = Depends(
     proposed["judgeScore"] = drafted.get("judgeScore")
     proposed["liveScore"] = drafted.get("liveScore")
     proposed["reason"] = drafted.get("reason") or ""
+    proposed.update(
+        _expected_gain_from_gsc(
+            proposed.get("evidence") or gsc_evidence,
+            judge_score=drafted.get("judgeScore"),
+            live_score=drafted.get("liveScore"),
+        )
+    )
     proposed["aiAlternatives"] = options
     proposed["model"] = drafted.get("model")
     proposed["role"] = drafted.get("role")
