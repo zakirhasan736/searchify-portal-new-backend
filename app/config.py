@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 DATABASE_URL = os.getenv(
-    "DATABASE_URL",
+    "DATABASE_URL", 
     "postgresql+psycopg://searchify:searchify@127.0.0.1:55432/searchify",
 )
 JWT_SECRET = os.getenv("JWT_SECRET", "change-this-local-secret")
