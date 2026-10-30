@@ -11,7 +11,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 import logging
 
-from app import config, google_match
+from app import config, google_match, problems
 from app.database import get_db
 from app import google_ads as gads
 from app import google_oauth as goauth
@@ -91,6 +91,60 @@ def _friendly_google_error(exc: Exception, *, email: str = "", site_url: str = "
     return detail[:500]
 
 
+def _google_problem(exc: Exception, row: GoogleConnection | None, token: str = "") -> dict:
+    """Structured, actionable problem for a failed Search Console / Analytics call."""
+    email = (row.google_email if row else "") or ""
+    prop = (row.gsc_site_url if row else "") or ""
+    technical = f"{type(exc).__name__}: {str(exc)[:300]}"
+    if isinstance(exc, goauth.GoogleReauthRequired):
+        return problems.make("google_reauth_required", "google", message=REAUTH, technical=technical)
+    low = str(exc).lower()
+    if "getaddrinfo" in low or "name or service not known" in low or "failed to resolve" in low or "timed out" in low:
+        return problems.make("google_network", "google", technical=technical)
+    status = getattr(exc, "status", 0)
+    service = getattr(exc, "service", "")
+    denied = status == 403 or "sufficient permission" in low or ("permission" in low and "site" in low)
+    if denied and service != "ga4":
+        target = getattr(exc, "resource", "") or prop
+        alternatives: list[dict] = []
+        if token and target:
+            try:
+                alternatives = problems.same_site_properties(goauth.list_gsc_sites(token), target)
+            except Exception:  # noqa: BLE001 - suggestions are best-effort
+                alternatives = []
+        return problems.gsc_no_access(target, email, alternatives, technical=getattr(exc, "raw", "") or technical)
+    if denied and service == "ga4":
+        pid = getattr(exc, "resource", "") or ((row.ga4_property_id if row else "") or "")
+        return problems.make(
+            "ga4_no_access",
+            "analytics",
+            message=f"{email or 'The connected Google account'} can't read GA4 property {pid}.",
+            email=email or "the connected Google account",
+            technical=getattr(exc, "raw", "") or technical,
+        )
+    area = "analytics" if service == "ga4" else "search_console" if service == "gsc" else "google"
+    return problems.make(
+        "research_error",
+        area,
+        title=f"{problems.AREA_LABELS.get(area, 'Google')} sync could not finish",
+        message=_friendly_google_error(exc, email=email, site_url=prop)[:300],
+        technical=technical,
+    )
+
+
+def _sync_warnings(row: GoogleConnection, synced: dict, queries: list, pages: list, report: dict | None = None) -> list[dict]:
+    out: list[dict] = []
+    if not row.gsc_site_url:
+        out.append(problems.make("gsc_not_selected", "search_console", severity="warning"))
+    elif synced.get("gsc") and not queries and not pages:
+        out.append(problems.make("gsc_no_data", "search_console"))
+    if not row.ga4_property_id:
+        out.append(problems.make("ga4_not_selected", "analytics"))
+    elif synced.get("ga4") and str((report or {}).get("sessions") or "0").replace(",", "") in {"0", "0.0", "—", ""}:
+        out.append(problems.make("ga4_no_data", "analytics"))
+    return out
+
+
 def _connection_payload(row: GoogleConnection | None) -> dict:
     if row is None:
         return {
@@ -143,6 +197,8 @@ def _connection_payload(row: GoogleConnection | None) -> dict:
         "scopes": row.scopes or [],
         "lastSyncAt": row.last_sync_at.isoformat() if row.last_sync_at else None,
         "lastError": row.last_error or "",
+        # Structured version of lastError (title, steps, action) for the help panel.
+        "problem": (meta.get("lastProblem") if row.last_error else None) or None,
         "accounts": _public_accounts(row),
     }
 
@@ -232,7 +288,11 @@ def _mark_reauth(db: Session, row: GoogleConnection):
     row.updated_at = datetime.utcnow()
     db.commit()
     log.warning("google_reauth_required", extra={"user_id": row.customer_id})
-    raise HTTPException(status_code=401, detail={"code": "google_reauth_required", "message": REAUTH})
+    raise problems.ProblemError(
+        401,
+        problems.make("google_reauth_required", "google", message=REAUTH),
+        {"code": "google_reauth_required", "message": REAUTH},
+    )
 
 
 def _stamp_validated(row: GoogleConnection, key: str, value: str) -> None:
@@ -821,6 +881,35 @@ def google_ads_disconnect(body: SyncBody = SyncBody(), db: Session = Depends(get
     return {"ok": True, "connection": _connection_payload(row)}
 
 
+def _sync_choice_to_sites(db: Session, user_id: int, row: GoogleConnection, chosen_host: str, body: "SelectBody") -> None:
+    """Copy the saved GSC/GA4 choice onto every connected website for the same host."""
+    if not chosen_host:
+        return
+    sites = (
+        db.query(CmsConnection)
+        .filter(CmsConnection.customer_id == user_id)
+        .all()
+    )
+    for cms in sites:
+        if body.cms_connection_id and cms.id == body.cms_connection_id:
+            continue  # already written above
+        if host_key(cms.site_url or "") != chosen_host:
+            continue
+        meta = dict(cms.meta or {})
+        changed = False
+        if body.gsc_site_url is not None and meta.get("gscSiteUrl") != (row.gsc_site_url or ""):
+            meta["gscSiteUrl"] = row.gsc_site_url or ""
+            changed = True
+        if body.ga4_property_id is not None and meta.get("ga4PropertyId") != (row.ga4_property_id or ""):
+            meta["ga4PropertyId"] = row.ga4_property_id or ""
+            meta["ga4PropertyName"] = row.ga4_property_name or ""
+            changed = True
+        if changed:
+            cms.meta = meta
+            flag_modified(cms, "meta")
+            cms.updated_at = datetime.utcnow()
+
+
 @router.post("/oauth/google/select")
 def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
@@ -833,28 +922,40 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
         if gsc_value:
             allowed = {p["siteUrl"]: p for p in goauth.list_gsc_sites(token)}
             if gsc_value not in allowed or allowed[gsc_value].get("permissionLevel") in google_match.UNUSABLE:
-                raise HTTPException(
-                    status_code=422,
-                    detail={
-                        "code": "gsc_no_access",
-                        "message": (
-                            f"{row.google_email or 'This Google account'} cannot read Search Console data for {gsc_value}. "
-                            "Ask the client to add this exact email as Full on that exact property "
-                            "(Domain and URL-prefix are separate), accept the invite, then try again."
-                        ),
-                    },
+                message = (
+                    f"{row.google_email or 'This Google account'} cannot read Search Console data for {gsc_value}. "
+                    "Ask the client to add this exact email as Full on that exact property "
+                    "(Domain and URL-prefix are separate), accept the invite, then try again."
+                )
+                raise problems.ProblemError(
+                    422,
+                    problems.gsc_no_access(
+                        gsc_value, row.google_email or "", problems.same_site_properties(list(allowed.values()), gsc_value)
+                    ),
+                    {"code": "gsc_no_access", "message": message},
                 )
             try:
                 goauth.probe_gsc_access(token, gsc_value, email=row.google_email or "")
             except RuntimeError as probe_exc:
-                raise HTTPException(
-                    status_code=422,
-                    detail={"code": "gsc_no_access", "message": str(probe_exc)[:500]},
+                raise problems.ProblemError(
+                    422,
+                    problems.gsc_no_access(
+                        gsc_value,
+                        row.google_email or "",
+                        problems.same_site_properties(list(allowed.values()), gsc_value),
+                        technical=getattr(probe_exc, "raw", "") or str(probe_exc)[:300],
+                    ),
+                    {"code": "gsc_no_access", "message": str(probe_exc)[:500]},
                 ) from probe_exc
         if ga4_value:
             props = {p["propertyId"]: p for p in goauth.list_ga4_properties(token)}
             if ga4_value not in props:
-                raise HTTPException(status_code=422, detail={"code": "ga4_no_access", "message": f"{row.google_email or 'This Google account'} cannot read Analytics property {ga4_value}."})
+                message = f"{row.google_email or 'This Google account'} cannot read Analytics property {ga4_value}."
+                raise problems.ProblemError(
+                    422,
+                    problems.make("ga4_no_access", "analytics", message=message, email=row.google_email or "the connected Google account"),
+                    {"code": "ga4_no_access", "message": message},
+                )
             if body.ga4_property_name is None:
                 body.ga4_property_name = props[ga4_value].get("displayName") or ""
     except HTTPException:
@@ -895,6 +996,11 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
                 "ga4PropertyName": row.ga4_property_name or "",
             })
     chosen = host_key(row.gsc_site_url or "")
+    # Sync reads the property from the WEBSITE record when one exists (_apply_site_google).
+    # Write the choice there too, or an older choice (e.g. sc-domain:… from a previous
+    # setup) silently wins at sync time and Google answers 403 for a property the
+    # account never chose.
+    _sync_choice_to_sites(db, user.id, row, chosen, body)
     if chosen:
         _save_binding(row, chosen, {
             "gscSiteUrl": row.gsc_site_url or "",
@@ -1842,19 +1948,31 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         db.commit()
     except Exception as exc:  # noqa: BLE001
         db.rollback()
+        if isinstance(exc, HTTPException):
+            raise
         fresh = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user_id).first()
-        detail = _friendly_google_error(
-            exc,
-            email=(fresh.google_email if fresh else "") or "",
-            site_url=(fresh.gsc_site_url if fresh else "") or "",
-        )
+        problem = _google_problem(exc, fresh, token)
+        # Keep ``detail`` a plain string for older screens; make it the actionable message.
+        detail = f"{problem['title']}. {problem['message']}".strip()
+        if problem.get("steps"):
+            detail += " " + problem["steps"][0]
         if fresh is not None:
             fresh.last_error = detail[:500]
             fresh.status = "error"
+            fresh_meta = dict(fresh.meta or {})
+            fresh_meta["lastProblem"] = problem
+            fresh.meta = fresh_meta
+            flag_modified(fresh, "meta")
             db.commit()
-        raise HTTPException(status_code=502, detail=detail[:500]) from exc
+        raise problems.ProblemError(502, problem, detail[:500]) from exc
 
-    return {"ok": True, "synced": synced, "enriched": enriched, "connection": _connection_payload(row)}
+    return {
+        "ok": True,
+        "synced": synced,
+        "enriched": enriched,
+        "connection": _connection_payload(row),
+        "warnings": _sync_warnings(row, synced, queries, pages, report),
+    }
 
 
 @router.post("/oauth/google/enrich")

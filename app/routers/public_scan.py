@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from time import time
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
+from app import problems
 from app.site_scan import host_of, preview_scan, public_host
 
 router = APIRouter(prefix="/api/v1/public", tags=["public"])
@@ -53,16 +54,19 @@ def _allow(ip: str) -> bool:
 def public_site_scan(body: PreviewBody, request: Request):
     home = _normalize(body.site)
     if not home or not public_host(home):
-        raise HTTPException(status_code=400, detail="Enter a public website address, like example.com.")
+        message = "Enter a public website address, like example.com."
+        raise problems.ProblemError(400, problems.make("target_invalid", "site_scan", message=message, action=None), message)
     host = host_of(home)
     cached = _cache.get(host)
     now = time()
     if cached and now - cached[0] < CACHE_TTL:
         return {"ok": True, "live": True, "cached": True, "scan": cached[1]}
     if not _allow(_client_ip(request)):
-        raise HTTPException(status_code=429, detail="The free scan is busy for this network. Try again in a little while.")
+        message = "The free scan is busy for this network. Try again in a little while."
+        raise problems.ProblemError(429, problems.make("provider_busy", "site_scan", message=message), message)
     scan = preview_scan(home, limit=8)
     if scan.get("error") and not scan.get("pagesRead"):
-        raise HTTPException(status_code=422, detail=scan["error"])
+        error = str(scan["error"])
+        raise problems.ProblemError(422, problems.scan_error_problem(error, scan.get("failed")), error)
     _cache[host] = (now, scan)
     return {"ok": True, "live": True, "cached": False, "scan": scan}

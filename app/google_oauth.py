@@ -115,6 +115,17 @@ class GoogleReauthRequired(RuntimeError):
     """The refresh token was revoked, expired, or the OAuth client changed. The owner must reconnect."""
 
 
+class GoogleApiError(RuntimeError):
+    """A Search Console / Analytics API call failed. Keeps what the help panel needs."""
+
+    def __init__(self, message: str, *, service: str, status: int, resource: str = "", raw: str = ""):
+        super().__init__(message)
+        self.service = service  # "gsc" | "ga4"
+        self.status = status
+        self.resource = resource  # GSC siteUrl or GA4 property id
+        self.raw = raw[:400]
+
+
 def list_ga4_streams(access_token: str, property_id: str) -> list[str]:
     """Default URIs of the property's web data streams. Empty if they cannot be read."""
     url = f"https://analyticsadmin.googleapis.com/v1beta/properties/{property_id}/dataStreams"
@@ -187,7 +198,10 @@ def probe_gsc_access(access_token: str, site_url: str, *, email: str = "") -> di
     with httpx.Client(timeout=30.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
-        raise RuntimeError(explain_gsc_http_error(response.status_code, response.text, site_url=site_url, email=email))
+        raise GoogleApiError(
+            explain_gsc_http_error(response.status_code, response.text, site_url=site_url, email=email),
+            service="gsc", status=response.status_code, resource=site_url, raw=response.text,
+        )
     return {"ok": True, "siteUrl": site_url}
 
 
@@ -239,7 +253,10 @@ def fetch_gsc_dimension(
     with httpx.Client(timeout=45.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
-        raise RuntimeError(explain_gsc_http_error(response.status_code, response.text, site_url=site_url))
+        raise GoogleApiError(
+            explain_gsc_http_error(response.status_code, response.text, site_url=site_url),
+            service="gsc", status=response.status_code, resource=site_url, raw=response.text,
+        )
     rows = []
     for row in response.json().get("rows") or []:
         keys = row.get("keys") or [""]
@@ -537,7 +554,10 @@ def fetch_ga4_report(
     with httpx.Client(timeout=45.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
-        raise RuntimeError(f"GA4 report failed: {response.text[:300]}")
+        raise GoogleApiError(
+            f"GA4 report failed: {response.text[:300]}",
+            service="ga4", status=response.status_code, resource=str(property_id), raw=response.text,
+        )
     out = []
     for row in response.json().get("rows") or []:
         dims = [d.get("value") or "" for d in (row.get("dimensionValues") or [])]
