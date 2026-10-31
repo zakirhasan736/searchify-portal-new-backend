@@ -11,15 +11,16 @@ import jwt
 
 from app import config
 
-ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
-SCOPES = [
+# Google Ads (adwords) is not used — do not request it in any OAuth consent.
+# Core Plug-in scopes must match Cloud Console Data Access for verification.
+CORE_SCOPES = [
     "openid",
     "email",
     "profile",
     "https://www.googleapis.com/auth/webmasters.readonly",
     "https://www.googleapis.com/auth/analytics.readonly",
-    ADS_SCOPE,
 ]
+SCOPES = list(CORE_SCOPES)
 
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -47,12 +48,31 @@ def parse_oauth_state(state: str) -> dict:
 
 
 def scopes_for(services: str = "") -> list[str]:
-    # One Google sign-in covers Search Console, GA4, and Ads.
-    return list(SCOPES)
+    """Least privilege by requested service. Never requests Google Ads / adwords.
+
+    - gsc → Search Console read-only
+    - ga4 / analytics → Analytics read-only
+    - empty or gsc,ga4 → both GSC + Analytics
+    """
+    wanted = {part.strip().lower() for part in str(services or "").split(",") if part.strip()}
+    # Ignore legacy "ads" / "adwords" tokens so old clients cannot reintroduce the scope.
+    wanted -= {"ads", "adwords"}
+    scopes = ["openid", "email", "profile"]
+    wants_gsc = bool(wanted & {"gsc", "webmasters", "searchconsole", "search_console"})
+    wants_ga = bool(wanted & {"ga4", "ga", "analytics"})
+    if not wanted or (not wants_gsc and not wants_ga):
+        wants_gsc = True
+        wants_ga = True
+    if wants_gsc:
+        scopes.append("https://www.googleapis.com/auth/webmasters.readonly")
+    if wants_ga:
+        scopes.append("https://www.googleapis.com/auth/analytics.readonly")
+    return list(dict.fromkeys(scopes))
 
 
 def ads_scope_granted(scopes: list | None) -> bool:
-    return any("adwords" in str(item) for item in (scopes or []))
+    """Always false — Searchify no longer uses Google Ads OAuth."""
+    return False
 
 
 def auth_url(state: str, services: str = "", force_consent: bool = True, prompt: str = "") -> str:
@@ -62,7 +82,7 @@ def auth_url(state: str, services: str = "", force_consent: bool = True, prompt:
         "response_type": "code",
         "scope": " ".join(scopes_for(services)),
         "access_type": "offline",
-        "include_granted_scopes": "true",
+        "include_granted_scopes": "false",
         "state": state,
     }
     if prompt:

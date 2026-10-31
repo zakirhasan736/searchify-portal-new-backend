@@ -496,7 +496,7 @@ def google_activate_site(body: ActivateSiteBody, db: Session = Depends(get_db), 
 
 @router.get("/oauth/google/start")
 def google_start(
-    services: str = Query(default="gsc,ga4,ads"),
+    services: str = Query(default="gsc,ga4"),
     add: str = Query(default=""),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
@@ -505,20 +505,17 @@ def google_start(
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
     already = bool(row and (row.refresh_token or row.access_token))
     adding = add == "1"
-    if already and not adding and goauth.ads_scope_granted(row.scopes) and "ads" in (services or ""):
-        return {
-            "authUrl": "",
-            "alreadyConnected": True,
-            "adsScope": True,
-            "services": services,
-        }
-    state = goauth.make_oauth_state(user.id, services=services)
+    # Strip legacy "ads" tokens — Google Ads OAuth is fully removed.
+    clean_services = ",".join(
+        part for part in str(services or "gsc,ga4").split(",") if part.strip().lower() not in {"ads", "adwords"}
+    ) or "gsc,ga4"
+    state = goauth.make_oauth_state(user.id, services=clean_services)
     prompt = "select_account consent" if adding else ""
     return {
-        "authUrl": goauth.auth_url(state, services=services, force_consent=not already or adding, prompt=prompt),
+        "authUrl": goauth.auth_url(state, services=clean_services, force_consent=not already or adding, prompt=prompt),
         "alreadyConnected": already,
-        "adsScope": goauth.ads_scope_granted(row.scopes) if row else False,
-        "services": services,
+        "adsScope": False,
+        "services": clean_services,
         "redirectUri": config.GOOGLE_OAUTH_REDIRECT_URI,
     }
 
@@ -593,11 +590,8 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
     except Exception as exc:  # noqa: BLE001
         return RedirectResponse(f"{fail}&detail={str(exc)[:120]}")
 
-    services = str(payload.get("services") or "")
-    flag = "ads-connected" if "ads" in services else "connected"
-    q = urlencode({"google": flag, "email": row.google_email or ""})
-    dest = f"{portal}/app/connections/ads" if flag == "ads-connected" else f"{portal}/app/connections"
-    return RedirectResponse(f"{dest}?{q}")
+    q = urlencode({"google": "connected", "email": row.google_email or ""})
+    return RedirectResponse(f"{portal}/app/connections?{q}")
 
 
 def _workspace_site_for_match(db: Session, user_id: int) -> str:
@@ -766,98 +760,30 @@ def _persist_ads_meta(db: Session, user: User, row: GoogleConnection, ads: dict,
     db.refresh(row)
 
 
+def _ads_removed():
+    raise HTTPException(
+        status_code=410,
+        detail="Google Ads is no longer part of Searchify. Connect Search Console and Analytics only.",
+    )
+
+
 @router.get("/oauth/google/ads/accounts")
 def google_ads_accounts(
     cms_connection_id: int | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
-    if row is None or not (row.access_token or row.refresh_token):
-        raise HTTPException(status_code=404, detail="Connect Google first")
-    if not goauth.ads_scope_granted(row.scopes):
-        raise HTTPException(status_code=409, detail="Google Ads permission is missing. Reconnect with Ads access.")
-    if not gads.ads_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="Add GOOGLE_ADS_DEVELOPER_TOKEN to the backend .env. Create it in Google Ads → Tools → API Center.",
-        )
-    token = _valid_access_token(db, row)
-    try:
-        accounts = gads.list_ads_accounts(token)
-    except Exception as exc:  # noqa: BLE001
-        row.last_error = str(exc)[:500]
-        db.commit()
-        raise HTTPException(status_code=502, detail=str(exc)[:400]) from exc
-    cms = None
-    if cms_connection_id:
-        cms = db.get(CmsConnection, cms_connection_id)
-        if cms is None or cms.customer_id != user.id:
-            raise HTTPException(status_code=404, detail="Website not found")
-    meta = (cms.meta if cms else row.meta) or {}
-    fallback = row.meta or {}
-    return {
-        "configured": True,
-        "accounts": accounts,
-        "selectedCustomerId": meta.get("adsCustomerId") or fallback.get("adsCustomerId") or "",
-        "selectedCustomerName": meta.get("adsCustomerName") or fallback.get("adsCustomerName") or "",
-        "cmsConnectionId": cms.id if cms else None,
-    }
+    _ads_removed()
 
 
 @router.post("/oauth/google/ads/select")
 def google_ads_select(body: AdsSelectBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Connect Google first")
-    cid = re.sub(r"\D", "", body.customer_id or "")
-    if not cid:
-        raise HTTPException(status_code=400, detail="Choose a Google Ads customer")
-    ads = {
-        "adsCustomerId": cid,
-        "adsCustomerName": (body.customer_name or "").strip() or f"Account {cid}",
-        "adsLoginCustomerId": re.sub(r"\D", "", body.login_customer_id or "") or None,
-    }
-    _persist_ads_meta(db, user, row, ads, body.cms_connection_id)
-    token = _valid_access_token(db, row)
-    try:
-        campaigns = gads.fetch_campaigns(token, cid, ads.get("adsLoginCustomerId"))
-        try:
-            terms = gads.fetch_search_terms(token, cid, ads.get("adsLoginCustomerId"))
-        except Exception:  # noqa: BLE001
-            terms = []
-        _write_ads_features(db, user.id, cid, ads["adsCustomerName"], campaigns, terms, body.cms_connection_id)
-    except Exception as exc:  # noqa: BLE001
-        row.last_error = str(exc)[:500]
-        db.commit()
-        raise HTTPException(status_code=400, detail=str(exc)[:400]) from exc
-    return {"ok": True, "adsCustomerId": cid, "adsCustomerName": ads["adsCustomerName"]}
+    _ads_removed()
 
 
 @router.post("/oauth/google/ads/sync")
 def google_ads_sync(body: SyncBody = SyncBody(), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Connect Google first")
-    cms = None
-    if body.cms_connection_id:
-        cms = db.get(CmsConnection, body.cms_connection_id)
-        if cms is None or cms.customer_id != user.id:
-            raise HTTPException(status_code=404, detail="Website not found")
-    meta = (cms.meta if cms else row.meta) or {}
-    cid = re.sub(r"\D", "", str(meta.get("adsCustomerId") or (row.meta or {}).get("adsCustomerId") or ""))
-    if not cid:
-        raise HTTPException(status_code=400, detail="Select a Google Ads account first")
-    token = _valid_access_token(db, row)
-    login = meta.get("adsLoginCustomerId") or (row.meta or {}).get("adsLoginCustomerId")
-    name = meta.get("adsCustomerName") or (row.meta or {}).get("adsCustomerName") or f"Account {cid}"
-    campaigns = gads.fetch_campaigns(token, cid, login)
-    try:
-        terms = gads.fetch_search_terms(token, cid, login)
-    except Exception:  # noqa: BLE001
-        terms = []
-    _write_ads_features(db, user.id, cid, name, campaigns, terms, body.cms_connection_id)
-    return {"ok": True, "campaigns": len(campaigns), "searchTerms": len(terms)}
+    _ads_removed()
 
 
 @router.post("/oauth/google/ads/disconnect")

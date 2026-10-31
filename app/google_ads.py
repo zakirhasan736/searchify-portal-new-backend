@@ -8,7 +8,8 @@ import httpx
 
 from app import config
 
-ADS_SCOPE = "https://www.googleapis.com/auth/adwords"
+# Deprecated — Searchify no longer requests Google Ads OAuth (adwords).
+ADS_SCOPE = ""
 
 
 def ads_configured() -> bool:
