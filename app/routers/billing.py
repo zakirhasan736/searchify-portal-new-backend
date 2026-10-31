@@ -81,8 +81,8 @@ CATALOG = [
     },
 ]
 
-# Early-launch counter — wire claimed* to live billing later.
-EARLY_LAUNCH = {
+# Early-launch counter defaults (Pricing.dc.html). Live values come from founding checkouts.
+EARLY_LAUNCH_SEED = {
     "total": 100,
     "claimed": 63,
     "claimedThisWeek": 12,
@@ -90,6 +90,7 @@ EARLY_LAUNCH = {
     "proListMo": 99,
     "proLaunchMo": 79,
 }
+EARLY_LAUNCH = dict(EARLY_LAUNCH_SEED)
 
 BY_ID = {p["id"]: p for p in CATALOG}
 BY_CANONICAL = {p["canonical"]: p for p in CATALOG}
@@ -266,14 +267,102 @@ def _admin(db: Session) -> User | None:
     return db.query(User).filter(User.role == "ROLE_ADMIN").order_by(User.id).first()
 
 
+def _parse_iso(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is not None:
+            dt = dt.replace(tzinfo=None) - (dt.utcoffset() or timedelta(0))
+        return dt
+    except Exception:
+        return None
+
+
+def _ago_label(dt: datetime) -> str:
+    secs = max(0, int((datetime.utcnow() - dt).total_seconds()))
+    if secs < 45:
+        return "just now"
+    if secs < 3600:
+        mins = max(1, secs // 60)
+        return f"{mins} min"
+    if secs < 86400:
+        hrs = max(1, secs // 3600)
+        return f"{hrs} hr" if hrs == 1 else f"{hrs} hrs"
+    days = max(1, secs // 86400)
+    if days < 14:
+        return "1 day" if days == 1 else f"{days} days"
+    weeks = days // 7
+    return "1 wk" if weeks == 1 else f"{weeks} wks"
+
+
+def _founding_claim_times(db: Session) -> list[datetime]:
+    """Latest founding/Pro early-launch checkout time per customer."""
+    rows = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.kind == "billing-checkout")
+        .order_by(FeatureRecord.id.desc())
+        .all()
+    )
+    by_user: dict[int, datetime] = {}
+    for row in rows:
+        payload = dict(row.payload or {})
+        # Only explicit early-launch founding claims move the counter (Pricing.dc.html).
+        if not bool(payload.get("founding")):
+            continue
+        at = _parse_iso(payload.get("at")) or (row.created_at if getattr(row, "created_at", None) else None)
+        if at is None:
+            continue
+        uid = int(row.customer_id)
+        prev = by_user.get(uid)
+        if prev is None or at > prev:
+            by_user[uid] = at
+    return sorted(by_user.values())
+
+
+def _early_launch_payload(db: Session) -> dict:
+    """Live early-launch counter for Pricing.html / Pricing.dc.html."""
+    total = int(EARLY_LAUNCH_SEED["total"])
+    seed_claimed = int(EARLY_LAUNCH_SEED["claimed"])
+    times = _founding_claim_times(db)
+    live_count = len(times)
+    # Seed = spots already claimed before live tracking. Each founding Pro checkout adds one.
+    claimed = min(total, seed_claimed + live_count)
+    if live_count:
+        week_ago = datetime.utcnow() - timedelta(days=7)
+        claimed_week = sum(1 for t in times if t >= week_ago)
+        last_label = _ago_label(times[-1])
+    else:
+        claimed_week = int(EARLY_LAUNCH_SEED["claimedThisWeek"])
+        last_label = str(EARLY_LAUNCH_SEED["lastClaimed"])
+    left = max(0, total - claimed)
+    return {
+        "total": total,
+        "claimed": claimed,
+        "left": left,
+        "claimedThisWeek": claimed_week,
+        "lastClaimed": last_label,
+        "lastClaimedAt": times[-1].isoformat() + "Z" if times else None,
+        "spotsHeadline": f"{left} of {total} spots left",
+        "claimedLabel": f"{claimed} CLAIMED",
+        "totalLabel": f"{total} SPOTS TOTAL",
+        "proListMo": int(EARLY_LAUNCH_SEED["proListMo"]),
+        "proLaunchMo": int(EARLY_LAUNCH_SEED["proLaunchMo"]),
+        "live": True,
+        "liveClaims": live_count,
+    }
+
+
 @router.get("/catalog")
-def catalog():
+def catalog(db: Session = Depends(get_db)):
+    early = _early_launch_payload(db)
     return {
         "ok": True,
         "live": True,
         "plans": CATALOG,
         "trialDays": 30,
-        "earlyLaunch": EARLY_LAUNCH,
+        "earlyLaunch": early,
         "managed": {
             "name": "Managed",
             "tag": "DONE FOR YOU",
@@ -322,6 +411,10 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
 
     trial_days = 30 if plan.get("freeMonth") else 0
     status = "trial" if trial_days else "active"
+    early = _early_launch_payload(db)
+    # Lock early-launch Pro price while spots remain; after that Pro is list price.
+    # Unique per customer via _founding_claim_times (plan switches don't double-count).
+    founding = bool(plan.get("founding")) and int(early.get("left") or 0) > 0
     _save_feature(
         db,
         user.id,
@@ -334,7 +427,7 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
             "email": (body.email or user.email or "").strip().lower(),
             "status": status,
             "trialDays": trial_days,
-            "founding": bool(plan.get("founding")),
+            "founding": founding,
             "provider": "internal",
             "at": datetime.utcnow().isoformat() + "Z",
         },
@@ -354,6 +447,8 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
         "canonical": canonical,
         "billing": billing,
         "trialDays": trial_days,
+        "founding": founding,
+        "earlyLaunch": _early_launch_payload(db),
         "next": "/app/connections",
         "detail": detail,
     }
