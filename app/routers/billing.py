@@ -81,16 +81,18 @@ CATALOG = [
     },
 ]
 
-# Early-launch counter defaults (Pricing.dc.html). Live values come from founding checkouts.
+# Early-launch offer: first 100 real founding Pro subscribers lock $79.
+# Counts are live unique users only — no design/demo seed fill.
 EARLY_LAUNCH_SEED = {
     "total": 100,
-    "claimed": 63,
-    "claimedThisWeek": 12,
-    "lastClaimed": "2 hrs",
+    "claimed": 0,
+    "claimedThisWeek": 0,
+    "lastClaimed": "—",
     "proListMo": 99,
     "proLaunchMo": 79,
 }
 EARLY_LAUNCH = dict(EARLY_LAUNCH_SEED)
+EARLY_LAUNCH_TOTAL = 100
 
 BY_ID = {p["id"]: p for p in CATALOG}
 BY_CANONICAL = {p["canonical"]: p for p in CATALOG}
@@ -576,20 +578,33 @@ def _early_launch_owner_id(db: Session) -> int:
 
 
 def _early_launch_store(db: Session) -> tuple[int, dict]:
-    """Persisted early-launch ledger: seed + unique offer claims."""
+    """Persisted early-launch ledger: unique real founding Pro users only."""
     owner_id = _early_launch_owner_id(db)
     data = _feature(db, owner_id, "early-launch")
     if not data:
         data = {
-            "total": int(EARLY_LAUNCH_SEED["total"]),
-            "seedClaimed": int(EARLY_LAUNCH_SEED["claimed"]),
-            "seedClaimedThisWeek": int(EARLY_LAUNCH_SEED["claimedThisWeek"]),
+            "total": EARLY_LAUNCH_TOTAL,
+            "seedClaimed": 0,
+            "seedClaimedThisWeek": 0,
+            "realOnly": True,
             "claims": [],
         }
         _save_feature(db, owner_id, "early-launch", "Early launch counter", data)
-    data.setdefault("total", int(EARLY_LAUNCH_SEED["total"]))
-    data.setdefault("seedClaimed", int(EARLY_LAUNCH_SEED["claimed"]))
-    data.setdefault("seedClaimedThisWeek", int(EARLY_LAUNCH_SEED["claimedThisWeek"]))
+    # One-time wipe of old design seed (63 claimed / 12 this week) so the UI
+    # only counts real users who received the founding Pro offer.
+    if not data.get("realOnly"):
+        data = {
+            **data,
+            "total": EARLY_LAUNCH_TOTAL,
+            "seedClaimed": 0,
+            "seedClaimedThisWeek": 0,
+            "realOnly": True,
+            "claims": list(data.get("claims") or []),
+        }
+        _save_feature(db, owner_id, "early-launch", "Early launch counter", data)
+    data.setdefault("total", EARLY_LAUNCH_TOTAL)
+    data["seedClaimed"] = 0
+    data["seedClaimedThisWeek"] = 0
     data.setdefault("claims", [])
     return owner_id, data
 
@@ -648,12 +663,20 @@ def _sync_early_launch_claims(db: Session) -> dict:
     return data
 
 
+def _user_has_early_launch_claim(data: dict, user_id: int) -> bool:
+    uid = int(user_id)
+    return any(int(c.get("userId") or 0) == uid for c in (data.get("claims") or []))
+
+
 def _record_early_launch_claim(db: Session, user_id: int, plan_id: str) -> dict:
-    """Record one early-launch offer received (idempotent per user)."""
+    """Record one early-launch offer received (idempotent per user, hard cap 100)."""
     owner_id, data = _early_launch_store(db)
     claims = list(data.get("claims") or [])
     uid = int(user_id)
     if any(int(c.get("userId") or 0) == uid for c in claims):
+        return data
+    total = max(1, int(data.get("total") or EARLY_LAUNCH_TOTAL))
+    if len(claims) >= total:
         return data
     claims.append(
         {
@@ -663,44 +686,54 @@ def _record_early_launch_claim(db: Session, user_id: int, plan_id: str) -> dict:
             "source": "offer",
         }
     )
-    data = {**data, "claims": claims[-500:]}
+    data = {**data, "claims": claims[-500:], "seedClaimed": 0, "seedClaimedThisWeek": 0, "realOnly": True}
     _save_feature(db, owner_id, "early-launch", "Early launch counter", data)
     return data
 
 
 def _early_launch_payload(db: Session) -> dict:
-    """Live early-launch counter for Pricing.html / Pricing.dc.html."""
+    """Live early-launch counter: unique founding Pro users / 100 spots."""
     data = _sync_early_launch_claims(db)
-    total = max(1, int(data.get("total") or EARLY_LAUNCH_SEED["total"]))
-    seed_claimed = max(0, int(data.get("seedClaimed") or EARLY_LAUNCH_SEED["claimed"]))
+    total = max(1, min(EARLY_LAUNCH_TOTAL, int(data.get("total") or EARLY_LAUNCH_TOTAL)))
     claims = list(data.get("claims") or [])
-    times: list[datetime] = []
+    # Deduplicate by userId in case older ledgers double-counted.
+    by_user: dict[int, dict] = {}
     for c in claims:
+        if c.get("userId") is None:
+            continue
+        uid = int(c["userId"])
+        prev = by_user.get(uid)
+        if prev is None:
+            by_user[uid] = dict(c)
+            continue
+        prev_at = _parse_iso(prev.get("at"))
+        next_at = _parse_iso(c.get("at"))
+        if next_at and (prev_at is None or next_at > prev_at):
+            by_user[uid] = dict(c)
+    unique = list(by_user.values())
+    times: list[datetime] = []
+    for c in unique:
         at = _parse_iso(c.get("at"))
         if at:
             times.append(at)
     times.sort()
-    live_count = len(claims)
-    # Seed = spots already claimed before tracking. Each founding Pro offer adds one.
-    offers_received = live_count
-    claimed = min(total, seed_claimed + live_count)
+    live_count = len(unique)
+    claimed = min(total, live_count)
     week_ago = datetime.utcnow() - timedelta(days=7)
-    live_week = sum(1 for t in times if t >= week_ago)
-    seed_week = int(data.get("seedClaimedThisWeek") or EARLY_LAUNCH_SEED["claimedThisWeek"])
-    # Seed baseline + offers received this week (numbers only grow as claims land).
-    claimed_week = seed_week + live_week
+    claimed_week = sum(1 for t in times if t >= week_ago)
     if live_count and times:
         last_label = _ago_label(times[-1])
         last_at = times[-1].isoformat() + "Z"
     else:
-        last_label = str(EARLY_LAUNCH_SEED["lastClaimed"])
+        last_label = "No claims yet"
         last_at = None
     left = max(0, total - claimed)
+    offer_open = left > 0
     return {
         "total": total,
         "claimed": claimed,
         "left": left,
-        "offersReceived": offers_received,
+        "offersReceived": live_count,
         "claimedThisWeek": claimed_week,
         "lastClaimed": last_label,
         "lastClaimedAt": last_at,
@@ -709,9 +742,10 @@ def _early_launch_payload(db: Session) -> dict:
         "totalLabel": f"{total} SPOTS TOTAL",
         "proListMo": int(EARLY_LAUNCH_SEED["proListMo"]),
         "proLaunchMo": int(EARLY_LAUNCH_SEED["proLaunchMo"]),
+        "offerOpen": offer_open,
         "live": True,
         "liveClaims": live_count,
-        "seedClaimed": seed_claimed,
+        "seedClaimed": 0,
     }
 
 
@@ -724,10 +758,25 @@ def early_launch(db: Session = Depends(get_db)):
 @router.get("/catalog")
 def catalog(db: Session = Depends(get_db)):
     early = _early_launch_payload(db)
+    offer_open = bool(early.get("offerOpen"))
+    plans = []
+    for raw in CATALOG:
+        plan = dict(raw)
+        if plan["id"] == "pro":
+            # While spots remain, Pro shows launch $79; after 100 claims, list $99.
+            if offer_open:
+                plan["mo"] = int(EARLY_LAUNCH_SEED["proLaunchMo"])
+                plan["listMo"] = int(EARLY_LAUNCH_SEED["proListMo"])
+                plan["founding"] = True
+            else:
+                plan["mo"] = int(EARLY_LAUNCH_SEED["proListMo"])
+                plan["listMo"] = int(EARLY_LAUNCH_SEED["proListMo"])
+                plan["founding"] = False
+        plans.append(plan)
     return {
         "ok": True,
         "live": True,
-        "plans": CATALOG,
+        "plans": plans,
         "trialDays": 30,
         "earlyLaunch": early,
         "managed": {
@@ -779,8 +828,17 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
     trial_days = 30 if plan.get("freeMonth") else 0
     status = "trial" if trial_days else "active"
     early = _early_launch_payload(db)
-    # Lock early-launch Pro price while spots remain; after that Pro is list price.
-    founding = bool(plan.get("founding")) and int(early.get("left") or 0) > 0
+    already_founding = _user_has_early_launch_claim(
+        _early_launch_store(db)[1], user.id
+    ) or bool(_feature(db, user.id, "billing-checkout").get("founding"))
+    # Lock early-launch Pro price while spots remain (max 100 unique users).
+    # Existing founding subscribers keep the offer even after the cap fills.
+    founding = (plan["id"] == "pro") and (already_founding or int(early.get("left") or 0) > 0)
+    if founding and plan["id"] == "pro":
+        # Persist launch price on the checkout row.
+        plan = {**plan, "mo": int(EARLY_LAUNCH_SEED["proLaunchMo"]), "listMo": int(EARLY_LAUNCH_SEED["proListMo"]), "founding": True}
+    elif plan["id"] == "pro":
+        plan = {**plan, "mo": int(EARLY_LAUNCH_SEED["proListMo"]), "listMo": int(EARLY_LAUNCH_SEED["proListMo"]), "founding": False}
     _save_feature(
         db,
         user.id,
