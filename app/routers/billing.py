@@ -159,6 +159,253 @@ def _paid_through(checkout: dict, billing: str) -> datetime:
     return started + timedelta(days=days)
 
 
+def _kpi_num(payload: dict, *parts: str) -> float | None:
+    """Read a numeric KPI from organic-search / feature panel rows."""
+    rows = []
+    for key in ("kpis",):
+        val = payload.get(key)
+        if isinstance(val, list):
+            rows.extend(val)
+    panels = payload.get("panels") if isinstance(payload.get("panels"), dict) else {}
+    if isinstance(panels.get("kpis"), list):
+        rows.extend(panels["kpis"])
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        label = str(row[0] or "").lower()
+        if any(p in label for p in parts):
+            raw = str(row[1] or "").replace(",", "").replace("%", "").strip()
+            try:
+                return float(raw)
+            except Exception:
+                continue
+    return None
+
+
+def _fmt_metric(n: float | int | None) -> str:
+    if n is None:
+        return "—"
+    if isinstance(n, float) and not n.is_integer():
+        return f"{n:.1f}"
+    return f"{int(round(float(n))):,}"
+
+
+def _pct_change(before: float | None, after: float | None, *, invert: bool = False) -> str:
+    if before is None or after is None or before == 0:
+        if before is None or after is None:
+            return "Waiting on data"
+        return "No change yet"
+    delta = (before - after) if invert else (after - before)
+    pct = round((delta / abs(before)) * 100)
+    if invert:
+        spots = round(before - after, 1)
+        if spots > 0:
+            return f"Up {spots:g} spots"
+        if spots < 0:
+            return f"Down {abs(spots):g} spots"
+        return "Flat so far"
+    sign = "+" if pct > 0 else ""
+    return f"{sign}{pct}%"
+
+
+def _normalize_since_rows(raw: list) -> list[dict]:
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        if not label:
+            continue
+        out.append(
+            {
+                "label": label,
+                "from": str(item.get("from") if item.get("from") is not None else "—"),
+                "to": str(item.get("to") if item.get("to") is not None else "—"),
+                "change": str(item.get("change") or ""),
+            }
+        )
+    return out
+
+
+def _build_cancel_since(db: Session, user: User, *, joined: datetime, moves: int) -> dict:
+    """Live before/after cards for Cancel.html — never uses design demo numbers."""
+    stored = _feature(db, user.id, "cancel-since") or _feature(db, user.id, "results-snapshot")
+    if isinstance(stored.get("since"), list) and stored.get("since"):
+        rows = _normalize_since_rows(stored["since"])
+        if rows:
+            return {
+                "since": rows,
+                "sinceLive": True,
+                "sinceSource": "snapshot",
+                "sinceNote": str(
+                    stored.get("note")
+                    or f"Compared with your starting point saved on {_fmt_joined(joined)}, across your sites."
+                ),
+                "measuredMoves": int(stored.get("measuredMoves") or 0),
+            }
+
+    organic = _feature(db, user.id, "organic-search")
+    inspection = _feature(db, user.id, "gsc-index-inspection")
+    path_board = _feature(db, user.id, "path-board") or _feature(db, user.id, "page-progress")
+
+    clicks_now = _kpi_num(organic, "click")
+    pos_now = _kpi_num(organic, "avg position", "position", "rank")
+    pages_found_now = None
+    if inspection.get("indexed") is not None:
+        try:
+            pages_found_now = float(inspection.get("indexed"))
+        except Exception:
+            pages_found_now = None
+    if pages_found_now is None:
+        pages_found_now = _kpi_num(organic, "page", "indexed", "url")
+
+    # Baseline from earliest monitoring snapshot on shipped changes.
+    changes = (
+        db.query(SiteChange)
+        .filter(SiteChange.customer_id == user.id)
+        .order_by(SiteChange.id.asc())
+        .limit(500)
+        .all()
+    )
+    base_pos: list[float] = []
+    live_pos: list[float] = []
+    measured = 0
+    for row in changes:
+        mon = dict(row.monitoring or {})
+        b = mon.get("baselinePosition")
+        l = mon.get("latestPosition")
+        try:
+            if b is not None:
+                base_pos.append(float(b))
+            if l is not None:
+                live_pos.append(float(l))
+        except Exception:
+            pass
+        if row.status in {"monitoring", "applied", "shipped", "published", "closed", "done"}:
+            if mon.get("latestPosition") is None or mon.get("waiting"):
+                measured += 1
+            elif row.status == "monitoring":
+                measured += 1
+
+    pos_from = round(sum(base_pos) / len(base_pos), 1) if base_pos else None
+    pos_to = round(sum(live_pos) / len(live_pos), 1) if live_pos else (round(pos_now, 1) if pos_now is not None else None)
+    if pos_from is None and pos_now is not None:
+        # No baselines yet — treat current as both ends until history exists.
+        pos_from = round(pos_now, 1)
+        pos_to = round(pos_now, 1)
+
+    # Clicks: prefer weekly series first/last month averages when present.
+    clicks_from = None
+    clicks_to = clicks_now
+    weekly = organic.get("panels", {}).get("weeklyClicks") if isinstance(organic.get("panels"), dict) else None
+    if not isinstance(weekly, list):
+        weekly = organic.get("weeklyClicks")
+    if isinstance(weekly, list) and len(weekly) >= 4:
+        vals: list[float] = []
+        for point in weekly:
+            try:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    vals.append(float(point[1] or 0))
+                elif isinstance(point, dict) and point.get("clicks") is not None:
+                    vals.append(float(point.get("clicks") or 0))
+            except Exception:
+                continue
+        if vals:
+            early = vals[: max(1, len(vals) // 4)]
+            late = vals[-max(1, len(vals) // 4) :]
+            clicks_from = round((sum(early) / len(early)) * 4.33)
+            clicks_to = round((sum(late) / len(late)) * 4.33)
+    if clicks_from is None and clicks_now is not None:
+        clicks_from = round(float(clicks_now))
+        clicks_to = round(float(clicks_now))
+
+    great_now = 0
+    great_from = 0
+    pages = path_board.get("pages") if isinstance(path_board.get("pages"), list) else path_board.get("rows")
+    if isinstance(pages, list):
+        for p in pages:
+            if not isinstance(p, dict):
+                continue
+            grade = str(p.get("grade") or p.get("status") or p.get("band") or "").lower()
+            if grade in {"great", "excellent", "pass", "passes", "good"}:
+                great_now += 1
+            if p.get("startedGreat") or p.get("baselineGreat"):
+                great_from += 1
+    if not pages and path_board.get("greatCount") is not None:
+        try:
+            great_now = int(path_board.get("greatCount") or 0)
+            great_from = int(path_board.get("greatFrom") or 0)
+        except Exception:
+            pass
+
+    pages_from = None
+    if pages_found_now is not None:
+        # Prefer stored baseline; else start ≈ current when no history.
+        try:
+            pages_from = float(stored.get("pagesFrom")) if stored.get("pagesFrom") is not None else float(pages_found_now)
+        except Exception:
+            pages_from = float(pages_found_now)
+
+    since = [
+        {
+            "label": "Clicks from Google / month",
+            "from": _fmt_metric(clicks_from),
+            "to": _fmt_metric(clicks_to),
+            "change": _pct_change(
+                float(clicks_from) if clicks_from is not None else None,
+                float(clicks_to) if clicks_to is not None else None,
+            ),
+        },
+        {
+            "label": "Average position",
+            "from": _fmt_metric(pos_from),
+            "to": _fmt_metric(pos_to),
+            "change": _pct_change(
+                float(pos_from) if pos_from is not None else None,
+                float(pos_to) if pos_to is not None else None,
+                invert=True,
+            ),
+        },
+        {
+            "label": "Pages at Great or Excellent",
+            "from": _fmt_metric(great_from),
+            "to": _fmt_metric(great_now),
+            "change": (
+                f"{great_now} page{'s' if great_now != 1 else ''} at goal"
+                if great_now
+                else ("No pages at goal yet" if moves else "Waiting on first scan")
+            ),
+        },
+        {
+            "label": "Pages Google has found",
+            "from": _fmt_metric(pages_from),
+            "to": _fmt_metric(pages_found_now),
+            "change": (
+                _pct_change(
+                    float(pages_from) if pages_from is not None else None,
+                    float(pages_found_now) if pages_found_now is not None else None,
+                )
+                if pages_found_now is not None
+                else ("Connect Search Console to track this" if not organic else "Waiting on crawl data")
+            ),
+        },
+    ]
+    has_live = any(
+        s["from"] != "—" or s["to"] != "—"
+        for s in since
+    )
+    return {
+        "since": since,
+        "sinceLive": has_live,
+        "sinceSource": "computed",
+        "sinceNote": (
+            f"Compared with your starting point saved on {_fmt_joined(joined)}, across your sites"
+            + (", and with the same months last year so seasons don't skew it." if has_live else ".")
+        ),
+        "measuredMoves": int(measured),
+    }
+
+
 def _account_payload(db: Session, user: User) -> dict:
     stored = (user.plan or "starter").strip().lower()
     catalog_id = STORED_TO_CATALOG.get(stored, "solo")
@@ -186,7 +433,7 @@ def _account_payload(db: Session, user: User) -> dict:
         db.query(SiteChange)
         .filter(
             SiteChange.customer_id == user.id,
-            SiteChange.status.in_(("shipped", "applied", "published", "closed", "done")),
+            SiteChange.status.in_(("shipped", "applied", "published", "closed", "done", "monitoring")),
         )
         .count()
     )
@@ -198,13 +445,30 @@ def _account_payload(db: Session, user: User) -> dict:
         or state.get("businessName")
         or (user.username or "Your workspace")
     )
-    founding = bool(plan.get("founding") or checkout.get("founding"))
+    early = _early_launch_payload(db)
+    checkout_founding = bool(checkout.get("founding")) if checkout else False
+    # Existing founding subscribers keep the launch price; new Pro only while spots remain.
+    founding = checkout_founding or (
+        catalog_id == "pro" and bool(plan.get("founding")) and int(early.get("left") or 0) > 0
+    )
     price = int(plan.get("mo") or 0)
+    if founding and catalog_id == "pro":
+        price = int(EARLY_LAUNCH_SEED["proLaunchMo"])
+    elif catalog_id == "pro" and not founding and plan.get("listMo"):
+        price = int(plan["listMo"])
+    list_mo = int(plan.get("listMo") or 0) or (int(EARLY_LAUNCH_SEED["proListMo"]) if catalog_id == "pro" else None)
     per = "year" if billing == "annual" else "month"
     amount = price * 10 if billing == "annual" else price
-    # Soft since-stats: live when we have outcomes snapshot, else empty for UI fallback.
-    outcomes = _feature(db, user.id, "cancel-since") or _feature(db, user.id, "results-snapshot")
-    since = outcomes.get("since") if isinstance(outcomes.get("since"), list) else []
+    solo_mo = int(BY_ID["solo"]["mo"])
+    since_pack = _build_cancel_since(db, user, joined=joined, moves=int(moves))
+    joined_short = _fmt_day(joined)
+    plan_line = f"{plan['name']} · ${amount} / {per}"
+    move_bit = (
+        f" · {int(moves)} moves shipped since {joined_short}"
+        if moves
+        else f" · joined {joined_short}"
+    )
+    plan_sub = f"{str(business).strip() or 'Your workspace'} · paid through {_fmt_day(paid)}{move_bit}"
     return {
         "ok": True,
         "live": True,
@@ -213,9 +477,12 @@ def _account_payload(db: Session, user: User) -> dict:
         "name": plan["name"],
         "billing": billing,
         "priceMo": price,
-        "listMo": int(plan.get("listMo") or 0) or None,
+        "listMo": list_mo,
+        "soloMo": solo_mo,
         "amount": amount,
         "per": per,
+        "planLine": plan_line,
+        "planSub": plan_sub,
         "founding": founding,
         "freeMonth": bool(plan.get("freeMonth")),
         "siteLimit": int(plan["siteLimit"] or 1),
@@ -226,11 +493,17 @@ def _account_payload(db: Session, user: User) -> dict:
         "trialDays": int(checkout.get("trialDays") or 0),
         "joinedAt": joined.isoformat() + "Z",
         "joinedLabel": _fmt_joined(joined),
+        "joinedShort": joined_short,
         "paidThrough": paid.isoformat() + "Z",
         "paidThroughLabel": _fmt_day(paid),
         "movesShipped": int(moves),
+        "measuredMoves": int(since_pack.get("measuredMoves") or 0),
         "business": str(business).strip() or "Your workspace",
-        "since": since,
+        "since": since_pack.get("since") or [],
+        "sinceLive": bool(since_pack.get("sinceLive")),
+        "sinceSource": since_pack.get("sinceSource") or "computed",
+        "sinceNote": since_pack.get("sinceNote") or "",
+        "earlyLaunchTotal": int(early.get("total") or EARLY_LAUNCH_SEED["total"]),
         "cancel": cancel or {},
         "pause": pause or {},
     }
@@ -297,53 +570,140 @@ def _ago_label(dt: datetime) -> str:
     return "1 wk" if weeks == 1 else f"{weeks} wks"
 
 
-def _founding_claim_times(db: Session) -> list[datetime]:
-    """Latest founding/Pro early-launch checkout time per customer."""
+def _early_launch_owner_id(db: Session) -> int:
+    admin = _admin(db)
+    return int(admin.id) if admin else 1
+
+
+def _early_launch_store(db: Session) -> tuple[int, dict]:
+    """Persisted early-launch ledger: seed + unique offer claims."""
+    owner_id = _early_launch_owner_id(db)
+    data = _feature(db, owner_id, "early-launch")
+    if not data:
+        data = {
+            "total": int(EARLY_LAUNCH_SEED["total"]),
+            "seedClaimed": int(EARLY_LAUNCH_SEED["claimed"]),
+            "seedClaimedThisWeek": int(EARLY_LAUNCH_SEED["claimedThisWeek"]),
+            "claims": [],
+        }
+        _save_feature(db, owner_id, "early-launch", "Early launch counter", data)
+    data.setdefault("total", int(EARLY_LAUNCH_SEED["total"]))
+    data.setdefault("seedClaimed", int(EARLY_LAUNCH_SEED["claimed"]))
+    data.setdefault("seedClaimedThisWeek", int(EARLY_LAUNCH_SEED["claimedThisWeek"]))
+    data.setdefault("claims", [])
+    return owner_id, data
+
+
+def _founding_checkout_claims(db: Session) -> list[dict]:
+    """Backfill candidates from billing-checkout rows marked founding."""
     rows = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.kind == "billing-checkout")
-        .order_by(FeatureRecord.id.desc())
+        .order_by(FeatureRecord.id.asc())
         .all()
     )
-    by_user: dict[int, datetime] = {}
+    out: list[dict] = []
+    seen: set[int] = set()
     for row in rows:
         payload = dict(row.payload or {})
-        # Only explicit early-launch founding claims move the counter (Pricing.dc.html).
         if not bool(payload.get("founding")):
             continue
-        at = _parse_iso(payload.get("at")) or (row.created_at if getattr(row, "created_at", None) else None)
-        if at is None:
-            continue
         uid = int(row.customer_id)
-        prev = by_user.get(uid)
-        if prev is None or at > prev:
-            by_user[uid] = at
-    return sorted(by_user.values())
+        if uid in seen:
+            continue
+        at = _parse_iso(payload.get("at")) or getattr(row, "created_at", None) or datetime.utcnow()
+        seen.add(uid)
+        out.append(
+            {
+                "userId": uid,
+                "planId": str(payload.get("planId") or "pro"),
+                "at": at.isoformat() + "Z",
+                "source": "checkout",
+            }
+        )
+    return out
+
+
+def _sync_early_launch_claims(db: Session) -> dict:
+    """Merge founding checkouts into the early-launch ledger (unique by user)."""
+    owner_id, data = _early_launch_store(db)
+    claims = list(data.get("claims") or [])
+    by_user = {int(c.get("userId")): dict(c) for c in claims if c.get("userId") is not None}
+    changed = False
+    for item in _founding_checkout_claims(db):
+        uid = int(item["userId"])
+        if uid not in by_user:
+            by_user[uid] = item
+            changed = True
+        else:
+            prev_at = _parse_iso(by_user[uid].get("at"))
+            next_at = _parse_iso(item.get("at"))
+            if next_at and (prev_at is None or next_at > prev_at):
+                by_user[uid] = {**by_user[uid], **item}
+                changed = True
+    if changed:
+        ordered = sorted(by_user.values(), key=lambda c: _parse_iso(c.get("at")) or datetime.min)
+        data = {**data, "claims": ordered[-500:]}
+        _save_feature(db, owner_id, "early-launch", "Early launch counter", data)
+    return data
+
+
+def _record_early_launch_claim(db: Session, user_id: int, plan_id: str) -> dict:
+    """Record one early-launch offer received (idempotent per user)."""
+    owner_id, data = _early_launch_store(db)
+    claims = list(data.get("claims") or [])
+    uid = int(user_id)
+    if any(int(c.get("userId") or 0) == uid for c in claims):
+        return data
+    claims.append(
+        {
+            "userId": uid,
+            "planId": str(plan_id or "pro"),
+            "at": datetime.utcnow().isoformat() + "Z",
+            "source": "offer",
+        }
+    )
+    data = {**data, "claims": claims[-500:]}
+    _save_feature(db, owner_id, "early-launch", "Early launch counter", data)
+    return data
 
 
 def _early_launch_payload(db: Session) -> dict:
     """Live early-launch counter for Pricing.html / Pricing.dc.html."""
-    total = int(EARLY_LAUNCH_SEED["total"])
-    seed_claimed = int(EARLY_LAUNCH_SEED["claimed"])
-    times = _founding_claim_times(db)
-    live_count = len(times)
-    # Seed = spots already claimed before live tracking. Each founding Pro checkout adds one.
+    data = _sync_early_launch_claims(db)
+    total = max(1, int(data.get("total") or EARLY_LAUNCH_SEED["total"]))
+    seed_claimed = max(0, int(data.get("seedClaimed") or EARLY_LAUNCH_SEED["claimed"]))
+    claims = list(data.get("claims") or [])
+    times: list[datetime] = []
+    for c in claims:
+        at = _parse_iso(c.get("at"))
+        if at:
+            times.append(at)
+    times.sort()
+    live_count = len(claims)
+    # Seed = spots already claimed before tracking. Each founding Pro offer adds one.
+    offers_received = live_count
     claimed = min(total, seed_claimed + live_count)
-    if live_count:
-        week_ago = datetime.utcnow() - timedelta(days=7)
-        claimed_week = sum(1 for t in times if t >= week_ago)
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    live_week = sum(1 for t in times if t >= week_ago)
+    seed_week = int(data.get("seedClaimedThisWeek") or EARLY_LAUNCH_SEED["claimedThisWeek"])
+    # Seed baseline + offers received this week (numbers only grow as claims land).
+    claimed_week = seed_week + live_week
+    if live_count and times:
         last_label = _ago_label(times[-1])
+        last_at = times[-1].isoformat() + "Z"
     else:
-        claimed_week = int(EARLY_LAUNCH_SEED["claimedThisWeek"])
         last_label = str(EARLY_LAUNCH_SEED["lastClaimed"])
+        last_at = None
     left = max(0, total - claimed)
     return {
         "total": total,
         "claimed": claimed,
         "left": left,
+        "offersReceived": offers_received,
         "claimedThisWeek": claimed_week,
         "lastClaimed": last_label,
-        "lastClaimedAt": times[-1].isoformat() + "Z" if times else None,
+        "lastClaimedAt": last_at,
         "spotsHeadline": f"{left} of {total} spots left",
         "claimedLabel": f"{claimed} CLAIMED",
         "totalLabel": f"{total} SPOTS TOTAL",
@@ -351,7 +711,14 @@ def _early_launch_payload(db: Session) -> dict:
         "proLaunchMo": int(EARLY_LAUNCH_SEED["proLaunchMo"]),
         "live": True,
         "liveClaims": live_count,
+        "seedClaimed": seed_claimed,
     }
+
+
+@router.get("/early-launch")
+def early_launch(db: Session = Depends(get_db)):
+    """Lightweight live counter for the Pricing early-launch panel."""
+    return {"ok": True, "live": True, **_early_launch_payload(db)}
 
 
 @router.get("/catalog")
@@ -413,7 +780,6 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
     status = "trial" if trial_days else "active"
     early = _early_launch_payload(db)
     # Lock early-launch Pro price while spots remain; after that Pro is list price.
-    # Unique per customer via _founding_claim_times (plan switches don't double-count).
     founding = bool(plan.get("founding")) and int(early.get("left") or 0) > 0
     _save_feature(
         db,
@@ -432,6 +798,8 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
             "at": datetime.utcnow().isoformat() + "Z",
         },
     )
+    if founding:
+        _record_early_launch_claim(db, user.id, plan["id"])
     from app.routers.partners import referral_plan
 
     referral_plan(db, user, canonical)  # a referred customer's plan shows on the partner's row
