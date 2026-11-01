@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy.orm import Session
@@ -575,6 +576,136 @@ def _collect_backlinks(items: list, *, prefer: dict[str, dict] | None = None) ->
     return best
 
 
+BACKLINKS_QUALITY = 3
+
+
+def _soft_call(path: str, payload: list, *, default: list | None = None) -> tuple[list, float]:
+    """Same as _call, but returns empty on provider/task failure so one enrichment never blanks the page."""
+    try:
+        return _call("POST", path, payload)
+    except ResearchError:
+        return list(default or []), 0.0
+
+
+def _map_anchor_rows(items: list) -> list[dict]:
+    rows = []
+    for item in items or []:
+        text = " ".join(str(item.get("anchor") or "").split())
+        if not text:
+            continue
+        rows.append({
+            "anchor": text[:160],
+            "backlinks": int(item.get("backlinks") or 0),
+            "referringDomains": int(item.get("referring_domains") or 0),
+            "dofollow": int(item.get("dofollow") or 0),
+            "nofollow": int(item.get("nofollow") or 0),
+        })
+        if len(rows) >= 12:
+            break
+    return rows
+
+
+def _map_referring_domain_rows(items: list) -> list[dict]:
+    rows = []
+    for item in items or []:
+        domain = str(item.get("domain") or item.get("domain_from") or "").removeprefix("www.")
+        if not domain:
+            continue
+        rows.append({
+            "domain": domain,
+            "backlinks": int(item.get("backlinks") or 0),
+            "rank": item.get("rank") if item.get("rank") is not None else item.get("domain_from_rank"),
+            "dofollow": int(item.get("dofollow") or 0),
+            "nofollow": int(item.get("nofollow") or 0),
+            "firstSeen": str(item.get("first_seen") or "")[:10] or None,
+        })
+        if len(rows) >= 12:
+            break
+    return rows
+
+
+def _map_linked_page_rows(items: list, host: str) -> list[dict]:
+    rows = []
+    for item in items or []:
+        page = str(item.get("page") or item.get("url") or "").strip()
+        if not page:
+            continue
+        try:
+            path = page if page.startswith("/") else urlparse(page).path or "/"
+        except Exception:
+            path = page
+        rows.append({
+            "page": path or "/",
+            "url": page if page.startswith("http") else f"https://{host}{path}",
+            "backlinks": int(item.get("backlinks") or item.get("referring_links") or 0),
+            "referringDomains": int(item.get("referring_domains") or 0),
+        })
+        if len(rows) >= 12:
+            break
+    return rows
+
+
+def _map_timeseries(items: list) -> list[dict]:
+    rows = []
+    for item in items or []:
+        rows.append({
+            "date": str(item.get("date") or item.get("month") or "")[:10],
+            "total": int(item.get("referring_domains") or item.get("referring_main_domains") or 0),
+            "domains": int(item.get("referring_domains") or 0),
+            "backlinks": int(item.get("backlinks") or 0),
+            "new": int(item.get("new_referring_domains") or item.get("new_backlinks") or 0),
+            "lost": int(item.get("lost_referring_domains") or item.get("lost_backlinks") or 0),
+        })
+    return rows[-12:]
+
+
+def _keyword_destinations(db: Session, user: User, host: str, linked_paths: set[str]) -> list[dict]:
+    """Best ranked keywords whose landing pages still need more outside links."""
+    stored = _stored_keywords(db, user.id, host) or {}
+    ranked = [row for row in (stored.get("ranked") or []) if isinstance(row, dict)]
+    ideas = [row for row in (stored.get("ideas") or []) if isinstance(row, dict)]
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(row: dict, *, kind: str) -> None:
+        kw = " ".join(str(row.get("keyword") or row.get("term") or "").split())
+        if not kw or kw.lower() in seen:
+            return
+        page = str(row.get("url") or row.get("page") or row.get("path") or "").strip()
+        path = "/"
+        if page:
+            try:
+                path = page if page.startswith("/") else urlparse(page).path or "/"
+            except Exception:
+                path = page if page.startswith("/") else "/"
+        links_here = path in linked_paths
+        out.append({
+            "keyword": kw[:80],
+            "page": path,
+            "position": row.get("position") or row.get("rank"),
+            "volume": row.get("volume") or row.get("searchVolume"),
+            "kind": kind,
+            "needLinks": not links_here,
+            "why": (
+                f"You already rank for “{kw}” around position {row.get('position') or row.get('rank') or '—'}."
+                if kind == "ranked"
+                else f"Suggested destination keyword for {path}."
+            ),
+        })
+        seen.add(kw.lower())
+
+    for row in sorted(ranked, key=lambda r: (r.get("position") if isinstance(r.get("position"), int) else 10**6, -(r.get("volume") or 0)))[:40]:
+        add(row, kind="ranked")
+        if len(out) >= 8:
+            break
+    if len(out) < 8:
+        for row in ideas[:12]:
+            add(row, kind="idea")
+            if len(out) >= 8:
+                break
+    return out
+
+
 def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored_only: bool = False) -> dict:
     host = host_of(site)
     if not host:
@@ -592,10 +723,10 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
             return _with_link_concepts(dict(row.payload), cached=True)
         return {"host": host, "state": "none", "cached": True, "concepts": [], "conceptNote": "No referring domains are stored yet. Refresh live backlink data."}
     saved = None if force else cached(db, user.id, "dfs-backlinks", title, WINDOWS["backlinks"])
-    if saved and saved.get("qualityVersion") == 2:
+    if saved and saved.get("qualityVersion") == BACKLINKS_QUALITY:
         return _with_link_concepts(saved, cached=True)
     quotas.check(db, user, "backlinks")
-    _budget(db, user, 3)
+    _budget(db, user, 7)
     cost = 0.0
     summary_res, c = _call(
         "POST",
@@ -622,23 +753,47 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     except ResearchError:
         live_res, c = _call("POST", "/backlinks/backlinks/live", [live_base])
     cost += c
-    try:
-        lost_res, c = _call(
-            "POST",
-            "/backlinks/backlinks/live",
-            [{
-                "target": host,
-                "mode": "one_per_domain",
-                "backlinks_status_type": "lost",
-                "limit": 50,
-                "include_subdomains": True,
-                "exclude_internal_backlinks": True,
-                "order_by": ["domain_from_rank,desc", "rank,desc"],
-            }],
-        )
-    except ResearchError:
-        lost_res, c = [], 0.0
+    lost_res, c = _soft_call(
+        "/backlinks/backlinks/live",
+        [{
+            "target": host,
+            "mode": "one_per_domain",
+            "backlinks_status_type": "lost",
+            "limit": 50,
+            "include_subdomains": True,
+            "exclude_internal_backlinks": True,
+            "order_by": ["domain_from_rank,desc", "rank,desc"],
+        }],
+    )
     cost += c
+    anchors_res, c = _soft_call(
+        "/backlinks/anchors/live",
+        [{"target": host, "limit": 20, "order_by": ["backlinks,desc"], "exclude_internal_backlinks": True}],
+    )
+    cost += c
+    referring_res, c = _soft_call(
+        "/backlinks/referring_domains/live",
+        [{"target": host, "limit": 20, "order_by": ["rank,desc"], "exclude_internal_backlinks": True}],
+    )
+    cost += c
+    pages_res, c = _soft_call(
+        "/backlinks/domain_pages_summary/live",
+        [{"target": host, "limit": 20, "order_by": ["backlinks,desc"]}],
+    )
+    cost += c
+    # Prefer new/lost timeseries when available; fall back to monthly summary.
+    series_res, c = _soft_call(
+        "/backlinks/new_and_lost_timeseries/live",
+        [{"target": host, "group_range": "month", "include_subdomains": True}],
+    )
+    cost += c
+    if not series_res:
+        series_res, c = _soft_call(
+            "/backlinks/timeseries_summary/live",
+            [{"target": host, "group_range": "month", "include_subdomains": True}],
+        )
+        cost += c
+
     live_page = (live_res or [{}])[0] or {}
     lost_page = (lost_res or [{}])[0] or {}
     merged = _collect_backlinks(live_page.get("items") or [])
@@ -647,7 +802,43 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     for row in sorted(merged.values(), key=lambda r: _link_quality(r["_raw"])):
         row.pop("_raw", None)
         links.append(row)
-    _spend(db, user, 3, cost)
+
+    top_anchors = _map_anchor_rows(((anchors_res or [{}])[0] or {}).get("items") or [])
+    top_linking_sites = _map_referring_domain_rows(((referring_res or [{}])[0] or {}).get("items") or [])
+    if not top_linking_sites:
+        # Fall back to the live link list when referring_domains endpoint is unavailable.
+        top_linking_sites = [
+            {
+                "domain": link.get("domain"),
+                "backlinks": 1,
+                "rank": link.get("domainRank") or link.get("rank"),
+                "dofollow": 1 if link.get("follow") == "Follow" else 0,
+                "nofollow": 0 if link.get("follow") == "Follow" else 1,
+                "firstSeen": link.get("firstSeen"),
+            }
+            for link in links[:12]
+            if link.get("domain")
+        ]
+    top_linked_pages = _map_linked_page_rows(((pages_res or [{}])[0] or {}).get("items") or [], host)
+    if not top_linked_pages:
+        counts: dict[str, int] = {}
+        for link in links:
+            path = "/"
+            target = str(link.get("target") or "")
+            try:
+                path = urlparse(target).path or "/"
+            except Exception:
+                path = "/"
+            counts[path] = counts.get(path, 0) + 1
+        top_linked_pages = [
+            {"page": path, "url": f"https://{host}{path}", "backlinks": n, "referringDomains": n}
+            for path, n in sorted(counts.items(), key=lambda kv: -kv[1])[:12]
+        ]
+    history = _map_timeseries(((series_res or [{}])[0] or {}).get("items") or series_res or [])
+    linked_paths = {str(p.get("page") or "/") for p in top_linked_pages}
+    keyword_destinations = _keyword_destinations(db, user, host, linked_paths)
+
+    _spend(db, user, 7, cost)
     quotas.consume(db, user, "backlinks")
     payload = {
         "host": host,
@@ -659,18 +850,27 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
             "brokenBacklinks": s.get("broken_backlinks"),
             "rank": s.get("rank"),
             "rankScale": "DataForSEO domain rank, 0 to 1000 (not Google PageRank)",
-            "counts": "Live referring-domain counts from the DataForSEO backlinks index",
+            "counts": "Live referring-domain counts from the DataForSEO backlinks index (external links only)",
+            "history": history,
         },
         "links": links,
+        "overview": {
+            "externalBacklinks": int(s.get("backlinks") or 0),
+            "externalReferringDomains": int(s.get("referring_domains") or 0),
+            "topLinkedPages": top_linked_pages,
+            "topLinkingSites": top_linking_sites,
+            "topLinkingText": top_anchors,
+        },
+        "keywordDestinations": keyword_destinations,
         "linksNote": (
-            "Best live link per referring domain first (strongest domain rank, dofollow preferred, spam score under 60). "
-            "Lost links are listed separately for review. Spam score is a provider signal requiring review, not a definitive spam judgment. "
-            "Anchor text alone does not prove relevance or authority."
+            "External backlinks from Searchify SEO (DataForSEO). Best live link per referring domain first "
+            "(strongest domain rank, dofollow preferred, spam score under 60). Lost links are listed for review. "
+            "Search Console “Links” is a separate Google view — internal links there are your own site links, not backlinks."
         ),
         "linksShown": len(links),
         "referringDomainsListed": live_page.get("total_count"),
         "lostDomainsListed": lost_page.get("total_count"),
-        "qualityVersion": 2,
+        "qualityVersion": BACKLINKS_QUALITY,
         "market": {"scope": "domain", "countryFilter": False, "note": "Backlink counts are domain-wide, not filtered by the SEO target country."},
         "provider": "dataforseo",
         "dataKind": "backlinks",
