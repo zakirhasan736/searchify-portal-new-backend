@@ -244,13 +244,33 @@ def read_page(client: httpx.Client, url: str) -> dict:
         reader.feed(response.text[:600_000])
     except Exception:  # noqa: BLE001
         pass
+    html_slice = response.text[:600_000]
     text = " ".join(reader.text)
     try:
         from app.audit_checks import analyze_html
 
-        audit = analyze_html(response.text[:600_000], final, text)
+        audit = analyze_html(html_slice, final, text)
     except Exception:  # noqa: BLE001 - audit facts are extra; never fail the page read
         audit = None
+    lower_html = html_slice.lower()
+    script_count = lower_html.count("<script")
+    img_count = lower_html.count("<img")
+    img_sized = len(re.findall(r"<img[^>]*(?:width=|height=)", lower_html[:250_000], flags=re.I))
+    img_lazy = len(re.findall(r"<img[^>]*loading=['\"]lazy['\"]", lower_html[:250_000], flags=re.I))
+    img_srcset = lower_html[:250_000].count("srcset=")
+    render_hints = {
+        "nextData": "__NEXT_DATA__" in html_slice,
+        "nextRoot": 'id="__next"' in lower_html or "id='__next'" in lower_html,
+        "reactRoot": "data-reactroot" in lower_html or "data-react-helmet" in lower_html,
+        "vue": "data-v-" in lower_html[:80_000],
+        "angular": "ng-version" in lower_html,
+        "scriptTags": script_count,
+        "imgTags": img_count,
+        "imgSized": img_sized,
+        "imgLazy": img_lazy,
+        "imgSrcset": img_srcset,
+        "bytes": len(html_slice.encode("utf-8", errors="ignore")),
+    }
     title = " ".join(reader.title)[:200]
     description = (reader.description or reader.og_description).strip()[:400]
     schema = summarize_json_ld(reader.json_ld)
@@ -274,6 +294,7 @@ def read_page(client: httpx.Client, url: str) -> dict:
         "headings": reader.headings[:14],
         "text": text[:4000],
         "words": len(text.split()),
+        "renderHints": render_hints,
         "canonical": canonical,
         "canonicalElsewhere": bool(canonical) and page_key(canonical) != page_key(final),
         "noindex": reader.noindex,
@@ -684,6 +705,304 @@ def _preview_platform(pages: list) -> str:
     if "squarespace" in blob:
         return "Squarespace"
     return ""
+
+
+def _topic_from_audit_title(title: str) -> str:
+    label_l = str(title or "").lower()
+    if "title" in label_l and "contentful" not in label_l:
+        return "title"
+    if "description" in label_l:
+        return "description"
+    if "heading" in label_l or "h1" in label_l:
+        return "heading"
+    if any(k in label_l for k in ("image", "img", "webp", "avif", "offscreen", "responsive image", "srcset")):
+        return "image"
+    if any(k in label_l for k in ("server response", "ttfb", "time to first byte", "document request")):
+        return "ssr"
+    if any(k in label_l for k in ("render-blocking", "render blocking", "critical request")):
+        return "ssr"
+    if "css" in label_l or "stylesheet" in label_l:
+        return "css"
+    if any(k in label_l for k in ("javascript", "boot-up", "bootup", "main-thread", "main thread", "js ")):
+        return "csr" if any(k in label_l for k in ("unused javascript", "boot", "main-thread", "main thread")) else "javascript"
+    if "lcp" in label_l or "largest contentful" in label_l:
+        return "lcp"
+    if "cls" in label_l or "layout shift" in label_l:
+        return "cls"
+    return "speed"
+
+
+def _preview_rendering(pages: list, pagespeed: dict | None = None) -> dict:
+    """Detect SSR vs CSR delivery and server-side fixes for images / loading speed."""
+    home = pages[0] if pages else {}
+    hints = home.get("renderHints") if isinstance(home.get("renderHints"), dict) else {}
+    words = int(home.get("words") or 0)
+    scripts = int(hints.get("scriptTags") or 0)
+    imgs = int(hints.get("imgTags") or 0)
+    sized = int(hints.get("imgSized") or 0)
+    lazy = int(hints.get("imgLazy") or 0)
+    srcset = int(hints.get("imgSrcset") or 0)
+    spa = bool(
+        hints.get("nextData")
+        or hints.get("nextRoot")
+        or hints.get("reactRoot")
+        or hints.get("vue")
+        or hints.get("angular")
+    )
+    # Thin initial HTML + lots of scripts ⇒ content likely waits on client JS (CSR).
+    csr_heavy = bool(spa and words < 80 and scripts >= 8) or (words < 40 and scripts >= 12)
+    ssr_like = words >= 120 and (not spa or hints.get("nextData"))
+    if csr_heavy:
+        mode = "csr"
+        mode_label = "Client-side rendered (CSR)"
+        mode_note = "Most of the readable copy arrives after JavaScript runs in the browser."
+    elif hints.get("nextData") or ssr_like:
+        mode = "ssr"
+        mode_label = "Server-side rendered (SSR)"
+        mode_note = "HTML for this page is largely ready from the server — keep images and LCP work on the server path too."
+    elif spa:
+        mode = "hybrid"
+        mode_label = "Hybrid / app shell"
+        mode_note = "An app framework is present; some content may still wait on client JavaScript."
+    else:
+        mode = "ssr"
+        mode_label = "Server HTML"
+        mode_note = "Page copy is present in the initial HTML response."
+
+    issues: list[dict] = []
+    solutions: list[dict] = []
+
+    def push_issue(topic: str, color: str, label: str, detail: str) -> None:
+        issues.append(
+            {
+                "topic": topic,
+                "color": color,
+                "path": "/",
+                "label": label,
+                "detail": detail,
+                "title": "",
+                "source": "render",
+            }
+        )
+
+    def push_solution(topic: str, label: str, detail: str) -> None:
+        solutions.append({"topic": topic, "label": label, "detail": detail, "kind": "ssr"})
+
+    if csr_heavy:
+        push_issue(
+            "csr",
+            "red",
+            "Important content waits on client-side JavaScript",
+            "Google and visitors see a thin shell first. Ship the main copy and hero with SSR/SSG so text and images arrive in the first HTML.",
+        )
+        push_solution(
+            "ssr",
+            "Render the homepage on the server (SSR/SSG)",
+            "Serve title, headings, and above-the-fold copy in the first HTML response instead of waiting for CSR hydration.",
+        )
+        push_solution(
+            "image",
+            "SSR the hero image with width, height, and modern formats",
+            "Preload the LCP image from the server HTML (WebP/AVIF, srcset, explicit dimensions) so loading speed does not wait on client JS.",
+        )
+
+    if imgs and sized < max(1, imgs // 2):
+        push_issue(
+            "image",
+            "yellow",
+            "Images missing width/height in the HTML",
+            f"{imgs - sized} of {imgs} images on the home HTML lack size attributes — this often hurts CLS and LCP.",
+        )
+        push_solution(
+            "ssr",
+            "Set image dimensions in server-rendered HTML",
+            "Add width/height (or aspect-ratio) on SSR markup so the browser reserves space before CSS/JS load.",
+        )
+
+    if imgs and srcset == 0:
+        push_issue(
+            "image",
+            "yellow",
+            "No responsive image srcset in the initial HTML",
+            "The server HTML does not advertise multiple image sizes. Mobile may download a desktop hero.",
+        )
+        push_solution(
+            "ssr",
+            "Emit responsive images from the server",
+            "SSR srcset/sizes (and modern formats) so loading speed is decided on the server, not after CSR.",
+        )
+
+    if imgs and lazy == 0 and imgs >= 4:
+        push_solution(
+            "image",
+            "Lazy-load below-the-fold images in SSR markup",
+            "Keep the LCP/hero eager in server HTML; mark the rest loading=\"lazy\" so first paint stays fast.",
+        )
+
+    vitals = (pagespeed or {}).get("vitals") or {}
+    ratings = (pagespeed or {}).get("ratings") or {}
+    ttfb = str(vitals.get("ttfb") or "")
+    if str(ratings.get("lcp") or "").lower() in {"poor", "needs improvement"}:
+        push_solution(
+            "ssr",
+            "Fix LCP on the server path",
+            f"LCP is {vitals.get('lcp') or 'slow'}. Prioritize SSR for the LCP element (usually the hero image or H1 block) and shrink server TTFB.",
+        )
+    if ttfb and ttfb not in {"—", "-", ""}:
+        # Heuristic: if TTFB display looks like multi-second, flag SSR hosting.
+        push_solution(
+            "ssr",
+            "Improve server response time (TTFB)",
+            f"PageSpeed reports TTFB {ttfb}. Cache SSR HTML at the edge and compress images on the server before they reach the browser.",
+        )
+
+    # Fold PageSpeed issues that already map to CSR/SSR/image.
+    for row in (pagespeed or {}).get("issues") or []:
+        topic = str(row.get("topic") or "")
+        if topic in {"csr", "ssr", "image"} and not any(i["label"] == row.get("label") for i in issues):
+            issues.append({**row, "source": row.get("source") or "pagespeed"})
+
+    return {
+        "mode": mode,
+        "modeLabel": mode_label,
+        "modeNote": mode_note,
+        "csrHeavy": csr_heavy,
+        "spaSignals": {
+            "next": bool(hints.get("nextData") or hints.get("nextRoot")),
+            "react": bool(hints.get("reactRoot")),
+            "vue": bool(hints.get("vue")),
+            "angular": bool(hints.get("angular")),
+        },
+        "stats": {
+            "words": words,
+            "scripts": scripts,
+            "images": imgs,
+            "imagesSized": sized,
+            "imagesLazy": lazy,
+            "imagesSrcset": srcset,
+        },
+        "issues": issues[:8],
+        "solutions": solutions[:6],
+    }
+
+
+def _preview_pagespeed(home: str) -> dict:
+    """Optional PageSpeed Insights pass for the public free analysis (LCP/CLS/title/CSS/JS/SSR)."""
+    try:
+        from app import config
+        from app.google_oauth import run_pagespeed
+    except Exception:  # noqa: BLE001
+        return {}
+    if not getattr(config, "GOOGLE_PAGESPEED_API_KEY", ""):
+        return {}
+    try:
+        mobile = run_pagespeed(home, "mobile")
+    except Exception:  # noqa: BLE001
+        return {}
+
+    vitals = mobile.get("vitals") or {}
+    ratings = mobile.get("vitalRatings") or {}
+    scores = mobile.get("scores") or {}
+    issues: list[dict] = []
+
+    def push(topic: str, color: str, label: str, detail: str) -> None:
+        issues.append(
+            {
+                "topic": topic,
+                "color": color,
+                "path": "/",
+                "label": label,
+                "detail": detail,
+                "title": "",
+                "source": "pagespeed",
+            }
+        )
+
+    # Core Web Vitals
+    for key, topic, human in (
+        ("LCP", "lcp", "Largest Contentful Paint"),
+        ("CLS", "cls", "Cumulative Layout Shift"),
+        ("INP", "inp", "Interaction to Next Paint"),
+    ):
+        rating = str(ratings.get(key) or "").lower()
+        value = vitals.get(key) or "—"
+        if rating == "poor":
+            push(topic, "red", f"{human} is poor ({value})", f"Google PageSpeed marks {human} as poor on mobile.")
+        elif rating == "needs improvement":
+            push(
+                topic,
+                "yellow",
+                f"{human} needs work ({value})",
+                f"Google PageSpeed marks {human} as needs improvement on mobile.",
+            )
+
+    # Prefer failing SEO + performance audits from the structured rows.
+    for row in (mobile.get("seoAudits") or []) + (mobile.get("perfAudits") or []):
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        title = str(row[0] or "")
+        status = str(row[1] or "")
+        value = str(row[2] or "") if len(row) > 2 else ""
+        detail = str(row[4] or "") if len(row) > 4 else ""
+        if status not in {"Fail", "Average"}:
+            continue
+        topic = _topic_from_audit_title(title)
+        color = "red" if status == "Fail" else "yellow"
+        push(topic, color, title, (detail or value or f"PageSpeed status: {status}")[:220])
+        if len(issues) >= 14:
+            break
+
+    # Opportunities often cover unused CSS/JS / images even when score rows are sparse.
+    for row in mobile.get("opportunities") or []:
+        if not isinstance(row, (list, tuple)) or not row:
+            continue
+        title = str(row[0] or "")
+        lower = title.lower()
+        topic = _topic_from_audit_title(title)
+        if "unused css" in lower:
+            push("css", "yellow", title, str(row[1] or row[2] or "Reduce unused CSS.")[:220])
+        elif "unused javascript" in lower or "unused js" in lower:
+            push("csr", "yellow", title, str(row[1] or row[2] or "Reduce unused client JavaScript (CSR weight).")[:220])
+        elif topic in {"image", "ssr", "lcp", "csr"}:
+            push(topic, "yellow", title, str(row[1] or row[2] or "")[:220])
+        elif "largest contentful paint" in lower:
+            push("lcp", "yellow", title, str(row[1] or row[2] or "")[:220])
+        if len(issues) >= 18:
+            break
+
+    # Deduplicate by label
+    seen: set[str] = set()
+    unique: list[dict] = []
+    for item in issues:
+        key = str(item.get("label") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    return {
+        "source": "google_pagespeed",
+        "strategy": "mobile",
+        "scores": scores,
+        "vitals": {
+            "lcp": vitals.get("LCP"),
+            "cls": vitals.get("CLS"),
+            "inp": vitals.get("INP"),
+            "fcp": vitals.get("FCP"),
+            "tbt": vitals.get("TBT"),
+            "si": vitals.get("SI"),
+            "ttfb": vitals.get("TTFB"),
+        },
+        "ratings": {
+            "lcp": ratings.get("LCP"),
+            "cls": ratings.get("CLS"),
+            "inp": ratings.get("INP"),
+            "fcp": ratings.get("FCP"),
+        },
+        "issues": unique[:12],
+        "performance": scores.get("performance"),
+        "seo": scores.get("seo"),
+    }
 
 
 def _preview_grade(counts: dict) -> tuple[str, str, str]:
@@ -1360,10 +1679,8 @@ def preview_scan(home: str, limit: int = 40) -> dict:
                 "title": "",
             })
     order = {"red": 0, "yellow": 1, "green": 2}
-    findings.sort(key=lambda item: order.get(item["color"], 9))
     host = crawled.get("host") or host_of(home)
     platform = _preview_platform(pages)
-    grade, gradeColor, gradeNote = _preview_grade(counts)
     brand = (titles[0].split("|")[0].split("-")[0].strip() if titles else host.split(".")[0].replace("-", " "))
     city = _preview_city(pages)
     category = _preview_category(pages, brand)
@@ -1376,6 +1693,27 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         gaps = _preview_gaps_from_site(pages, category, city)
     visits = int(visibility.get("visits") or 0)
     competitors = _preview_competitors(host, places, visits)
+    pagespeed = _preview_pagespeed(crawled.get("home") or home)
+    rendering = _preview_rendering(pages, pagespeed)
+    # Fold PageSpeed + SSR/CSR/image issues into the heatmap + findings.
+    for issue in [*(pagespeed.get("issues") or []), *(rendering.get("issues") or [])]:
+        color = str(issue.get("color") or "yellow")
+        if color in counts:
+            counts[color] = counts.get(color, 0) + 1
+        dots.append({"color": color, "path": str(issue.get("path") or "/"), "topic": issue.get("topic")})
+        findings.append(
+            {
+                "color": color,
+                "path": str(issue.get("path") or "/"),
+                "label": issue.get("label") or "PageSpeed issue",
+                "detail": issue.get("detail") or "",
+                "title": "",
+                "topic": issue.get("topic") or "speed",
+                "source": issue.get("source") or "pagespeed",
+            }
+        )
+    findings.sort(key=lambda item: order.get(item["color"], 9))
+    grade, gradeColor, gradeNote = _preview_grade(counts)
     about = _preview_about(pages, brand, host, findings, category=category, city=city)
     opportunities = _preview_opportunities(pages, brand, category, city, places, findings)
     name_bit = brand.split()[0] if brand else "there"
@@ -1457,7 +1795,10 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "competitors": competitors,
         "visibility": visibility,
         "researchSource": visibility_pack.get("researchSource") or "",
+        "pagespeed": pagespeed or None,
+        "pagespeedSource": pagespeed.get("source") if pagespeed else "",
+        "rendering": rendering or None,
         "deepScan": True,
         "scanLimit": deep,
-        "scanVersion": "free-deep-v2",
+        "scanVersion": "free-deep-v4",
     }
