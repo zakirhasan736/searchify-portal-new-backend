@@ -2,17 +2,31 @@
 
 from __future__ import annotations
 
+import re
+import secrets
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from app import config, mailer
 from app.database import get_db
 from app.models import FeatureRecord, User
-from app.security import get_current_user, hash_password, make_token, user_type, verify_password
+from app.security import (
+    get_current_user,
+    hash_password,
+    make_password_token,
+    make_token,
+    read_password_token,
+    user_type,
+    verify_password,
+)
 
 router = APIRouter(prefix="/api/v1/investors", tags=["investors"])
 
 DEMO_PASSWORD = "Investor-2026"
+SETUP_MINUTES = 72 * 60  # invite link: 3 days
 
 INVESTORS = {
     "nick@petitt.example": {
@@ -125,6 +139,170 @@ class SignInBody(BaseModel):
 
 class MessageBody(BaseModel):
     note: str = Field("", max_length=2000)
+
+
+class SetPasswordBody(BaseModel):
+    token: str = ""
+    password: str = ""
+
+
+class CreateInvestorBody(BaseModel):
+    email: str = ""
+    displayName: str = ""
+    firstName: str = ""
+    pct: float | None = None  # 0–1 ownership fraction for the portal stake page
+    shares: str = ""
+    where: str = ""
+    taxNote: str = ""
+
+
+def _unique_username(db: Session, email: str, display_name: str) -> str:
+    base = re.sub(r"[^a-z0-9]", "", (display_name or email.split("@")[0]).lower())[:28] or "investor"
+    username, n = base, 1
+    while db.query(User).filter(User.username == username).first() is not None:
+        n += 1
+        username = f"{base}{n}"[:40]
+    return username
+
+
+def _setup_url(user: User) -> str:
+    return f"{config.PUBLIC_SITE_URL}/investors/login?setup={make_password_token(user, 'setup', SETUP_MINUTES)}"
+
+
+def list_portal_investors(db: Session) -> list[dict]:
+    ensure_investor_accounts(db)
+    rows = []
+    for user in db.query(User).filter(User.role == "ROLE_INVESTOR").order_by(User.id).all():
+        profile = _profile_for(db, user)
+        rows.append(
+            {
+                "id": f"u{user.id}",
+                "userId": user.id,
+                "email": user.email,
+                "displayName": profile.get("displayName") or user.username,
+                "pctLabel": profile.get("pctLabel") or "",
+                "where": profile.get("where") or "",
+                "invitedAt": profile.get("invitedAt") or None,
+            }
+        )
+    return rows
+
+
+def create_investor_account(db: Session, body: CreateInvestorBody) -> dict:
+    """Owner (HQ) creates an invite-only investor login and emails a set-password link."""
+    email = (body.email or "").strip().lower()
+    name = " ".join((body.displayName or "").split())[:80]
+    if not email or "@" not in email:
+        raise HTTPException(400, "Enter a real email address.")
+    if not name:
+        raise HTTPException(400, "Enter the investor’s full name.")
+    existing = db.query(User).filter(User.email == email).one_or_none()
+    if existing is not None and existing.role != "ROLE_INVESTOR":
+        raise HTTPException(409, "That email already has a customer, partner, or admin account.")
+    if existing is not None:
+        user = existing
+    else:
+        user = User(
+            username=_unique_username(db, email, name),
+            email=email,
+            # Unusable until the investor sets a password from the emailed link.
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            role="ROLE_INVESTOR",
+            plan="investor",
+            site_limit=0,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+    first = " ".join((body.firstName or name.split()[0]).split())[:40] or "there"
+    pct = body.pct
+    if pct is not None:
+        try:
+            pct = float(pct)
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Ownership must be a number between 0 and 100%.")
+        if not 0 < pct <= 1:
+            raise HTTPException(400, "Ownership must be above 0% and at most 100%.")
+    shares = " ".join((body.shares or "").split())[:40]
+    where = " ".join((body.where or "").split())[:40]
+    tax_note = " ".join((body.taxNote or "").split())[:160]
+    profile = {
+        **(_feature(db, user.id, "investor-profile") or {}),
+        "email": email,
+        "displayName": name,
+        "firstName": first,
+        "letterName": first,
+        "greeting": f"Hey {first},",
+        "handle": user.username,
+        "where": where,
+        "taxNote": tax_note,
+        "shares": shares,
+        "invitedAt": datetime.utcnow().isoformat() + "Z",
+        "invitedBy": "hq",
+    }
+    if pct is not None:
+        profile["pct"] = round(pct, 6)
+        profile["pctLabel"] = f"{round(pct * 10000) / 100:g}%"
+        if shares:
+            profile["sharesNote"] = (
+                f"Your stake is {shares} Class A shares in Aequitas Marketing Corp. "
+                "Every share has the same vote and the same dividend."
+            )
+    _save_feature(db, user.id, "investor-profile", "Investor profile", profile)
+
+    setup = _setup_url(user)
+    emailed = mailer.send(
+        email,
+        "Your Searchify investor portal invite",
+        f"Hi {first},\n\n"
+        "Aadle created your Searchify investor account. There is no public sign-up — this invite is the only way in.\n\n"
+        f"1. Set your password (link works for 3 days):\n{setup}\n\n"
+        f"2. Then sign in at:\n{config.PUBLIC_SITE_URL}/investors/login\n\n"
+        "If you did not expect this, reply to Aadle and ignore the link.\n",
+    )
+    return {
+        "ok": True,
+        "emailed": emailed,
+        "setupUrl": setup,
+        "investor": {
+            "id": f"u{user.id}",
+            "userId": user.id,
+            "email": email,
+            "displayName": name,
+            "pctLabel": profile.get("pctLabel") or "",
+        },
+        "detail": (
+            "Invite emailed with a set-password link."
+            if emailed
+            else "Account created. Email isn’t set up — copy the set-password link and send it yourself."
+        ),
+    }
+
+
+def resend_investor_invite(db: Session, investor_key: str) -> dict:
+    try:
+        user = db.get(User, int(str(investor_key).lstrip("u")))
+    except (TypeError, ValueError):
+        user = None
+    if user is None or user.role != "ROLE_INVESTOR":
+        raise HTTPException(404, "Investor account not found")
+    profile = _profile_for(db, user)
+    first = profile.get("firstName") or profile.get("letterName") or "there"
+    setup = _setup_url(user)
+    emailed = mailer.send(
+        user.email,
+        "Set your Searchify investor password",
+        f"Hi {first},\n\n"
+        f"Set your investor portal password here (works for 3 days):\n{setup}\n\n"
+        f"Then sign in at {config.PUBLIC_SITE_URL}/investors/login\n",
+    )
+    return {
+        "ok": True,
+        "emailed": emailed,
+        "setupUrl": setup,
+        "detail": "Invite resent." if emailed else "Email isn’t set up — copy the link below.",
+    }
 
 
 def _profile_for(db: Session, user: User) -> dict:
@@ -307,6 +485,27 @@ def signin(body: SignInBody, db: Session = Depends(get_db)):
         "step": "done",
         "token": make_token(user),
         "userType": user_type(user.role),
+        "username": user.username,
+        "displayName": profile.get("displayName"),
+    }
+
+
+@router.post("/set-password")
+def set_password(body: SetPasswordBody, db: Session = Depends(get_db)):
+    """Finish an HQ invite: set the password and sign the investor in."""
+    user = read_password_token(body.token, db)
+    if user is None or user.role != "ROLE_INVESTOR":
+        raise HTTPException(400, "This link has expired or was already used. Ask Aadle for a new one.")
+    if len(body.password or "") < 8:
+        raise HTTPException(400, "Use at least 8 characters.")
+    user.password_hash = hash_password(body.password)
+    db.add(user)
+    db.commit()
+    profile = _profile_for(db, user)
+    return {
+        "ok": True,
+        "token": make_token(user),
+        "userType": "investor",
         "username": user.username,
         "displayName": profile.get("displayName"),
     }

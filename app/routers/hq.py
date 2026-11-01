@@ -1105,7 +1105,65 @@ def get_shareholders(db: Session = Depends(get_db), user: User = Depends(get_cur
         data["state"] = {**data["state"], **stored}
         if stored.get("holders"):
             data["holders"] = stored["holders"]
+    from app.routers.investors import list_portal_investors
+
+    data["portalInvestors"] = list_portal_investors(db)
     return {"ok": True, "live": True, **data}
+
+
+class CreateInvestorHqBody(BaseModel):
+    email: str = ""
+    displayName: str = ""
+    firstName: str = ""
+    pctPercent: float | None = None  # 0–100 from the HQ form
+    shares: str = ""
+    where: str = ""
+    taxNote: str = ""
+
+
+@router.get("/investors")
+def get_investors(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app.routers.investors import list_portal_investors
+
+    return {"ok": True, "live": True, "portalInvestors": list_portal_investors(db)}
+
+
+@router.post("/investors")
+def create_investor(body: CreateInvestorHqBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Aadle/HQ creates an invite-only investor login and emails the set-password link."""
+    _require_admin(user)
+    from app.routers.investors import CreateInvestorBody, create_investor_account, list_portal_investors
+
+    pct = None
+    if body.pctPercent is not None:
+        try:
+            pct = float(body.pctPercent) / 100.0
+        except (TypeError, ValueError):
+            raise HTTPException(400, "Ownership % must be a number.")
+    result = create_investor_account(
+        db,
+        CreateInvestorBody(
+            email=body.email,
+            displayName=body.displayName,
+            firstName=body.firstName,
+            pct=pct,
+            shares=body.shares,
+            where=body.where,
+            taxNote=body.taxNote,
+        ),
+    )
+    result["portalInvestors"] = list_portal_investors(db)
+    return result
+
+
+@router.post("/investors/{investor_key}/invite")
+def resend_investor_invite_hq(investor_key: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Resend the set-password link when the investor lost the email or the link expired."""
+    _require_admin(user)
+    from app.routers.investors import resend_investor_invite
+
+    return resend_investor_invite(db, investor_key)
 
 
 @router.put("/shareholders")
