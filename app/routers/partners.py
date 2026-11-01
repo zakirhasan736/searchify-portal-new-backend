@@ -8,7 +8,7 @@ import secrets
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field  # noqa: F401 — Field used by request bodies
 from sqlalchemy.orm import Session
 
 from app import config, mailer
@@ -116,6 +116,18 @@ class ApplyBody(BaseModel):
     channel: str = ""
     country: str = "United States"
     agreed: bool = False
+    role: str = ""
+    platforms: list[str] = Field(default_factory=list)
+    audience: list[str] = Field(default_factory=list)
+    reach: str = ""
+    website: str = ""
+    note: str = ""
+
+
+class AgreementBody(BaseModel):
+    signedName: str = Field(min_length=2, max_length=120)
+    acceptedRules: bool = False
+    acceptedTerms: bool = False
 
 
 class PayoutBody(BaseModel):
@@ -400,6 +412,11 @@ def apply(body: ApplyBody, db: Session = Depends(get_db)):
     rows = list(apps.get("rows") or [])
     if any(str(r.get("email") or "").lower() == email and r.get("status") == "pending" for r in rows):
         return {"ok": True, "detail": "Application sent. We reply within 2 business days with your partner link."}
+    channel = (body.channel or "").strip()
+    if not channel and body.platforms:
+        channel = ", ".join(str(p).strip() for p in body.platforms if str(p).strip())[:200]
+    if not channel and body.website.strip():
+        channel = body.website.strip()[:200]
     rows.insert(
         0,
         {
@@ -407,8 +424,14 @@ def apply(body: ApplyBody, db: Session = Depends(get_db)):
             "id": f"app-{secrets.token_hex(6)}",
             "name": name,
             "email": email,
-            "channel": body.channel.strip(),
+            "channel": channel,
             "country": body.country.strip() or "United States",
+            "role": (body.role or "").strip()[:80],
+            "platforms": [str(p).strip()[:60] for p in (body.platforms or []) if str(p).strip()][:12],
+            "audience": [str(a).strip()[:60] for a in (body.audience or []) if str(a).strip()][:12],
+            "reach": (body.reach or "").strip()[:40],
+            "website": (body.website or "").strip()[:300],
+            "note": (body.note or "").strip()[:500],
             "status": "pending",
             "at": datetime.utcnow().isoformat() + "Z",
         },
@@ -668,8 +691,15 @@ def approve_application(db: Session, owner_id: int, app_id: str, *, rate: float 
             "qualified": 0,
             "country": row.get("country") or "",
             "channel": row.get("channel") or "",
+            "needsAgreement": True,
         })
         _save_feature(db, user.id, "partner-ledger", "Partner ledger", _empty_ledger())
+    else:
+        # Re-approval of an existing partner still needs first-sign agreement if never signed.
+        existing = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
+        if not existing.get("agreementSignedAt"):
+            existing["needsAgreement"] = True
+            _save_feature(db, user.id, "partner-profile", "Partner profile", existing)
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
     setup = f"{config.PUBLIC_SITE_URL}/partners/login?setup={make_password_token(user, 'setup', SETUP_MINUTES)}"
     link = f"{config.PUBLIC_SITE_URL}/?ref={profile['handle']}"
@@ -713,6 +743,8 @@ def me(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_partner(user)
     profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
     payout = _feature(db, user.id, "partner-payout")
+    signed = bool(profile.get("agreementSignedAt"))
+    needs = bool(profile.get("needsAgreement")) and not signed
     return {
         "id": user.id,
         "username": user.username,
@@ -721,6 +753,32 @@ def me(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
         "payout": payout,
         "tier": profile.get("tier") or "standard",
         "program": program_status(profile),
+        "agreementSigned": signed,
+        "needsAgreement": needs,
+        "referralLink": f"{config.PUBLIC_SITE_URL}/?ref={profile.get('handle') or user.username}",
+    }
+
+
+@router.post("/agreement")
+def sign_agreement(body: AgreementBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """First sign-in: accept the rules and sign the affiliate agreement."""
+    _require_partner(user)
+    if not body.acceptedRules or not body.acceptedTerms:
+        raise HTTPException(400, "Accept the rules and the agreement to continue.")
+    name = (body.signedName or "").strip()
+    if len(name) < 2:
+        raise HTTPException(400, "Type your full name to sign.")
+    profile = {**_default_profile(user), **_feature(db, user.id, "partner-profile")}
+    now = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    profile["agreementSignedAt"] = now
+    profile["agreementSignedName"] = name
+    profile["needsAgreement"] = False
+    _save_feature(db, user.id, "partner-profile", "Partner profile", profile)
+    return {
+        "ok": True,
+        "agreementSigned": True,
+        "referralLink": f"{config.PUBLIC_SITE_URL}/?ref={profile.get('handle') or user.username}",
+        "handle": profile.get("handle") or user.username,
     }
 
 
