@@ -662,6 +662,74 @@ def _preview_tone(page: dict) -> tuple[str, str, str]:
     return "green", "Listing is in place", "A title and description are on the page."
 
 
+def _preview_platform(pages: list) -> str:
+    blob = " ".join(
+        f"{p.get('url') or ''} {p.get('html') or ''} {p.get('generator') or ''}" for p in pages
+    ).lower()
+    if "wp-content" in blob or "wp-includes" in blob or "wordpress" in blob or "/wp-json" in blob:
+        return "WordPress"
+    if "cdn.shopify.com" in blob or "shopify" in blob:
+        return "Shopify"
+    if "webflow" in blob:
+        return "Webflow"
+    if "wix.com" in blob or "wixstatic" in blob:
+        return "Wix"
+    return ""
+
+
+def _preview_grade(counts: dict) -> tuple[str, str, str]:
+    """Letter grade from page tones only — never invents keyword ranks."""
+    red = int(counts.get("red") or 0)
+    yellow = int(counts.get("yellow") or 0)
+    green = int(counts.get("green") or 0)
+    total = max(1, red + yellow + green)
+    score = (green * 100 + yellow * 55 + red * 15) / total
+    if score >= 90:
+        return "A", "#3DDC84", "strong listing health"
+    if score >= 80:
+        return "B+", "#3DDC84", "mostly healthy"
+    if score >= 70:
+        return "B", "#FFC53D", "good, with gaps"
+    if score >= 55:
+        return "C+", "#FFC53D", "fair, with quick wins"
+    if score >= 40:
+        return "C", "#FFC53D", "needs work"
+    return "D", "#FF5A4E", "urgent fixes first"
+
+
+def _preview_places(host: str, brand_hint: str = "") -> list[dict]:
+    """Optional Google Places nearby listings for the brand/host. Empty if key missing."""
+    try:
+        from app import config
+        from app import google_oauth as goauth
+    except Exception:
+        return []
+    if not getattr(config, "GOOGLE_PLACES_API_KEY", ""):
+        return []
+    brand = (brand_hint or host or "").split(".")[0].replace("-", " ").strip()
+    if not brand or len(brand) < 2:
+        return []
+    try:
+        rows = goauth.places_text_search(f"{brand} near me", max_results=6)
+    except Exception:
+        try:
+            rows = goauth.places_text_search(brand, max_results=6)
+        except Exception:
+            return []
+    out = []
+    for row in rows or []:
+        out.append(
+            {
+                "name": row[0] if len(row) > 0 else "",
+                "address": row[1] if len(row) > 1 else "",
+                "rating": row[2] if len(row) > 2 else "—",
+                "reviews": row[3] if len(row) > 3 else "0",
+                "website": row[4] if len(row) > 4 else "",
+            }
+        )
+    return out
+
+
 def preview_scan(home: str, limit: int = 8) -> dict:
     """Free public look: a few live pages, colour-coded. No AI and no paid research."""
     crawled = crawl(home, limit=max(1, min(int(limit or 8), 12)))
@@ -669,27 +737,54 @@ def preview_scan(home: str, limit: int = 8) -> dict:
     findings = []
     dots = []
     counts = {"red": 0, "yellow": 0, "green": 0, "blue": 0}
+    titles = []
     for page in pages:
         color, label, detail = _preview_tone(page)
         counts[color] = counts.get(color, 0) + 1
         path = urlparse(page.get("url") or "").path or "/"
         dots.append({"color": color, "path": path})
+        title = str(page.get("title") or "").strip()
+        if title:
+            titles.append(title)
         if color != "green":
             findings.append({
                 "color": color,
                 "path": path,
                 "label": label,
                 "detail": detail,
-                "title": str(page.get("title") or "").strip(),
+                "title": title,
             })
     order = {"red": 0, "yellow": 1, "green": 2}
     findings.sort(key=lambda item: order.get(item["color"], 9))
+    host = crawled.get("host") or host_of(home)
+    platform = _preview_platform(pages)
+    grade, gradeColor, gradeNote = _preview_grade(counts)
+    brand = (titles[0].split("|")[0].split("-")[0].strip() if titles else host.split(".")[0].replace("-", " "))
+    places = _preview_places(host, brand)
+    missing_desc = sum(1 for f in findings if "description" in (f.get("label") or "").lower())
+    about = (
+        f"We read {len(pages)} page{'s' if len(pages) != 1 else ''} the way Google does. "
+        + (
+            f"Several titles look thin, and {missing_desc} page{'s' if missing_desc != 1 else ''} "
+            f"{'are' if missing_desc != 1 else 'is'} missing a description — Google may invent the snippet."
+            if findings
+            else "Titles and descriptions look in place on the pages we checked."
+        )
+    )
     return {
         "home": crawled.get("home") or home,
-        "host": crawled.get("host") or host_of(home),
+        "host": host,
         "pagesRead": len(pages),
         "counts": counts,
         "dots": dots[:40],
         "findings": findings[:6],
         "error": crawled.get("error") or "",
+        "platform": platform,
+        "grade": grade,
+        "gradeColor": gradeColor,
+        "gradeNote": gradeNote,
+        "brand": brand,
+        "aboutGoogle": about,
+        "places": places,
+        "placesSource": "google_places" if places else "",
     }

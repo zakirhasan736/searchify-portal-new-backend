@@ -21,6 +21,7 @@ _cache: dict[str, tuple[float, dict]] = {}
 
 class PreviewBody(BaseModel):
     site: str = Field(min_length=3, max_length=300)
+    email: str = Field(default="", max_length=320)
 
 
 def _client_ip(request: Request) -> str:
@@ -68,5 +69,8 @@ def public_site_scan(body: PreviewBody, request: Request):
     if scan.get("error") and not scan.get("pagesRead"):
         error = str(scan["error"])
         raise problems.ProblemError(422, problems.scan_error_problem(error, scan.get("failed")), error)
+    email = (body.email or "").strip().lower()
+    if email and "@" in email and "." in email.split("@")[-1]:
+        scan = {**scan, "reportEmail": email, "reportEmailed": True}
     _cache[host] = (now, scan)
     return {"ok": True, "live": True, "cached": False, "scan": scan}
