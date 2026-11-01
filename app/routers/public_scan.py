@@ -1,4 +1,5 @@
-"""Free public site preview. Reads a few live pages and colour-codes them. No account, no paid research."""
+"""Free public deep site scan. Reads sitemap + internal pages, grades a heatmap, and optionally
+pulls live ranked keywords when Searchify SEO is connected. No account required."""
 
 from __future__ import annotations
 
@@ -15,6 +16,9 @@ router = APIRouter(prefix="/api/v1/public", tags=["public"])
 WINDOW = 3600
 MAX_SCANS = 6
 CACHE_TTL = 900
+# Deep public crawl — sitemap + link expansion up to this many HTML pages.
+PUBLIC_SCAN_PAGES = 40
+CACHE_VER = "free-deep-v2"
 _hits: dict[str, list[float]] = {}
 _cache: dict[str, tuple[float, dict]] = {}
 
@@ -58,19 +62,20 @@ def public_site_scan(body: PreviewBody, request: Request):
         message = "Enter a public website address, like example.com."
         raise problems.ProblemError(400, problems.make("target_invalid", "site_scan", message=message, action=None), message)
     host = host_of(home)
-    cached = _cache.get(host)
+    cache_key = f"{CACHE_VER}:{host}"
+    cached = _cache.get(cache_key)
     now = time()
     if cached and now - cached[0] < CACHE_TTL:
         return {"ok": True, "live": True, "cached": True, "scan": cached[1]}
     if not _allow(_client_ip(request)):
         message = "The free scan is busy for this network. Try again in a little while."
         raise problems.ProblemError(429, problems.make("provider_busy", "site_scan", message=message), message)
-    scan = preview_scan(home, limit=8)
+    scan = preview_scan(home, limit=PUBLIC_SCAN_PAGES)
     if scan.get("error") and not scan.get("pagesRead"):
         error = str(scan["error"])
         raise problems.ProblemError(422, problems.scan_error_problem(error, scan.get("failed")), error)
     email = (body.email or "").strip().lower()
     if email and "@" in email and "." in email.split("@")[-1]:
         scan = {**scan, "reportEmail": email, "reportEmailed": True}
-    _cache[host] = (now, scan)
+    _cache[cache_key] = (now, scan)
     return {"ok": True, "live": True, "cached": False, "scan": scan}

@@ -649,31 +649,40 @@ def _preview_tone(page: dict) -> tuple[str, str, str]:
     """Colour from what the page actually has. No invented scores."""
     title = str(page.get("title") or "").strip()
     description = str(page.get("description") or "").strip()
+    words = int(page.get("words") or 0)
     if page.get("noindex"):
         return "red", "Hidden from Google", "This page asks Google not to index it."
     if not title:
         return "red", "Missing title", "Google has no title to show for this page."
+    if words and words < 40:
+        return "red", "Thin page", "There is almost no readable copy for Google to understand."
     if not description:
         return "yellow", "Missing description", "The search snippet will be chosen by Google."
     if len(title) < 12 or len(title) > 65:
         return "yellow", "Title length", "The title is hard to read in a search result."
     if not str(page.get("h1") or "").strip():
         return "yellow", "Missing heading", "The page has no H1."
+    if page.get("canonicalElsewhere"):
+        return "yellow", "Canonical elsewhere", "This URL points Google to a different page as the main one."
     return "green", "Listing is in place", "A title and description are on the page."
 
 
 def _preview_platform(pages: list) -> str:
     blob = " ".join(
-        f"{p.get('url') or ''} {p.get('html') or ''} {p.get('generator') or ''}" for p in pages
+        f"{p.get('url') or ''} {p.get('text') or ''} {p.get('ogImage') or ''} "
+        f"{' '.join((img.get('src') or '') for img in (p.get('images') or []) if isinstance(img, dict))}"
+        for p in pages
     ).lower()
     if "wp-content" in blob or "wp-includes" in blob or "wordpress" in blob or "/wp-json" in blob:
         return "WordPress"
-    if "cdn.shopify.com" in blob or "shopify" in blob:
+    if "cdn.shopify.com" in blob or "myshopify.com" in blob or "shopify" in blob:
         return "Shopify"
     if "webflow" in blob:
         return "Webflow"
     if "wix.com" in blob or "wixstatic" in blob:
         return "Wix"
+    if "squarespace" in blob:
+        return "Squarespace"
     return ""
 
 
@@ -684,7 +693,9 @@ def _preview_grade(counts: dict) -> tuple[str, str, str]:
     green = int(counts.get("green") or 0)
     total = max(1, red + yellow + green)
     score = (green * 100 + yellow * 55 + red * 15) / total
-    if score >= 90:
+    if score >= 92:
+        return "A+", "#3DDC84", "excellent listing health"
+    if score >= 88:
         return "A", "#3DDC84", "strong listing health"
     if score >= 80:
         return "B+", "#3DDC84", "mostly healthy"
@@ -697,8 +708,103 @@ def _preview_grade(counts: dict) -> tuple[str, str, str]:
     return "D", "#FF5A4E", "urgent fixes first"
 
 
-def _preview_places(host: str, brand_hint: str = "") -> list[dict]:
-    """Optional Google Places nearby listings for the brand/host. Empty if key missing."""
+_CATEGORY_HINTS: list[tuple[str, tuple[str, ...]]] = [
+    ("web design agency", ("web design", "website design", "web development", "wordpress agency", "web agency")),
+    ("digital marketing agency", ("digital marketing", "seo agency", "marketing agency", "ppc agency", "content marketing")),
+    ("software company", ("saas", "software company", "software development", "app development", "product studio")),
+    ("roofing contractor", ("roofing", "roof repair", "roof replacement", "roofer")),
+    ("plumbing company", ("plumber", "plumbing", "drain cleaning")),
+    ("hvac company", ("hvac", "air conditioning", "furnace", "heating and cooling")),
+    ("dentist", ("dentist", "dental clinic", "orthodont")),
+    ("law firm", ("law firm", "attorney", "lawyer", "legal services")),
+    ("real estate agency", ("real estate", "realtor", "property management")),
+    ("restaurant", ("restaurant", "cafe", "bistro", "dining")),
+    ("fitness gym", ("gym", "fitness", "personal trainer")),
+    ("auto repair", ("auto repair", "mechanic", "car service")),
+]
+
+
+_CITY_HINTS = (
+    "calgary", "edmonton", "toronto", "vancouver", "ottawa", "montreal", "winnipeg", "halifax",
+    "london", "manchester", "birmingham", "glasgow", "edinburgh",
+    "sydney", "melbourne", "brisbane", "perth", "auckland",
+    "new york", "los angeles", "chicago", "houston", "phoenix", "philadelphia", "san antonio",
+    "san diego", "dallas", "san jose", "austin", "jacksonville", "fort worth", "columbus",
+    "charlotte", "indianapolis", "san francisco", "seattle", "denver", "boston", "nashville",
+    "detroit", "portland", "las vegas", "miami", "atlanta", "minneapolis",
+)
+
+
+def _page_blob(pages: list, limit: int = 12) -> str:
+    parts = []
+    for page in pages[:limit]:
+        parts.append(str(page.get("title") or ""))
+        parts.append(str(page.get("description") or ""))
+        parts.append(str(page.get("h1") or ""))
+        parts.append(" ".join(str(h) for h in (page.get("headings") or [])[:8]))
+        parts.append(" ".join(str(n) for n in (page.get("nav") or [])[:12]))
+        parts.append(str(page.get("schemaName") or ""))
+        parts.append(" ".join(str(t) for t in (page.get("schemaTypes") or [])[:6]))
+        parts.append(str(page.get("text") or "")[:900])
+        parts.append(urlparse(page.get("url") or "").path or "")
+    return " ".join(parts).lower()
+
+
+def _preview_city(pages: list) -> str:
+    blob = _page_blob(pages)
+    for city in _CITY_HINTS:
+        if re.search(rf"\b{re.escape(city)}\b", blob):
+            return city.title()
+    try:
+        from app import locations as loc
+
+        for key, (_label, _country) in loc.REGIONS.items():
+            if re.search(rf"\b{re.escape(key)}\b", blob):
+                return key.title()
+    except Exception:
+        pass
+    return ""
+
+
+def _preview_category(pages: list, brand: str = "") -> str:
+    """Infer the business category from schema, titles, nav and copy — not the brand alone."""
+    blob = _page_blob(pages)
+    schema_types = " ".join(
+        str(t).lower() for page in pages for t in (page.get("schemaTypes") or []) if t
+    )
+    schema_name = " ".join(str(page.get("schemaName") or "") for page in pages[:4]).strip()
+    scored: list[tuple[int, str]] = []
+    for label, needles in _CATEGORY_HINTS:
+        hits = sum(1 for needle in needles if needle in blob)
+        if hits:
+            scored.append((hits, label))
+    if scored:
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return scored[0][1]
+    if "localbusiness" in schema_types or "professionalservice" in schema_types:
+        if schema_name and brand and schema_name.lower() != brand.lower():
+            return schema_name[:60]
+        return "local business"
+    # Fall back to a concrete homepage H1 / nav phrase (skip pure brand).
+    home = next((p for p in pages if (urlparse(p.get("url") or "").path or "/") in {"", "/"}), pages[0] if pages else None)
+    for candidate in (
+        str((home or {}).get("h1") or "").split("|")[0].strip(),
+        *((home or {}).get("nav") or [])[:6],
+        str((home or {}).get("title") or "").split("|")[0].strip(),
+    ):
+        text = " ".join(str(candidate or "").split())
+        if len(text) < 4:
+            continue
+        if brand and text.lower() == brand.lower():
+            continue
+        if text.lower() in {"home", "welcome", "menu"}:
+            continue
+        return text[:60]
+    return "local business"
+
+
+def _preview_places(host: str, brand_hint: str = "", category: str = "", city: str = "") -> list[dict]:
+    """Google Places rivals by category + city. Never search brand-only “near me” (wrong vertical)."""
     try:
         from app import config
         from app import google_oauth as goauth
@@ -707,37 +813,523 @@ def _preview_places(host: str, brand_hint: str = "") -> list[dict]:
     if not getattr(config, "GOOGLE_PLACES_API_KEY", ""):
         return []
     brand = (brand_hint or host or "").split(".")[0].replace("-", " ").strip()
-    if not brand or len(brand) < 2:
-        return []
+    category = (category or "").strip() or "local business"
+    city = (city or "").strip()
+    queries = []
+    if city:
+        queries.append(f"{category} in {city}")
+        queries.append(f"best {category} {city}")
+    else:
+        queries.append(category)
+    # Own listing lookup last — useful when the brand has a Google profile, not for rivals.
+    if brand and len(brand) >= 2:
+        queries.append(f"{brand} {city}".strip() if city else brand)
+
+    out: list[dict] = []
+    seen: set[str] = set()
+    for query in queries:
+        try:
+            rows = goauth.places_text_search(query, max_results=8)
+        except Exception:
+            continue
+        for row in rows or []:
+            name = row[0] if len(row) > 0 else ""
+            address = row[1] if len(row) > 1 else ""
+            website = row[4] if len(row) > 4 else ""
+            key = (name or "").strip().lower()
+            if not key or key in seen:
+                continue
+            site_host = host_of(website) if website else ""
+            # Skip the scanned site itself from the rival list.
+            if site_host and site_host == host:
+                continue
+            # Brand-only query can return the owner's listing — keep others for competitors.
+            if query.startswith(brand) and brand.lower() in key and site_host == host:
+                continue
+            seen.add(key)
+            out.append(
+                {
+                    "name": name,
+                    "address": address,
+                    "rating": row[2] if len(row) > 2 else "—",
+                    "reviews": row[3] if len(row) > 3 else "0",
+                    "website": website,
+                    "query": query,
+                    "category": category,
+                    "city": city,
+                }
+            )
+            if len(out) >= 6:
+                break
+        if len(out) >= 4:
+            break
+    return out[:6]
+
+
+def _ctr_share(position: int | None) -> float:
+    """Public CTR curve used only to estimate visits from ranked positions × volume."""
+    if not position or position < 1:
+        return 0.0
+    table = {
+        1: 0.28,
+        2: 0.15,
+        3: 0.11,
+        4: 0.08,
+        5: 0.06,
+        6: 0.05,
+        7: 0.04,
+        8: 0.03,
+        9: 0.025,
+        10: 0.02,
+    }
+    if position <= 10:
+        return table.get(position, 0.02)
+    if position <= 20:
+        return 0.01
+    if position <= 30:
+        return 0.004
+    return 0.002
+
+
+def _rank_status(position: int | None) -> tuple[str, str]:
+    if not position or position < 1:
+        return "Unknown", "yellow"
+    if position <= 10:
+        return "Page one", "green"
+    page = (position - 1) // 10 + 1
+    if position <= 20:
+        return f"Near miss · page {page}", "yellow"
+    return f"Buried · page {page}", "red"
+
+
+def _guess_market(pages: list, places: list) -> tuple[str, str]:
+    """Best-effort country for public ranked keywords. Falls back to United States."""
+    blob = " ".join(
+        [
+            " ".join(str(p.get("title") or "") for p in pages),
+            " ".join(str(p.get("text") or "")[:800] for p in pages[:8]),
+            " ".join(str(p.get("address") or "") for p in places),
+        ]
+    ).lower()
     try:
-        rows = goauth.places_text_search(f"{brand} near me", max_results=6)
+        from app import locations as loc
+
+        for key, (country, _iso, lang) in loc.COUNTRIES.items():
+            if re.search(rf"\b{re.escape(key)}\b", blob):
+                return country, lang
+        for key, (_label, country_key) in loc.REGIONS.items():
+            if re.search(rf"\b{re.escape(key)}\b", blob):
+                country, _iso, lang = loc.COUNTRIES.get(country_key, ("United States", "US", "en"))
+                return country, lang
+    except Exception:
+        pass
+    return "United States", "en"
+
+
+def _preview_visibility(host: str, pages: list, places: list) -> dict:
+    """Real ranked keywords + opportunity ideas when Searchify SEO (DataForSEO) is connected.
+
+    Empty buckets stay empty — nothing is invented for the free report.
+    """
+    empty = {
+        "keywords": [],
+        "gaps": [],
+        "visibility": {
+            "searches": 0,
+            "pageOne": 0,
+            "nearMisses": 0,
+            "visits": 0,
+            "market": "",
+            "source": "",
+        },
+        "researchSource": "",
+    }
+    try:
+        from app import research
+    except Exception:
+        return empty
+    if not research.configured():
+        return empty
+    location, language = _guess_market(pages, places)
+    ranked: list[dict] = []
+    gaps: list[dict] = []
+    try:
+        ranked_res, _ = research._call(
+            "POST",
+            "/dataforseo_labs/google/ranked_keywords/live",
+            [
+                {
+                    "target": host,
+                    "location_name": location,
+                    "language_code": language,
+                    "limit": 50,
+                    "item_types": ["organic"],
+                    "filters": ["ranked_serp_element.serp_item.rank_group", "<=", 100],
+                    "order_by": [
+                        "ranked_serp_element.serp_item.rank_group,asc",
+                        "keyword_data.keyword_info.search_volume,desc",
+                    ],
+                }
+            ],
+            timeout=45.0,
+        )
     except Exception:
         try:
-            rows = goauth.places_text_search(brand, max_results=6)
+            ranked_res, _ = research._call(
+                "POST",
+                "/dataforseo_labs/google/ranked_keywords/live",
+                [
+                    {
+                        "target": host,
+                        "location_name": location,
+                        "language_code": language,
+                        "limit": 50,
+                        "order_by": ["keyword_data.keyword_info.search_volume,desc"],
+                    }
+                ],
+                timeout=45.0,
+            )
         except Exception:
-            return []
-    out = []
-    for row in rows or []:
-        out.append(
+            ranked_res = []
+    best: dict[str, dict] = {}
+    for item in ((ranked_res or [{}])[0] or {}).get("items") or []:
+        row = research._kw_row(item)
+        serp = (item.get("ranked_serp_element") or {}).get("serp_item") or {}
+        if (serp.get("type") or "organic") not in ("", "organic"):
+            continue
+        keyword = str(row.get("keyword") or "").strip()
+        if not keyword:
+            continue
+        position = serp.get("rank_group") or serp.get("rank_absolute")
+        try:
+            position = int(position) if position is not None else None
+        except (TypeError, ValueError):
+            position = None
+        volume = row.get("volume")
+        try:
+            volume = int(volume) if volume is not None else None
+        except (TypeError, ValueError):
+            volume = None
+        status, tone = _rank_status(position)
+        candidate = {
+            "keyword": keyword,
+            "volume": volume,
+            "position": position,
+            "status": status,
+            "tone": tone,
+            "url": str(serp.get("url") or "")[:300],
+            "page": str(serp.get("relative_url") or "")[:200],
+        }
+        key = keyword.lower()
+        held = best.get(key)
+        if held is None or (position or 10**6) < (held.get("position") or 10**6):
+            best[key] = candidate
+    ranked = sorted(
+        best.values(),
+        key=lambda row: (
+            row.get("position") or 10**6,
+            -(row.get("volume") or 0),
+            row.get("keyword") or "",
+        ),
+    )
+    known = {row["keyword"].lower() for row in ranked}
+    try:
+        site_res, _ = research._call(
+            "POST",
+            "/dataforseo_labs/google/keywords_for_site/live",
+            [
+                {
+                    "target": host,
+                    "location_name": location,
+                    "language_code": language,
+                    "include_subdomains": True,
+                    "limit": 40,
+                    "filters": ["keyword_info.search_volume", ">", 0],
+                    "order_by": ["relevance,desc"],
+                }
+            ],
+            timeout=45.0,
+        )
+    except Exception:
+        try:
+            site_res, _ = research._call(
+                "POST",
+                "/dataforseo_labs/google/keywords_for_site/live",
+                [{"target": host, "location_name": location, "language_code": language, "limit": 40}],
+                timeout=45.0,
+            )
+        except Exception:
+            site_res = []
+    for item in ((site_res or [{}])[0] or {}).get("items") or []:
+        row = research._kw_row(item)
+        keyword = str(row.get("keyword") or "").strip()
+        key = keyword.lower()
+        if not keyword or key in known:
+            continue
+        # Opportunity gaps: relevant site ideas you are not currently ranking for in the top 100.
+        volume = row.get("volume")
+        try:
+            volume = int(volume) if volume is not None else None
+        except (TypeError, ValueError):
+            volume = None
+        if not volume:
+            continue
+        gaps.append({"keyword": keyword, "volume": volume})
+        known.add(key)
+        if len(gaps) >= 8:
+            break
+
+    page_one = sum(1 for row in ranked if (row.get("position") or 99) <= 10)
+    near = sum(1 for row in ranked if 11 <= (row.get("position") or 0) <= 20)
+    visits = 0
+    for row in ranked:
+        vol = row.get("volume") or 0
+        visits += int(round(vol * _ctr_share(row.get("position"))))
+
+    return {
+        "keywords": ranked[:12],
+        "gaps": gaps[:6],
+        "visibility": {
+            "searches": len(ranked),
+            "pageOne": page_one,
+            "nearMisses": near,
+            "visits": visits,
+            "market": location,
+            "source": "dataforseo_ranked" if ranked else "",
+        },
+        "researchSource": "dataforseo" if ranked or gaps else "",
+        "allRankedCount": len(ranked),
+    }
+
+
+def _preview_about(pages: list, brand: str, host: str, findings: list, category: str = "", city: str = "") -> str:
+    """Plain-language gist from titles/headings/copy — no invented ranks."""
+    home = next((p for p in pages if (urlparse(p.get("url") or "").path or "/") in {"", "/"}), pages[0] if pages else None)
+    home_title = str((home or {}).get("title") or "").strip()
+    missing_desc = sum(1 for f in findings if "description" in (f.get("label") or "").lower())
+    bits = [f"We read {len(pages)} page{'s' if len(pages) != 1 else ''} the way Google does."]
+    if category:
+        bits.append(f"Your site reads as a {category}.")
+    elif brand and brand.lower() not in {"home", "welcome"}:
+        bits.append(f"The site presents itself as {brand}.")
+    if city:
+        if home_title and city.lower() not in home_title.lower():
+            bits.append(f"Your homepage never says “{city}”, even though that market shows up on the site.")
+        else:
+            bits.append(f"We found {city} in your content.")
+    else:
+        bits.append("Google may be unsure which city or region to send you for.")
+    if missing_desc:
+        bits.append(
+            f"{missing_desc} page{'s' if missing_desc != 1 else ''} "
+            f"{'are' if missing_desc != 1 else 'is'} missing a description, so Google may invent the snippet."
+        )
+    elif findings:
+        bits.append("A few listing details are thin — fixing them is usually a quick win.")
+    else:
+        bits.append("Basic titles and descriptions look in place; the next wins are usually local phrases and Search Console clicks.")
+    return " ".join(bits)
+
+
+def _preview_page_rows(pages: list) -> list[dict]:
+    """Every crawled page for the free report table — including healthy ones."""
+    rows = []
+    for page in pages:
+        color, label, detail = _preview_tone(page)
+        path = urlparse(page.get("url") or "").path or "/"
+        rows.append(
             {
-                "name": row[0] if len(row) > 0 else "",
-                "address": row[1] if len(row) > 1 else "",
-                "rating": row[2] if len(row) > 2 else "—",
-                "reviews": row[3] if len(row) > 3 else "0",
-                "website": row[4] if len(row) > 4 else "",
+                "color": color,
+                "path": path,
+                "label": label,
+                "detail": detail,
+                "title": str(page.get("title") or "").strip(),
+                "words": int(page.get("words") or 0),
             }
         )
+    order = {"red": 0, "yellow": 1, "green": 2}
+    rows.sort(key=lambda item: (order.get(item["color"], 9), item.get("path") or ""))
+    return rows
+
+
+def _preview_opportunities(pages: list, brand: str, category: str, city: str, places: list, findings: list) -> list[dict]:
+    """Conversion-ready problems even when titles/descriptions already pass."""
+    out: list[dict] = []
+    home = next((p for p in pages if (urlparse(p.get("url") or "").path or "/") in {"", "/"}), pages[0] if pages else None)
+    home_title = str((home or {}).get("title") or "").strip()
+    if city and home_title and city.lower() not in home_title.lower():
+        out.append(
+            {
+                "color": "red",
+                "path": "/",
+                "label": f'Your homepage title never says “{city}”',
+                "detail": f'Your title is the headline Google shows in search. Right now it says “{home_title or "Home"}”.',
+                "title": home_title,
+            }
+        )
+    if category and home_title and not any(token in home_title.lower() for token in category.lower().split()[:2] if len(token) > 3):
+        out.append(
+            {
+                "color": "red",
+                "path": "/",
+                "label": f'Your homepage title never says "{category.split()[0]}"',
+                "detail": f"People searching for a {category} need that phrase in the title Google shows.",
+                "title": home_title,
+            }
+        )
+    missing_desc = [f for f in findings if "description" in (f.get("label") or "").lower()]
+    if missing_desc:
+        out.append(
+            {
+                "color": "red",
+                "path": "",
+                "label": f"{len(missing_desc)} pages have no description in Google",
+                "detail": "Google is filling in the blanks with random text from the page, so fewer people click.",
+                "title": "",
+            }
+        )
+    thin = [p for p in pages if int(p.get("words") or 0) and int(p.get("words") or 0) < 120]
+    if thin:
+        out.append(
+            {
+                "color": "yellow",
+                "path": urlparse(thin[0].get("url") or "").path or "/",
+                "label": f"{len(thin)} pages look thin for Google",
+                "detail": "Short pages rarely win competitive local searches. Adding clear service copy usually helps.",
+                "title": str(thin[0].get("title") or ""),
+            }
+        )
+    if places:
+        top = places[0]
+        out.append(
+            {
+                "color": "yellow",
+                "path": "",
+                "label": f"{top.get('name') or 'A nearby rival'} already has stronger local proof",
+                "detail": (
+                    f"They show {top.get('rating') or '—'}★ from {top.get('reviews') or '0'} reviews. "
+                    "Connect Google and we’ll show the searches they’re winning that you aren’t."
+                ),
+                "title": "",
+            }
+        )
+    elif category:
+        out.append(
+            {
+                "color": "yellow",
+                "path": "",
+                "label": f"Local {category} rivals are already collecting reviews",
+                "detail": "Without Search Console we can’t see the exact clicks you lose — Solo unlocks that list.",
+                "title": "",
+            }
+        )
+    # Dedupe by label and keep strongest first.
+    seen: set[str] = set()
+    unique = []
+    for row in out:
+        key = str(row.get("label") or "")
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(row)
+    return unique
+
+
+def _preview_gaps_from_site(pages: list, category: str, city: str) -> list[dict]:
+    """Search phrases people would type, derived from the site — volumes stay empty until research runs."""
+    phrases: list[str] = []
+    if category and city:
+        phrases.extend(
+            [
+                f"{category} {city}",
+                f"best {category} {city}",
+                f"{category} near me",
+                f"{category.split()[0]} cost {city}" if category.split() else f"{category} {city}",
+            ]
+        )
+    elif category:
+        phrases.extend([category, f"best {category}", f"{category} near me"])
+    nav = []
+    for page in pages[:6]:
+        for item in page.get("nav") or []:
+            label = " ".join(str(item or "").split())
+            if 3 < len(label) < 48 and label.lower() not in {"home", "contact", "about", "blog"}:
+                nav.append(label)
+    for label in dict.fromkeys(nav):
+        phrase = f"{label} {city}".strip() if city else label
+        phrases.append(phrase.lower())
+        if len(phrases) >= 10:
+            break
+    out = []
+    seen: set[str] = set()
+    for phrase in phrases:
+        key = phrase.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"keyword": phrase, "volume": None, "source": "site_crawl", "note": "volume after Solo"})
+        if len(out) >= 6:
+            break
     return out
 
 
-def preview_scan(home: str, limit: int = 8) -> dict:
-    """Free public look: a few live pages, colour-coded. No AI and no paid research."""
-    crawled = crawl(home, limit=max(1, min(int(limit or 8), 12)))
+def _preview_competitors(host: str, places: list, visits: int) -> list[dict]:
+    """Bars for nearby Places listings + you. Uses review signal when traffic is unknown."""
+    rivals = []
+    for place in places[:4]:
+        name = str(place.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            rating = float(str(place.get("rating") or "0").replace("★", "").strip() or 0)
+        except ValueError:
+            rating = 0.0
+        try:
+            reviews = int(str(place.get("reviews") or "0").replace(",", "").split()[0] or 0)
+        except ValueError:
+            reviews = 0
+        score = max(1, int(round(rating * max(reviews, 1))))
+        site = str(place.get("website") or "").strip()
+        label = host_of(site) if site else name
+        rivals.append(
+            {
+                "name": label or name,
+                "label": name,
+                "score": score,
+                "you": False,
+                "visits": None,
+                "rating": place.get("rating"),
+                "reviews": place.get("reviews"),
+                "address": place.get("address") or "",
+            }
+        )
+    you_score = max(1, int(visits) if visits else 8)
+    rivals.append({"name": host, "label": f"You · {host}", "score": you_score, "you": True, "visits": visits or None})
+    top = max((r["score"] for r in rivals), default=1)
+    for row in rivals:
+        row["pct"] = max(6, round(100 * row["score"] / top))
+        if row.get("you") and visits:
+            row["signal"] = f"{visits} / mo est."
+        elif row.get("you"):
+            row["signal"] = "your site"
+        elif row.get("rating") not in (None, "", "—"):
+            row["signal"] = f"{row.get('rating')}★ · {row.get('reviews') or 0} reviews"
+        else:
+            row["signal"] = f"{row['score']} local signal"
+    return rivals
+
+
+def preview_scan(home: str, limit: int = 40) -> dict:
+    """Free public deep scan: sitemap + internal links, heatmap grade, optional live ranked keywords."""
+    deep = max(1, min(int(limit or 40), 50))
+    crawled = crawl(home, limit=deep)
     pages = crawled.get("pages") or []
+    failed = crawled.get("failed") or []
     findings = []
     dots = []
     counts = {"red": 0, "yellow": 0, "green": 0, "blue": 0}
     titles = []
+    page_rows = _preview_page_rows(pages)
     for page in pages:
         color, label, detail = _preview_tone(page)
         counts[color] = counts.get(color, 0) + 1
@@ -754,37 +1346,118 @@ def preview_scan(home: str, limit: int = 8) -> dict:
                 "detail": detail,
                 "title": title,
             })
+    broken = [row for row in failed if str(row.get("error") or "").startswith("HTTP 4") or str(row.get("error") or "").startswith("HTTP 5")]
+    if broken:
+        counts["red"] = counts.get("red", 0) + min(len(broken), 6)
+        for row in broken[:6]:
+            path = urlparse(row.get("url") or "").path or "/"
+            dots.append({"color": "red", "path": path})
+            findings.append({
+                "color": "red",
+                "path": path,
+                "label": "Broken page",
+                "detail": f"A linked URL returned {row.get('error') or 'an error'}.",
+                "title": "",
+            })
     order = {"red": 0, "yellow": 1, "green": 2}
     findings.sort(key=lambda item: order.get(item["color"], 9))
     host = crawled.get("host") or host_of(home)
     platform = _preview_platform(pages)
     grade, gradeColor, gradeNote = _preview_grade(counts)
     brand = (titles[0].split("|")[0].split("-")[0].strip() if titles else host.split(".")[0].replace("-", " "))
-    places = _preview_places(host, brand)
-    missing_desc = sum(1 for f in findings if "description" in (f.get("label") or "").lower())
-    about = (
-        f"We read {len(pages)} page{'s' if len(pages) != 1 else ''} the way Google does. "
-        + (
-            f"Several titles look thin, and {missing_desc} page{'s' if missing_desc != 1 else ''} "
-            f"{'are' if missing_desc != 1 else 'is'} missing a description — Google may invent the snippet."
-            if findings
-            else "Titles and descriptions look in place on the pages we checked."
+    city = _preview_city(pages)
+    category = _preview_category(pages, brand)
+    places = _preview_places(host, brand, category=category, city=city)
+    visibility_pack = _preview_visibility(host, pages, places)
+    visibility = visibility_pack.get("visibility") or {}
+    keywords = visibility_pack.get("keywords") or []
+    gaps = visibility_pack.get("gaps") or []
+    if not gaps:
+        gaps = _preview_gaps_from_site(pages, category, city)
+    visits = int(visibility.get("visits") or 0)
+    competitors = _preview_competitors(host, places, visits)
+    about = _preview_about(pages, brand, host, findings, category=category, city=city)
+    opportunities = _preview_opportunities(pages, brand, category, city, places, findings)
+    name_bit = brand.split()[0] if brand else "there"
+    if visibility.get("searches"):
+        headline = (
+            f"{name_bit}, Google finds you for {visibility['searches']} searches. "
+            f"You're on page one for {visibility.get('pageOne') or 0} of them."
         )
-    )
+    elif places and category:
+        top = places[0].get("name") or "local rivals"
+        headline = (
+            f"{name_bit}, your site reads as a {category}"
+            + (f" in {city}" if city else "")
+            + f". Nearby, {top} is already collecting the local trust signals."
+        )
+    else:
+        urgent = counts.get("red") or 0
+        work = counts.get("yellow") or 0
+        if urgent:
+            headline = f"{name_bit}, we checked {len(pages)} pages on {host}. {urgent} need urgent fixes"
+            headline += f", and {work} need work." if work else "."
+        elif work:
+            headline = f"{name_bit}, we checked {len(pages)} pages on {host}. {work} pages need work."
+        else:
+            headline = (
+                f"{name_bit}, we checked {len(pages)} pages on {host}. "
+                f"Listings look tidy — the next wins are the searches and local rivals Solo unlocks."
+            )
+    problems = []
+    for row in [*opportunities, *findings]:
+        key = str(row.get("label") or "")
+        if any(key == str(p.get("label") or "") for p in problems):
+            continue
+        problems.append(row)
+        if len(problems) >= 3:
+            break
+    if not problems:
+        problems = [
+            {
+                "color": "yellow",
+                "path": "",
+                "label": "Public crawl can’t see the searches you’re losing",
+                "detail": "Connect Google Search Console and we’ll list the exact queries and the fixes to approve.",
+                "title": "",
+            }
+        ]
+    more_issues = max(0, len(findings) + len(opportunities) - len(problems))
+    places_query = ""
+    if places:
+        places_query = str(places[0].get("query") or "")
+    elif category:
+        places_query = f"{category} in {city}" if city else category
     return {
         "home": crawled.get("home") or home,
         "host": host,
         "pagesRead": len(pages),
+        "pagesDiscovered": len(pages) + len(failed),
         "counts": counts,
-        "dots": dots[:40],
-        "findings": findings[:6],
+        "dots": dots[:48],
+        "findings": findings[:24],
+        "pageRows": page_rows[:24],
+        "problems": problems,
+        "moreIssues": more_issues,
         "error": crawled.get("error") or "",
         "platform": platform,
         "grade": grade,
         "gradeColor": gradeColor,
         "gradeNote": gradeNote,
         "brand": brand,
+        "category": category,
+        "city": city,
+        "headline": headline,
         "aboutGoogle": about,
         "places": places,
+        "placesQuery": places_query,
         "placesSource": "google_places" if places else "",
+        "keywords": keywords,
+        "gaps": gaps,
+        "competitors": competitors,
+        "visibility": visibility,
+        "researchSource": visibility_pack.get("researchSource") or "",
+        "deepScan": True,
+        "scanLimit": deep,
+        "scanVersion": "free-deep-v2",
     }
