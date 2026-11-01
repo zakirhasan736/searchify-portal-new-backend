@@ -78,6 +78,8 @@ def user_type(role: str) -> str:
         return "admin"
     if role == "ROLE_PARTNER":
         return "partner"
+    if role == "ROLE_INVESTOR":
+        return "investor"
     return "client"
 
 

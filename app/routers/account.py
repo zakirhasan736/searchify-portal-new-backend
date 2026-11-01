@@ -32,7 +32,7 @@ log = logging.getLogger("searchify.account")
 
 RESET_MINUTES = 30
 MIN_LENGTH = 8
-AREA_ROLE = {"customer": "ROLE_CLIENT", "partner": "ROLE_PARTNER", "admin": "ROLE_ADMIN"}
+AREA_ROLE = {"customer": "ROLE_CLIENT", "partner": "ROLE_PARTNER", "admin": "ROLE_ADMIN", "investor": "ROLE_INVESTOR"}
 AREA_LINK = {
     "customer": "/reset-password?token={token}",
     "partner": "/partners/login?reset={token}",
@@ -66,7 +66,7 @@ def password_problem(password: str) -> str:
 
 
 def _area_of(user: User) -> str:
-    return {"ROLE_ADMIN": "admin", "ROLE_PARTNER": "partner"}.get(user.role, "customer")
+    return {"ROLE_ADMIN": "admin", "ROLE_PARTNER": "partner", "ROLE_INVESTOR": "investor"}.get(user.role, "customer")
 
 
 @router.post("/forgot")

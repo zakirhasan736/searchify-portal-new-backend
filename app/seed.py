@@ -2,6 +2,7 @@ from sqlalchemy.orm import Session
 
 from app.models import Domain, Project, Suggestion, Tag, User
 from app.routers.hq import ensure_hq_demo
+from app.routers.investors import ensure_investor_accounts
 from app.routers.partners import ensure_partner_account
 from app.security import hash_password
 
@@ -73,6 +74,7 @@ def seed(db: Session) -> None:
 
     ensure_admin_account(db)
     ensure_partner_account(db)
+    ensure_investor_accounts(db)
     ensure_hq_demo(db)
 
 

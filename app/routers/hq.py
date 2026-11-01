@@ -801,6 +801,249 @@ def run_partner_payout(body: PayoutRunBody | None = None, db: Session = Depends(
     return {"ok": True, "message": message, "results": results, **data}
 
 
+def _demo_cancellations() -> dict:
+    """Sample cancel desk when no live cancel-feedback rows exist yet."""
+    return {
+        "headline": "7 tried to cancel in October. 4 stayed.",
+        "sub": "Every reason, every comment and every offer, from the customer's cancel flow. Read them all; this is where the product gets better.",
+        "kpis": [
+            {"label": "Started to cancel", "value": "7", "sub": "October so far", "color": "#F2F4F5"},
+            {"label": "Stayed", "value": "4", "sub": "3 took an offer, 1 paused", "color": "#3DDC84"},
+            {"label": "Cancelled", "value": "3", "sub": "matches 2.1% monthly churn", "color": "#FF8A80"},
+            {"label": "Revenue lost", "value": "$137", "sub": "a month, from those 3", "color": "#FF8A80"},
+            {"label": "Revenue kept", "value": "$507", "sub": "a month, plus $29 paused", "color": "#3DDC84"},
+        ],
+        "reasons": [
+            {"label": "Costs too much", "stayed": 4, "left": 2, "total": 6, "keptPct": 67},
+            {"label": "Not seeing results", "stayed": 3, "left": 2, "total": 5, "keptPct": 60},
+            {"label": "Got what I needed", "stayed": 1, "left": 3, "total": 4, "keptPct": 25},
+            {"label": "Reviewing takes too long", "stayed": 2, "left": 1, "total": 3, "keptPct": 67},
+            {"label": "Missing something", "stayed": 0, "left": 3, "total": 3, "keptPct": 0},
+            {"label": "Something isn’t working", "stayed": 1, "left": 1, "total": 2, "keptPct": 50},
+            {"label": "Switching tools", "stayed": 0, "left": 2, "total": 2, "keptPct": 0},
+            {"label": "Business closing", "stayed": 0, "left": 1, "total": 1, "keptPct": 0},
+            {"label": "Something else", "stayed": 0, "left": 1, "total": 1, "keptPct": 0},
+        ],
+        "reasonsNote": "“Missing something” and “Switching tools” keep nobody yet. That's a product problem, not an offer problem: see the requests on the right.",
+        "offers": [
+            {"label": "Switch to Solo", "shown": 8, "taken": 3, "rate": 38},
+            {"label": "Take next month free", "shown": 5, "taken": 3, "rate": 60},
+            {"label": "Pause up to 3 months", "shown": 7, "taken": 2, "rate": 29},
+            {"label": "Ship small fixes on its own", "shown": 3, "taken": 2, "rate": 67},
+            {"label": "Fix it first", "shown": 2, "taken": 1, "rate": 50},
+            {"label": "15-minute review call", "shown": 6, "taken": 1, "rate": 17},
+        ],
+        "comments": [
+            {
+                "id": "desert",
+                "outcome": "left",
+                "needsReply": True,
+                "name": "Desert Law Group",
+                "meta": "Pro · since Sep · 31 moves shipped",
+                "when": "Oct 21",
+                "reason": "Something isn’t working · “links went to the wrong practice areas”",
+                "quote": "Three of the internal links pointed family-law pages at criminal-defence pages. I undid them, but I stopped trusting it after that.",
+                "note": "Offered “fix it first”. Declined. Referred by Sam Ortiz: his commission stops after Nov 21.",
+                "toProduct": True,
+                "customerId": "",
+                "email": "hello@desertlaw.example",
+            },
+            {
+                "id": "harbour",
+                "outcome": "left",
+                "needsReply": True,
+                "name": "Harbour Yoga Studio",
+                "meta": "Solo · 2 months · 9 moves shipped",
+                "when": "Oct 17",
+                "reason": "I’m moving to another tool · “Squarespace”",
+                "quote": "We’re moving the site off WordPress to Squarespace and it sounds like you don’t support it.",
+                "note": "No offer shown. Platform request counted.",
+                "toProduct": True,
+                "customerId": "",
+                "email": "hi@harbouryoga.example",
+            },
+            {
+                "id": "oakridge",
+                "outcome": "left",
+                "needsReply": True,
+                "name": "Oakridge Plumbing",
+                "meta": "Solo · 6 months · 44 moves shipped",
+                "when": "Oct 9",
+                "reason": "I got what I needed",
+                "quote": "Honestly it did its job. We’re ranking for everything we wanted.",
+                "note": "Offered watch mode on Solo and a pause. Declined both. Good win-back candidate in 60 days.",
+                "toProduct": False,
+                "customerId": "",
+                "email": "office@oakridge.example",
+            },
+            {
+                "id": "bright",
+                "outcome": "stayed",
+                "needsReply": False,
+                "name": "Bright Smile Dental",
+                "meta": "Pro · 1 month · 18 moves shipped",
+                "when": "Oct 24",
+                "reason": "I’m not seeing results",
+                "quote": "Nothing has moved yet and I’m paying for it.",
+                "note": "Took the free month. 11 changes still being measured, first results due Nov 3.",
+                "toProduct": False,
+                "customerId": "tampa",
+                "email": "office@brightsmile.example",
+            },
+        ],
+        "requests": [
+            {"label": "Squarespace or Wix support", "count": 3},
+            {"label": "Shopify support", "count": 2},
+            {"label": "Smarter internal links (match by topic)", "count": 2},
+            {"label": "Bulk approve across client sites", "count": 2},
+            {"label": "White-label client reports", "count": 1},
+        ],
+        "followUps": [
+            {"when": "Right away", "text": "Confirmation email: the date access ends, what stays on their site, how to come back."},
+            {"when": "Day 2", "text": "If they wrote a comment: a short personal reply from the founder. Not a template."},
+            {"when": "3 days left", "text": "Heads-up that access ends soon, and that their launch price goes with it."},
+            {"when": "Day 60", "text": "Win-back email, only if something they asked for has shipped or their reason was “got what I needed”."},
+            {"when": "Paused", "text": "Email a week before billing restarts, with one-click “pause a bit longer” or “cancel”."},
+        ],
+        "houseRule": "One reason screen, at most two offers, and “continue cancelling” always one tap away. No hiding the button, no making people email or call to leave.",
+        "openCount": 4,
+        "problemsCount": 9,
+    }
+
+
+def _live_cancellations(db: Session) -> dict | None:
+    """Build cancel desk from admin cancel-feedback inbox when real rows exist."""
+    admin = _admin_owner(db)
+    inbox = _feature(db, admin.id, "cancel-feedback")
+    rows = list(inbox.get("rows") or [])
+    if not rows:
+        return None
+    customers = {str(c.get("id")): c for c in hq_live.customer_list(db)}
+    by_email = {str(c.get("email") or "").lower(): c for c in customers.values()}
+    comments = []
+    reason_bucket: dict[str, dict] = {}
+    left = stayed = 0
+    lost = kept = 0.0
+    for row in rows[:80]:
+        email = str(row.get("email") or "").lower()
+        cust = by_email.get(email) or {}
+        outcome = "left"
+        plan = str(row.get("planId") or cust.get("plan") or "solo").lower()
+        price = float(PRICE.get(plan, 29) or 29)
+        # Reactivated / paused feedback stays; cancelled stays left.
+        status = str(row.get("status") or "cancelled").lower()
+        if status in {"reactivated", "paused", "stayed"}:
+            outcome = "stayed"
+            stayed += 1
+            kept += price
+        else:
+            left += 1
+            lost += price
+        reason = str(row.get("reason") or "Something else").strip() or "Something else"
+        bucket = reason_bucket.setdefault(reason, {"stayed": 0, "left": 0})
+        bucket["stayed" if outcome == "stayed" else "left"] += 1
+        when = str(row.get("at") or "")[:10]
+        comments.append(
+            {
+                "id": f"c{row.get('userId') or email}-{when}",
+                "outcome": outcome,
+                "needsReply": outcome == "left" and bool(row.get("note") or row.get("detail")),
+                "name": cust.get("name") or email or "Customer",
+                "meta": f"{plan.title()} · {cust.get('since') or 'recent'}",
+                "when": when or "—",
+                "reason": reason + (f" · “{row.get('detail')}”" if row.get("detail") else ""),
+                "quote": str(row.get("note") or row.get("detail") or "No comment left."),
+                "note": "From live cancel flow.",
+                "toProduct": "missing" in reason.lower() or "squarespace" in str(row.get("detail") or "").lower(),
+                "customerId": cust.get("id") or "",
+                "email": email,
+            }
+        )
+    reasons = []
+    for label, counts in reason_bucket.items():
+        total = counts["stayed"] + counts["left"]
+        kept_pct = int(round(100 * counts["stayed"] / total)) if total else 0
+        reasons.append(
+            {
+                "label": label,
+                "stayed": counts["stayed"],
+                "left": counts["left"],
+                "total": total,
+                "keptPct": kept_pct,
+            }
+        )
+    reasons.sort(key=lambda r: (-r["total"], r["label"]))
+    started = left + stayed
+    demo = _demo_cancellations()
+    return {
+        **demo,
+        "live": True,
+        "headline": f"{started} started to cancel. {stayed} stayed.",
+        "sub": "Live from the customer cancel flow.",
+        "kpis": [
+            {"label": "Started to cancel", "value": str(started), "sub": "from cancel feedback", "color": "#F2F4F5"},
+            {"label": "Stayed", "value": str(stayed), "sub": "reactivated or paused", "color": "#3DDC84"},
+            {"label": "Cancelled", "value": str(left), "sub": "access ending at period end", "color": "#FF8A80"},
+            {"label": "Revenue lost", "value": f"${int(round(lost))}", "sub": "a month, from those who left", "color": "#FF8A80"},
+            {"label": "Revenue kept", "value": f"${int(round(kept))}", "sub": "a month, from those who stayed", "color": "#3DDC84"},
+        ],
+        "reasons": reasons or demo["reasons"],
+        "comments": comments or demo["comments"],
+        "openCount": sum(1 for c in comments if c.get("needsReply")),
+    }
+
+
+@router.get("/cancellations")
+def get_cancellations(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    live = _live_cancellations(db)
+    if live:
+        return {"ok": True, "live": True, **live}
+    return {"ok": True, "live": False, **_demo_cancellations()}
+
+
+class CancelDeskActionBody(BaseModel):
+    action: str = Field(..., description="reply|product|done")
+    email: str = ""
+    note: str = ""
+
+
+@router.put("/cancellations/{item_id}")
+def act_cancellation(
+    item_id: str,
+    body: CancelDeskActionBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Track HQ follow-up on a cancel comment (reply / send to product / mark done)."""
+    _require_admin(user)
+    admin = _admin_owner(db)
+    state = _feature(db, admin.id, "hq-cancel-desk")
+    done = dict(state.get("done") or {})
+    product = dict(state.get("product") or {})
+    replied = dict(state.get("replied") or {})
+    if body.action == "done":
+        done[item_id] = True
+        msg = "Marked done."
+    elif body.action == "product":
+        product[item_id] = True
+        msg = "Sent to product."
+    elif body.action == "reply":
+        from app import mailer
+
+        to = (body.email or "").strip()
+        if to and mailer.send(to, "A note from Searchify", (body.note or "Thanks for the feedback — we're on it.").strip()):
+            replied[item_id] = True
+            msg = f"Reply emailed to {to}."
+        else:
+            replied[item_id] = True
+            msg = "Reply logged. Email isn’t set up, so contact them directly."
+    else:
+        raise HTTPException(400, "Unknown action")
+    _save_feature(db, admin.id, "hq-cancel-desk", "HQ cancel desk", {"done": done, "product": product, "replied": replied})
+    return {"ok": True, "message": msg, "done": done, "product": product, "replied": replied}
+
+
 @router.get("/problems")
 def get_problems(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_admin(user)
