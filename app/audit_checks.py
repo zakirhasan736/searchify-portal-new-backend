@@ -272,7 +272,7 @@ NON_INDEXABLE = {
                    ["Open yoursite/robots.txt.", "Find the Disallow line that matches the URLs below.", "Remove it or narrow it, keeping only private areas blocked.", "Crawl again."], "robots"),
     "meta_tag": ("Pages set to noindex (meta robots tag)", "Warning",
                  "If these pages should appear in Google, remove the noindex setting.",
-                 ["In WordPress open the page → SEO plugin box → Advanced.", "Set 'Allow search engines to show this page' to Yes (Yoast) or remove 'No Index' (Rank Math).",
+                 ["In Searchify open Queue (or the page draft), then check indexing for that URL.", "If the page should rank, remove noindex from the page meta robots (Searchify drafts do not add noindex). In WordPress also check Settings → Reading → Discourage search engines is OFF.",
                   "Leave noindex only on thank-you, cart, login and similar pages.", "Crawl again."], "noindex"),
     "http_header": ("Pages set to noindex by an X-Robots-Tag header", "Warning",
                     "Remove the noindex X-Robots-Tag header for pages that should rank.",
@@ -321,17 +321,21 @@ def canonical_issues(html_items: list[dict], site_host: str) -> list[dict]:
     if other_host:
         out.append(issue("canonical_other_domain", "Canonical points to another domain", "Critical", "Canonicals",
                          "Point the canonical to this site's own URL unless the content truly belongs on the other domain.",
-                         ["Open the SEO plugin's Advanced/canonical field for each page.", "Clear the wrong value so the page uses its own URL.",
+                         ["In Searchify review the page draft, or set a self-canonical in the theme head for each page.", "Clear the wrong value so the page uses its own URL.",
                           "Check staging/old-domain settings in WordPress → Settings → General.", "Crawl again."], other_host, help_url=DOC["canonical"]))
     if http_canon:
         out.append(issue("canonical_http", "Canonical uses http on an https site", "Warning", "Canonicals",
                          "Use the https URL in the canonical.",
-                         ["Set WordPress Address and Site Address to https in Settings → General.", "Re-save the SEO plugin settings.", "Crawl again."], http_canon, help_url=DOC["canonical"]))
+                         ["Set WordPress Address and Site Address to https in Settings → General.", "Re-approve the page in Searchify (Open Graph / JSON-LD on) and crawl again.", "Crawl again."], http_canon, help_url=DOC["canonical"]))
     if missing:
         out.append(issue("canonical_missing", "Pages have no canonical tag", "Notice", "Canonicals",
                          "Add a self-referencing canonical so Google knows the main URL of each page.",
-                         ["Most SEO plugins (Yoast, Rank Math) add it automatically: check the plugin is active on these pages.",
-                          "For custom pages, add <link rel=\"canonical\" href=\"https://…the page URL…\">.", "Crawl again."], missing, help_url=DOC["canonical"]))
+                         [
+                             "Searchify can publish a self-canonical with the approved listing.",
+                             'For custom pages, add <link rel="canonical" href="https://…the page URL…"> in the theme head.',
+                             "Crawl again.",
+                         ],
+                         missing, help_url=DOC["canonical"]))
     if elsewhere:
         out.append(issue("canonical_elsewhere", "Pages point their canonical to a different URL", "Notice", "Canonicals",
                          "Make sure each of these is a true duplicate. If not, set the canonical to the page itself.",
@@ -855,7 +859,7 @@ SCHEMA_GROUPS = {
 
 SCHEMA_STEPS = [
     "Open the page in Google's Rich Results Test (button below) to see the same error.",
-    "Find where the schema comes from: your SEO plugin (Yoast/Rank Math schema tab), a schema/reviews/WooCommerce plugin, or code in the theme.",
+    "Find where the schema comes from: Searchify JSON-LD on publish, a reviews/WooCommerce block, or code in the theme.",
     "Fix the field named in the message (for example add priceCurrency, or make lowPrice lower than highPrice).",
     "Re-test in the Rich Results Test, then crawl again.",
 ]
@@ -961,7 +965,7 @@ def scan_issues(scan: dict | None) -> list[dict]:
     if accordion_rows:
         out.append(issue("accordion_without_faq", "FAQ accordions without FAQ schema", "Notice", "FAQ",
                          "Add FAQPage schema that uses the same questions and answers shown in the accordion.",
-                         ["Use your SEO plugin's FAQ block (Yoast FAQ / Rank Math FAQ) instead of a plain accordion, or add FAQPage JSON-LD.",
+                         ["Keep Q and A as real headings and paragraphs on the page, then approve in Searchify so FAQ schema matches the visible text — or add FAQPage JSON-LD that uses the same wording.",
                           "Use the exact question and answer text that is visible on the page.",
                           "Test the page in the Rich Results Test."], accordion_rows, help_url=DOC["faq"], source="scan"))
     if no_size_rows:
@@ -1225,7 +1229,7 @@ SITE_PROBLEM_TEXT = {
     "robots_5xx": ("robots.txt returns a server error", "Robots", "robots",
                    ["Open yoursite/robots.txt in a browser.", "Fix the server error with your host (it should return 200 or 404).", "Re-check in Search Console → Settings → robots.txt."]),
     "robots_blocks_site": ("robots.txt blocks the whole website", "Robots", "robots",
-                           ["Edit robots.txt (Yoast → Tools → File editor, or your host's file manager).", "Remove “Disallow: /” for User-agent: * / Googlebot.", "In WordPress also check Settings → Reading → 'Discourage search engines' is OFF."]),
+                           ["Edit robots.txt via your host file manager or site root (Searchify does not edit robots.txt yet).", "Remove “Disallow: /” for User-agent: * / Googlebot.", "In WordPress also check Settings → Reading → 'Discourage search engines' is OFF."]),
     "robots_blocks_pages": ("robots.txt blocks important pages", "Robots", "robots",
                             ["Find the Disallow rule that matches the pages listed.", "Remove or narrow it.", "Test in Search Console → URL Inspection."]),
     "robots_blocks_assets": ("robots.txt blocks CSS/JS needed to render pages", "Robots", "robots",
@@ -1233,16 +1237,16 @@ SITE_PROBLEM_TEXT = {
     "robots_unreachable": ("robots.txt could not be loaded", "Robots", "robots", ["Open yoursite/robots.txt. If it times out, check the server or firewall with your host."]),
     "robots_too_big": ("robots.txt is too large", "Robots", "robots_create", ["Remove repeated or unused rules so the file is under 500 KB."]),
     "robots_syntax": ("robots.txt has syntax problems", "Robots", "robots_create", ["Fix the lines listed: each rule is 'Name: value' on its own line.", "Remove unknown rules."]),
-    "robots_noindex": ("robots.txt uses unsupported 'Noindex'", "Robots", "noindex", ["Remove the Noindex line.", "Add a noindex meta tag to the page instead (SEO plugin → Advanced)."]),
+    "robots_noindex": ("robots.txt uses unsupported 'Noindex'", "Robots", "noindex", ["Remove the Noindex line.", "Add a noindex meta robots tag only on pages that should stay out of Google (cart, thank-you). Control public titles and descriptions from Searchify."]),
     "robots_crawl_delay": ("robots.txt uses Crawl-delay (ignored by Google)", "Robots", "robots", ["You can leave it; Google ignores it. Other crawlers may slow down."]),
-    "robots_missing": ("No robots.txt file", "Robots", "robots_create", ["Optional but useful: add a robots.txt with your 'Sitemap:' line.", "Most SEO plugins create one automatically."]),
+    "robots_missing": ("No robots.txt file", "Robots", "robots_create", ["Optional but useful: add a robots.txt with your 'Sitemap:' line.", "Add a robots.txt with a Sitemap: line, or generate one from your host/CDN."]),
     "robots_no_sitemap": ("robots.txt doesn't list the sitemap", "Sitemap", "sitemap", ["Add a line: Sitemap: https://yoursite/sitemap_index.xml (your real sitemap URL)."]),
-    "sitemap_missing": ("No XML sitemap found", "Sitemap", "sitemap", ["Turn on the XML sitemap in your SEO plugin (Yoast/Rank Math → Sitemap).", "Submit it in Search Console → Sitemaps."]),
-    "sitemap_error": ("The sitemap returns an error", "Sitemap", "sitemap", ["Open the sitemap URL in a browser.", "Re-save permalinks (Settings → Permalinks) and the SEO plugin sitemap settings.", "Resubmit in Search Console."]),
+    "sitemap_missing": ("No XML sitemap found", "Sitemap", "sitemap", ["Use WordPress core sitemap (/wp-sitemap.xml) or your host sitemap, then submit it in Search Console → Sitemaps. Titles and descriptions stay controlled from Searchify.", "Submit it in Search Console → Sitemaps."]),
+    "sitemap_error": ("The sitemap returns an error", "Sitemap", "sitemap", ["Open the sitemap URL in a browser.", "Re-save permalinks (Settings → Permalinks), confirm /wp-sitemap.xml loads, then resubmit in Search Console.", "Resubmit in Search Console."]),
     "sitemap_invalid": ("The sitemap is not valid XML", "Sitemap", "sitemap", ["A plugin or theme is printing text before the XML. Disable plugins one at a time to find it.", "Resubmit in Search Console."]),
     "sitemap_other_host": ("The sitemap is on another domain", "Sitemap", "sitemap", ["List the sitemap on this site's own domain."]),
     "sitemap_bad_urls": ("The sitemap lists broken, redirected or noindex URLs", "Sitemap", "sitemap",
-                         ["Remove the URLs listed from the sitemap (exclude them in the SEO plugin, or fix the page).", "A sitemap should only list live, indexable, final URLs.", "Resubmit in Search Console."]),
+                         ["Remove the URLs listed from the sitemap (or fix the page so it is live and indexable).", "A sitemap should only list live, indexable, final URLs.", "Resubmit in Search Console."]),
     "http_no_redirect": ("http doesn't redirect to https", "Redirects", "redirects", ["Turn on 'Always use HTTPS' (Cloudflare) or the host's force-HTTPS option.", "Or add a 301 rule from http:// to https://."]),
     "http_temp_redirect": ("http → https uses a temporary redirect", "Redirects", "redirects", ["Change the http → https redirect to 301."]),
     "www_duplicate": ("www and non-www versions both load", "Redirects", "canonical", ["Pick one version (www or not).", "301-redirect the other version to it at the host/CDN.", "Use the same version in WordPress Settings → General."]),
@@ -1279,7 +1283,7 @@ COVERAGE_HELP = [
     (re.compile(r"page with redirect", re.I), "Notice", "Search Console: page with redirect (not indexed, expected)",
      ["This URL redirects, so Google indexes the target instead. Remove it from the sitemap and update internal links to the final URL."]),
     (re.compile(r"noindex", re.I), "Warning", "Search Console: excluded by noindex",
-     ["If this page should rank, remove the noindex (SEO plugin → Advanced).", "Request indexing in Search Console → URL Inspection."]),
+     ["If this page should rank, remove the noindex meta robots tag, then re-check from Searchify → Site audit.", "Request indexing in Search Console → URL Inspection."]),
     (re.compile(r"blocked by robots", re.I), "Warning", "Search Console: blocked by robots.txt",
      ["Remove the Disallow rule that matches this URL if it should rank.", "Request indexing."]),
     (re.compile(r"unauthori[sz]ed|401|forbidden|403|other 4xx", re.I), "Critical", "Search Console: blocked (401/403/4xx)",

@@ -1156,13 +1156,59 @@ CHECK_GUIDE = {
     "low_content_rate": ("Paragraphs", ["Open the page named in this list.", "Read the word count beside it.", "Add a paragraph about what this page offers, who it is for, and the next step.", "Update the page, then crawl again. Searchify does not write the body copy."]),
     "paragraph_content": ("Paragraphs", ["Open the page named beside the word count.", "Replace a thin or hard-to-read paragraph with a few plain sentences.", "Say what the page offers, who it is for, and what to do next.", "Searchify does not rewrite the paragraph for you."]),
     "heading_order": ("Typography", ["Open the page.", "Keep one H1 that names the subject.", "Put H2 sections under that H1. Do not jump from H1 to H3.", "Update the page. Searchify does not edit the theme headings."]),
-    "render_mode": ("Render", ["This crawl reads the first HTML, before JavaScript runs.", "Server-rendered means the paragraph is already in that HTML.", "Client-rendered means the first HTML is thin and scripts are expected to fill the page. Many crawlers still read the thin HTML.", "Ask the site builder to put the main paragraph in the server HTML. Searchify does not change the theme."]),
-    "has_micromarkup_errors": ("Schema", ["Approve the title and description.", "On publish, leave Open Graph and JSON-LD turned on so Searchify writes a clean page schema."]),
-    "missing_open_graph": ("Social", ["Approve the title and description.", "On publish, leave Open Graph turned on. The social title and description use that same listing."]),
-    "missing_json_ld": ("Schema", ["Approve the title and description.", "On publish, leave JSON-LD turned on. Searchify writes a WebPage schema from that listing."]),
-    "faq_without_schema": ("FAQ", ["Keep the questions visible on the page as real headings.", "Answer each one in the paragraph under it.", "Approving the page schema does not invent answers that are not written on the page."]),
+    "render_mode": ("Render", [
+        "This crawl reads the first HTML the server sends, before JavaScript runs.",
+        "SSR (server-side): title, headings, copy and hero image are already in that HTML — Google and visitors see them on first paint.",
+        "CSR (client-side): the first HTML is a thin shell; copy and images arrive after scripts run — crawlers and slow devices often miss them.",
+        "Ask your developer to put the main paragraph, H1, and hero image in the server HTML (SSR, SSG, or pre-rendering). Searchify does not change the theme.",
+    ]),
+    "csr_heavy": ("Render", [
+        "Cause: the first HTML has little text while many scripts load — content waits on client-side rendering (CSR).",
+        "Improvement: ship the main copy, H1, and hero in the first HTML (SSR / pre-render). Defer non-critical JavaScript.",
+        "After it improves: Google and AI crawlers can read the page without waiting for JS; first paint and LCP get faster; Searchify’s crawl matches what visitors see.",
+        "Searchify reports this from the live HTML. Theme/host changes are done by your developer — not from another SEO plugin.",
+    ]),
+    "ssr_improve": ("Render", [
+        "Keep titles, headings, and above-the-fold copy in the server HTML (SSR).",
+        "Pre-render or cache HTML at the edge so TTFB and first paint stay low.",
+        "After it improves: Server reading content matches the live page; fewer “thin HTML” findings; LCP/FCP stabilize.",
+    ]),
+    "pre_render": ("Render", [
+        "Pre-render or statically generate key pages so the first response already includes readable content.",
+        "Cache that HTML (CDN / page cache) so Google does not wait on a cold PHP or Node render.",
+        "After it improves: first paint and TTFB drop; crawlers see the same content Searchify reads.",
+    ]),
+    "first_paint": ("Performance", [
+        "First paint / FCP is delayed when CSS or JS block the first view, or when the hero waits on client scripts.",
+        "Inline critical CSS if needed; defer non-critical scripts; keep the hero image in SSR HTML with width/height.",
+        "After it improves: visitors see text sooner; PageSpeed FCP/LCP scores rise; fewer render-blocking findings.",
+    ]),
+    "image_first_load": ("Images", [
+        "Cause: hero or FAQ images load late (no dimensions, no SSR sizes, or everything marked lazy).",
+        "Keep the LCP/hero image eager in server HTML with width, height, and a modern format; lazy-load only below the fold.",
+        "After it improves: less layout shift (CLS); faster LCP; image FAQs and product photos appear with the first paint.",
+        "In Searchify: open Site audit → Images, then update alt text from the page editor or the Searchify queue when a draft is ready.",
+    ]),
+    "server_content": ("Render", [
+        "Searchify (and Google) read what the server sends first.",
+        "If important copy only appears after JavaScript, put that copy in the server HTML or pre-render it.",
+        "After it improves: titles, FAQs, and body text show up in the audit and in search without waiting on CSR.",
+    ]),
+    "has_micromarkup_errors": ("Schema", ["Approve the title and description in Searchify.", "On publish, leave Open Graph and JSON-LD turned on so Searchify writes a clean page schema."]),
+    "missing_open_graph": ("Social", ["Approve the title and description in Searchify.", "On publish, leave Open Graph turned on. The social title and description use that same listing."]),
+    "missing_json_ld": ("Schema", ["Approve the title and description in Searchify.", "On publish, leave JSON-LD turned on. Searchify writes a WebPage schema from that listing."]),
+    "faq_without_schema": ("FAQ", [
+        "Keep the questions visible on the page as real headings, with answers in the paragraph under each one.",
+        "If the FAQ uses images, give each image alt text and keep the answer text in the HTML (not only in a click handler).",
+        "Approve the page in Searchify so FAQ schema can match the visible Q&A — Searchify does not invent answers that are not on the page.",
+        "After it improves: FAQ findings clear; rich results / AI tools can read the same questions Searchify shows.",
+    ]),
     "video_without_details": ("Video", ["Give the video page a title that says what the video is about.", "Add one paragraph that describes the video.", "Add the video on the page itself. Searchify does not upload the file."]),
-    "missing_share_image": ("Social", ["Choose one clear image that represents the page.", "Set it as the social share image in your SEO plugin.", "Searchify does not create the image."]),
+    "missing_share_image": ("Social", [
+        "Choose one clear image that represents the page.",
+        "Set it as the social share image when you approve the page in Searchify (Open Graph on publish), or in your theme’s featured image.",
+        "Searchify does not create the image file.",
+    ]),
 }
 
 
@@ -1213,7 +1259,7 @@ def _listing_gaps(items: list[dict]) -> list[dict]:
         ("missing_json_ld", "Pages have no JSON-LD schema", "Warning",
          "Publish the approved title with JSON-LD turned on.", True, missing_schema),
         ("missing_share_image", "Pages have no social share image", "Notice",
-         "Set a share image in the SEO plugin. Searchify does not create the picture.", False, missing_image),
+         "Set a featured / share image and approve Open Graph in Searchify. Searchify does not create the picture.", False, missing_image),
         ("faq_without_schema", "Question headings are not backed by FAQ schema", "Notice",
          "Write the answer under each question on the page. Searchify does not invent FAQ answers.", False, faq_pages),
         ("video_without_details", "Video pages are missing video details for search and social", "Notice",
@@ -1415,11 +1461,66 @@ def _content_findings(items: list[dict]) -> list[dict]:
             "Rewrite the thin paragraph on each page named here.",
             paragraph_pages,
         ))
-    if render_pages:
+    csr_pages = [p for p in render_pages if "client-rendered" in str(p.get("detail") or "").lower() or "Likely client" in str(p.get("detail") or "")]
+    ssr_pages = [p for p in render_pages if "Server-rendered" in str(p.get("detail") or "")]
+    thin_pages = [p for p in render_pages if p not in csr_pages and p not in ssr_pages]
+    if csr_pages:
+        findings.append(_content_issue(
+            "csr_heavy",
+            "Client-side rendering (CSR) hides content from the first HTML",
+            "Warning",
+            "Cause: thin first HTML + many scripts. Put the main copy, H1, and hero image in SSR/pre-rendered HTML. "
+            "After it improves: crawlers read the page without waiting on JavaScript; first paint and LCP get faster.",
+            csr_pages,
+        ))
+    if ssr_pages and not csr_pages:
+        findings.append(_content_issue(
+            "ssr_improve",
+            "Server-side rendering (SSR) is in place — keep improving first paint",
+            "Notice",
+            "Content is already in the first HTML. Next: cache SSR HTML, keep hero images sized in markup, defer non-critical JS. "
+            "After it improves: FCP/LCP stay stable and Searchify keeps matching what Google reads.",
+            ssr_pages[:15],
+        ))
+    if thin_pages and not csr_pages:
+        findings.append(_content_issue(
+            "server_content",
+            "Server HTML is thin — add readable content before scripts",
+            "Notice",
+            "Cause: little text in the first HTML. Add a real paragraph on the server response. "
+            "After it improves: Searchify and Google see the offer without CSR.",
+            thin_pages,
+        ))
+    if csr_pages or thin_pages:
+        findings.append(_content_issue(
+            "pre_render",
+            "Pre-rendering / cached HTML would speed first paint",
+            "Notice" if not csr else "Warning",
+            "Pre-render or edge-cache key pages so the first response includes copy and the hero. "
+            "After it improves: TTFB and first paint drop; fewer CSR thin-shell findings.",
+            (csr_pages or thin_pages)[:12],
+        ))
+        findings.append(_content_issue(
+            "first_paint",
+            "First paint can improve with SSR content and lighter scripts",
+            "Warning" if csr else "Notice",
+            "Defer non-critical JavaScript and keep above-the-fold text/images in the server HTML. "
+            "After it improves: visitors see content sooner; PageSpeed FCP/LCP rise.",
+            (csr_pages or thin_pages)[:12],
+        ))
+        findings.append(_content_issue(
+            "image_first_load",
+            "Image first-loading (hero / FAQ images) should be in SSR HTML",
+            "Warning" if csr else "Notice",
+            "Eager-load the LCP/hero image in server HTML with width/height; lazy-load only below the fold. "
+            "After it improves: less CLS, faster LCP, FAQ and product images appear with first paint.",
+            (csr_pages or thin_pages)[:12],
+        ))
+    if render_pages and not (csr_pages or thin_pages):
         findings.append(_content_issue(
             "render_mode",
             "Server and client render",
-            "Warning" if csr else "Notice",
+            "Notice",
             "Read each page's render note. Text that exists only after JavaScript can be missed.",
             render_pages,
         ))
@@ -1484,7 +1585,7 @@ def _fetch_checked_pages(task_id: str, key: str, limit: int = 25) -> list[dict]:
     return list(((result or [{}])[0] or {}).get("items") or [])
 
 
-AUDIT_REPORT_VERSION = 2
+AUDIT_REPORT_VERSION = 3
 
 
 def _optional_items(path: str, body: dict, timeout: float = 60) -> list[dict]:

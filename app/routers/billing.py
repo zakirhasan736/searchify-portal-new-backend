@@ -229,6 +229,262 @@ def _normalize_since_rows(raw: list) -> list[dict]:
     return out
 
 
+def _num0(value) -> int:
+    """Coerce to a non-negative int; missing / bad values become 0 (TrialReport.html)."""
+    if value is None or value == "" or value == "—":
+        return 0
+    try:
+        return max(0, int(round(float(str(value).replace(",", "").replace("%", "").strip()))))
+    except Exception:
+        return 0
+
+
+def _trial_status(before: int, after: int, *, moves: int = 0, kind: str = "count") -> str:
+    """Plain-language status matching TrialReport.html tone."""
+    if before == 0 and after == 0:
+        return "Too early to call"
+    if after > before:
+        if kind == "pages" and after - before >= 3:
+            return "Proven"
+        delta = after - before
+        if before > 0:
+            pct = round((delta / before) * 100)
+            if pct >= 10:
+                return f"Early sign, +{pct}%"
+        return "Early sign, rising" if kind != "pages" else "Early sign"
+    if after < before:
+        return "Too early to call"
+    if moves and after > 0:
+        return "Too early to call"
+    return "Too early to call"
+
+
+def _series_ends(weekly, index: int = 1) -> tuple[int | None, int | None]:
+    """Early vs late average from a weekly series; index picks the numeric column."""
+    if not isinstance(weekly, list) or len(weekly) < 2:
+        return None, None
+    vals: list[float] = []
+    for point in weekly:
+        try:
+            if isinstance(point, (list, tuple)) and len(point) > index:
+                vals.append(float(point[index] or 0))
+            elif isinstance(point, dict):
+                key = ("clicks", "impressions", "value", "count")[min(index - 1, 3)] if index >= 1 else "clicks"
+                if point.get(key) is not None:
+                    vals.append(float(point.get(key) or 0))
+                elif point.get("clicks") is not None and index == 1:
+                    vals.append(float(point.get("clicks") or 0))
+                elif point.get("impressions") is not None and index == 2:
+                    vals.append(float(point.get("impressions") or 0))
+        except Exception:
+            continue
+    if len(vals) < 2:
+        return None, None
+    chunk = max(1, len(vals) // 4)
+    early = vals[:chunk]
+    late = vals[-chunk:]
+    return round(sum(early) / len(early)), round(sum(late) / len(late))
+
+
+def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, moves: int) -> dict:
+    """TrialReport.html — The numbers, honestly. Always six rows; missing values are 0."""
+    stored = _feature(db, user.id, "trial-report-metrics") or _feature(db, user.id, "results-snapshot")
+    organic = _feature(db, user.id, "organic-search")
+    ga4 = _feature(db, user.id, "ga4-overview") or _feature(db, user.id, "analytics-overview") or _feature(db, user.id, "ga4")
+    path_board = _feature(db, user.id, "path-board") or _feature(db, user.id, "page-progress")
+    audit = _feature(db, user.id, "site-audit")
+    scan = _feature(db, user.id, "site-scan") or {}
+
+    # --- Healthy pages (now) ---
+    healthy_now = 0
+    pages = path_board.get("pages") if isinstance(path_board.get("pages"), list) else path_board.get("rows")
+    if isinstance(pages, list):
+        for p in pages:
+            if not isinstance(p, dict):
+                continue
+            grade = str(p.get("grade") or p.get("status") or p.get("band") or "").lower()
+            if grade in {"great", "excellent", "pass", "passes", "good", "healthy", "green"}:
+                healthy_now += 1
+    if not healthy_now and path_board.get("greatCount") is not None:
+        healthy_now = _num0(path_board.get("greatCount"))
+    if not healthy_now:
+        counts = scan.get("counts") if isinstance(scan.get("counts"), dict) else {}
+        if counts.get("green") is not None:
+            healthy_now = _num0(counts.get("green"))
+        else:
+            # Count passing audit rows as healthy when no path board.
+            for row in audit.get("rows") or []:
+                if isinstance(row, (list, tuple)) and len(row) > 1:
+                    sev = str(row[1] or row[3] or "").lower()
+                    if sev in {"pass", "good", "ok"} or "pass" in sev:
+                        healthy_now += 1
+    healthy_from = _num0(stored.get("healthyFrom")) if stored.get("healthyFrom") is not None else 0
+    if healthy_from == 0 and healthy_now and not stored.get("healthyFrom"):
+        # No baseline saved yet — day 1 stays 0 until we persist a start snapshot.
+        healthy_from = 0
+
+    # --- Searches / impressions / clicks from GSC organic-search ---
+    searches_now = _num0(_kpi_num(organic, "quer", "search", "keyword"))
+    if not searches_now:
+        rows = organic.get("rows") if isinstance(organic.get("rows"), list) else []
+        searches_now = len([r for r in rows if isinstance(r, (list, tuple)) and r])
+    panels = organic.get("panels") if isinstance(organic.get("panels"), dict) else {}
+    if not searches_now and isinstance(panels.get("queries"), list):
+        searches_now = len(panels["queries"])
+
+    impressions_now = _num0(_kpi_num(organic, "impression", "show"))
+    clicks_now = _num0(_kpi_num(organic, "click"))
+
+    # Page-one searches: queries with position <= 10
+    page_one_now = _num0(_kpi_num(organic, "page one", "page 1", "top 10"))
+    if not page_one_now:
+        qrows = organic.get("rows") if isinstance(organic.get("rows"), list) else []
+        if not qrows and isinstance(panels.get("queries"), list):
+            qrows = panels["queries"]
+        count = 0
+        for row in qrows:
+            try:
+                if isinstance(row, (list, tuple)) and len(row) >= 5:
+                    pos = float(str(row[4]).replace(",", "") or 0)
+                elif isinstance(row, dict):
+                    pos = float(row.get("position") or row.get("rank") or 0)
+                else:
+                    continue
+                if 0 < pos <= 10:
+                    count += 1
+            except Exception:
+                continue
+        page_one_now = count
+
+    # Weekly series → day-1 vs now when history exists
+    weekly = panels.get("weeklyClicks") or organic.get("weeklyClicks")
+    weekly_imp = panels.get("weeklyImpressions") or organic.get("weeklyImpressions")
+    clicks_from_s, clicks_to_s = _series_ends(weekly, 1)
+    imp_from_s, imp_to_s = _series_ends(weekly_imp if weekly_imp else weekly, 2 if not weekly_imp else 1)
+
+    searches_from = _num0(stored.get("searchesFrom"))
+    impressions_from = _num0(stored.get("impressionsFrom"))
+    page_one_from = _num0(stored.get("pageOneFrom"))
+    clicks_from = _num0(stored.get("clicksFrom"))
+    if clicks_from_s is not None:
+        clicks_from = _num0(clicks_from_s)
+        clicks_now = _num0(clicks_to_s if clicks_to_s is not None else clicks_now)
+    if imp_from_s is not None:
+        impressions_from = _num0(imp_from_s)
+        impressions_now = _num0(imp_to_s if imp_to_s is not None else impressions_now)
+
+    # Prefer explicit stored baselines when present
+    if stored.get("searchesFrom") is not None:
+        searches_from = _num0(stored.get("searchesFrom"))
+    if stored.get("pageOneFrom") is not None:
+        page_one_from = _num0(stored.get("pageOneFrom"))
+    if stored.get("healthyFrom") is not None:
+        healthy_from = _num0(stored.get("healthyFrom"))
+
+    # Calls / form leads from GA4
+    leads_now = _num0(
+        _kpi_num(ga4, "conversion", "key event", "lead", "call", "form", "contact")
+        or ga4.get("conversions")
+        or ga4.get("keyEvents")
+        or ga4.get("leads")
+    )
+    leads_from = _num0(stored.get("leadsFrom"))
+
+    # If stored snapshot has a full trialMetrics list, prefer normalized numbers from it.
+    if isinstance(stored.get("trialMetrics"), list) and stored.get("trialMetrics"):
+        by_label = {
+            str(item.get("label") or "").strip().lower(): item
+            for item in stored["trialMetrics"]
+            if isinstance(item, dict)
+        }
+
+        def snap(label: str, fallback_from: int, fallback_to: int) -> tuple[int, int]:
+            row = by_label.get(label.lower()) or {}
+            return _num0(row.get("from") if row.get("from") is not None else fallback_from), _num0(
+                row.get("to") if row.get("to") is not None else fallback_to
+            )
+
+        healthy_from, healthy_now = snap("Healthy pages", healthy_from, healthy_now)
+        searches_from, searches_now = snap("Searches you show up for", searches_from, searches_now)
+        impressions_from, impressions_now = snap("Times Google showed your site", impressions_from, impressions_now)
+        page_one_from, page_one_now = snap("Searches on page one", page_one_from, page_one_now)
+        clicks_from, clicks_now = snap("Clicks from Google", clicks_from, clicks_now)
+        leads_from, leads_now = snap("Calls and form leads", leads_from, leads_now)
+
+    rows = [
+        {
+            "label": "Healthy pages",
+            "from": healthy_from,
+            "to": healthy_now,
+            "change": _trial_status(healthy_from, healthy_now, moves=moves, kind="pages"),
+        },
+        {
+            "label": "Searches you show up for",
+            "from": searches_from,
+            "to": searches_now,
+            "change": _trial_status(searches_from, searches_now, moves=moves),
+        },
+        {
+            "label": "Times Google showed your site",
+            "from": impressions_from,
+            "to": impressions_now,
+            "change": _trial_status(impressions_from, impressions_now, moves=moves),
+        },
+        {
+            "label": "Searches on page one",
+            "from": page_one_from,
+            "to": page_one_now,
+            "change": _trial_status(page_one_from, page_one_now, moves=moves),
+        },
+        {
+            "label": "Clicks from Google",
+            "from": clicks_from,
+            "to": clicks_now,
+            "change": _trial_status(clicks_from, clicks_now, moves=moves),
+        },
+        {
+            "label": "Calls and form leads",
+            "from": leads_from,
+            "to": leads_now,
+            "change": _trial_status(leads_from, leads_now, moves=moves),
+        },
+    ]
+
+    # Persist a day-1 baseline once when we first see live non-zero "now" values and no baseline yet.
+    needs_baseline = not stored.get("trialBaselineSaved")
+    if needs_baseline and any(r["to"] > 0 for r in rows):
+        baseline = {
+            "trialBaselineSaved": True,
+            "healthyFrom": healthy_now,  # first sighting becomes day-1 floor for future diffs
+            "searchesFrom": searches_now,
+            "impressionsFrom": impressions_now,
+            "pageOneFrom": page_one_now,
+            "clicksFrom": clicks_now,
+            "leadsFrom": leads_now,
+            "savedAt": datetime.utcnow().isoformat() + "Z",
+            "joinedAt": joined.isoformat() + "Z",
+        }
+        # Day-1 display for this first report: use current as both ends (honest start).
+        for r in rows:
+            r["from"] = r["to"]
+            r["change"] = "Too early to call" if r["to"] == 0 else "Early sign"
+        try:
+            _save_feature(db, user.id, "trial-report-metrics", "Trial report metrics", {**baseline, "trialMetrics": rows})
+        except Exception:
+            pass
+        # Re-read semantics: after saving baseline, from==to on first view is correct.
+
+    has_live = any(r["to"] > 0 or r["from"] > 0 for r in rows)
+    return {
+        "trialMetrics": rows,
+        "trialMetricsLive": has_live,
+        "trialMetricsNote": (
+            "From your Google Search Console and Analytics when connected. "
+            '"Too early" means a fix went live recently or we do not have history yet.'
+        ),
+    }
+
+
 def _build_cancel_since(db: Session, user: User, *, joined: datetime, moves: int) -> dict:
     """Live before/after cards for Cancel.html — never uses design demo numbers."""
     stored = _feature(db, user.id, "cancel-since") or _feature(db, user.id, "results-snapshot")
@@ -463,6 +719,7 @@ def _account_payload(db: Session, user: User) -> dict:
     amount = price * 10 if billing == "annual" else price
     solo_mo = int(BY_ID["solo"]["mo"])
     since_pack = _build_cancel_since(db, user, joined=joined, moves=int(moves))
+    trial_pack = _build_trial_report_metrics(db, user, joined=joined, moves=int(moves))
     joined_short = _fmt_day(joined)
     plan_line = f"{plan['name']} · ${amount} / {per}"
     move_bit = (
@@ -505,6 +762,9 @@ def _account_payload(db: Session, user: User) -> dict:
         "sinceLive": bool(since_pack.get("sinceLive")),
         "sinceSource": since_pack.get("sinceSource") or "computed",
         "sinceNote": since_pack.get("sinceNote") or "",
+        "trialMetrics": trial_pack.get("trialMetrics") or [],
+        "trialMetricsLive": bool(trial_pack.get("trialMetricsLive")),
+        "trialMetricsNote": trial_pack.get("trialMetricsNote") or "",
         "earlyLaunchTotal": int(early.get("total") or EARLY_LAUNCH_SEED["total"]),
         "cancel": cancel or {},
         "pause": pause or {},

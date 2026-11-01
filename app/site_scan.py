@@ -258,6 +258,7 @@ def read_page(client: httpx.Client, url: str) -> dict:
     img_sized = len(re.findall(r"<img[^>]*(?:width=|height=)", lower_html[:250_000], flags=re.I))
     img_lazy = len(re.findall(r"<img[^>]*loading=['\"]lazy['\"]", lower_html[:250_000], flags=re.I))
     img_srcset = lower_html[:250_000].count("srcset=")
+    class_bits = re.findall(r'class=["\']([^"\']+)["\']', html_slice[:120_000], flags=re.I)
     render_hints = {
         "nextData": "__NEXT_DATA__" in html_slice,
         "nextRoot": 'id="__next"' in lower_html or "id='__next'" in lower_html,
@@ -270,6 +271,7 @@ def read_page(client: httpx.Client, url: str) -> dict:
         "imgLazy": img_lazy,
         "imgSrcset": img_srcset,
         "bytes": len(html_slice.encode("utf-8", errors="ignore")),
+        "classSample": " ".join(class_bits[:80])[:4000],
     }
     title = " ".join(reader.title)[:200]
     description = (reader.description or reader.og_description).strip()[:400]
@@ -730,6 +732,100 @@ def _topic_from_audit_title(title: str) -> str:
     if "cls" in label_l or "layout shift" in label_l:
         return "cls"
     return "speed"
+
+
+def _preview_markup_quality(pages: list, html_slice: str = "") -> dict:
+    """Title/description/heading typography, BEM class hygiene, CSS/JS footprint from live HTML."""
+    home = pages[0] if pages else {}
+    hints = home.get("renderHints") if isinstance(home.get("renderHints"), dict) else {}
+    issues: list[dict] = []
+
+    def push(topic: str, color: str, label: str, detail: str) -> None:
+        issues.append(
+            {
+                "topic": topic,
+                "color": color,
+                "path": "/",
+                "label": label,
+                "detail": detail,
+                "title": str(home.get("title") or ""),
+                "source": "markup",
+            }
+        )
+
+    # Heading / typography
+    h1 = str(home.get("h1") or "").strip()
+    headings = home.get("headings") if isinstance(home.get("headings"), list) else []
+    h1_parts = [p.strip() for p in h1.split("|") if p.strip()] if h1 else []
+    if not h1:
+        push("typography", "yellow", "Missing H1 heading", "The homepage has no H1. Typography hierarchy starts with one clear H1.")
+    elif len(h1_parts) > 1:
+        push(
+            "typography",
+            "yellow",
+            "Multiple H1-style headings on the homepage",
+            "Google prefers one clear H1. Extra H1s weaken typography and topic focus.",
+        )
+    if headings and len(headings) >= 2:
+        # Skipped levels are hard without tag names; flag very flat outlines.
+        if len(headings) <= 2 and int(home.get("words") or 0) > 200:
+            push(
+                "heading",
+                "yellow",
+                "Thin heading outline",
+                "Few H2/H3 headings for a long page — structure the copy with clearer typography.",
+            )
+
+    # BEM / class naming hygiene from raw HTML or a classSample token string
+    sample = html_slice or ""
+    if not sample and isinstance(hints.get("classSample"), str):
+        sample = hints["classSample"]
+    classes = re.findall(r'class=["\']([^"\']+)["\']', sample[:200_000], flags=re.I)
+    tokens: list[str] = []
+    for block in classes[:400]:
+        tokens.extend(t for t in re.split(r"\s+", block) if t)
+    if not tokens and sample and "class=" not in sample.lower():
+        tokens = [t for t in re.split(r"\s+", sample) if t and len(t) < 80][:400]
+    bem_like = 0
+    if tokens:
+        bem_like = sum(1 for t in tokens if "__" in t or "--" in t or re.match(r"^[a-z]+(-[a-z0-9]+)+$", t))
+        utility_heavy = sum(1 for t in tokens if re.match(r"^(p|m|mt|mb|px|py|w|h|text|bg|flex|grid)-", t))
+        chaotic = sum(1 for t in tokens if re.search(r"[A-Z].*[A-Z]|_|[0-9]{3,}", t) and "__" not in t)
+        ratio = bem_like / max(1, len(tokens))
+        if ratio < 0.08 and chaotic > 12:
+            push(
+                "bem",
+                "yellow",
+                "CSS class names look inconsistent (not BEM-like)",
+                "Mixed, hard-to-maintain class names make CSS refactors risky. Prefer Block__Element--Modifier (BEM) or a clear system.",
+            )
+        if utility_heavy > len(tokens) * 0.55:
+            push(
+                "css",
+                "yellow",
+                "Utility-class CSS dominates the markup",
+                "Heavy utility CSS can bloat HTML and hurt maintainability. Audit unused CSS with PageSpeed.",
+            )
+
+    scripts = int(hints.get("scriptTags") or 0)
+    if scripts >= 20:
+        push(
+            "javascript",
+            "yellow",
+            f"{scripts} script tags on the homepage",
+            "A large JavaScript footprint often slows LCP and INP. Prefer SSR for critical content and defer non-critical JS.",
+        )
+    imgs = int(hints.get("imgTags") or 0)
+    sized = int(hints.get("imgSized") or 0)
+    if imgs and sized < max(1, imgs // 2):
+        push(
+            "image",
+            "yellow",
+            "Images missing width/height attributes",
+            "Unset image dimensions cause layout shift (CLS). Set sizes in SSR HTML.",
+        )
+
+    return {"issues": issues[:10], "classTokens": len(tokens), "bemRatio": round((bem_like / max(1, len(tokens))), 3) if tokens else 0}
 
 
 def _preview_rendering(pages: list, pagespeed: dict | None = None) -> dict:
@@ -1658,12 +1754,21 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         if title:
             titles.append(title)
         if color != "green":
+            low = label.lower()
+            topic = (
+                "title" if "title" in low else
+                "description" if "description" in low else
+                "heading" if "heading" in low else
+                "content"
+            )
             findings.append({
                 "color": color,
                 "path": path,
                 "label": label,
                 "detail": detail,
                 "title": title,
+                "topic": topic,
+                "source": "crawl",
             })
     broken = [row for row in failed if str(row.get("error") or "").startswith("HTTP 4") or str(row.get("error") or "").startswith("HTTP 5")]
     if broken:
@@ -1695,8 +1800,13 @@ def preview_scan(home: str, limit: int = 40) -> dict:
     competitors = _preview_competitors(host, places, visits)
     pagespeed = _preview_pagespeed(crawled.get("home") or home)
     rendering = _preview_rendering(pages, pagespeed)
-    # Fold PageSpeed + SSR/CSR/image issues into the heatmap + findings.
-    for issue in [*(pagespeed.get("issues") or []), *(rendering.get("issues") or [])]:
+    markup = _preview_markup_quality(pages, str((pages[0] or {}).get("renderHints", {}).get("classSample") or "") if pages else "")
+    # Fold PageSpeed + SSR/CSR/image + markup (BEM/typography/CSS/JS) into findings.
+    for issue in [
+        *(pagespeed.get("issues") or []),
+        *(rendering.get("issues") or []),
+        *(markup.get("issues") or []),
+    ]:
         color = str(issue.get("color") or "yellow")
         if color in counts:
             counts[color] = counts.get(color, 0) + 1
@@ -1707,13 +1817,85 @@ def preview_scan(home: str, limit: int = 40) -> dict:
                 "path": str(issue.get("path") or "/"),
                 "label": issue.get("label") or "PageSpeed issue",
                 "detail": issue.get("detail") or "",
-                "title": "",
+                "title": issue.get("title") or "",
                 "topic": issue.get("topic") or "speed",
                 "source": issue.get("source") or "pagespeed",
             }
         )
     findings.sort(key=lambda item: order.get(item["color"], 9))
     grade, gradeColor, gradeNote = _preview_grade(counts)
+
+    # Topic checklist for FreeAnalysis major-issue showcase (HTML layout + tech topics).
+    topic_keys = (
+        "title",
+        "description",
+        "heading",
+        "typography",
+        "bem",
+        "css",
+        "javascript",
+        "image",
+        "lcp",
+        "cls",
+        "ssr",
+        "csr",
+        "places",
+        "grade",
+    )
+    topic_status = []
+    for key in topic_keys:
+        if key == "places":
+            if places:
+                topic_status.append(
+                    {
+                        "topic": "places",
+                        "status": "ok",
+                        "color": "green",
+                        "label": f"{len(places)} Google Places rivals nearby",
+                        "detail": (str(places[0].get("query") or "") if places else "") or category,
+                    }
+                )
+            else:
+                topic_status.append(
+                    {
+                        "topic": "places",
+                        "status": "warning",
+                        "color": "yellow",
+                        "label": "No Google Places rivals found yet",
+                        "detail": "Category or city was unclear from the crawl.",
+                    }
+                )
+            continue
+        if key == "grade":
+            tone = "green"
+            if grade in ("D", "D+", "F", "C-", "C"):
+                tone = "yellow"
+            if grade in ("D-", "F") or (counts.get("red") or 0) >= 4:
+                tone = "red"
+            topic_status.append(
+                {
+                    "topic": "grade",
+                    "status": "error" if tone == "red" else ("warning" if tone == "yellow" else "ok"),
+                    "color": tone,
+                    "label": f"Site rank grade {grade}",
+                    "detail": gradeNote or "",
+                }
+            )
+            continue
+        hits = [f for f in findings if str(f.get("topic") or "") == key]
+        if not hits:
+            topic_status.append({"topic": key, "status": "ok", "color": "green", "label": "Looking fine", "detail": ""})
+            continue
+        worst = hits[0]
+        topic_status.append(
+            {
+                "topic": key,
+                "status": "error" if worst.get("color") == "red" else "warning",
+                "color": worst.get("color") or "yellow",
+                "label": worst.get("label") or key,
+                "detail": worst.get("detail") or "",
+            }
+        )
     about = _preview_about(pages, brand, host, findings, category=category, city=city)
     opportunities = _preview_opportunities(pages, brand, category, city, places, findings)
     name_bit = brand.split()[0] if brand else "there"
@@ -1798,7 +1980,9 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "pagespeed": pagespeed or None,
         "pagespeedSource": pagespeed.get("source") if pagespeed else "",
         "rendering": rendering or None,
+        "markup": markup or None,
+        "topicStatus": topic_status,
         "deepScan": True,
         "scanLimit": deep,
-        "scanVersion": "free-deep-v4",
+        "scanVersion": "free-deep-v5",
     }

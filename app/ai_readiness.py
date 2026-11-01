@@ -286,7 +286,7 @@ def _reason(key, name, severity, group, engines, fix, steps, pages, *, help_url=
 
 ROBOTS_STEPS = [
     "Open yoursite/robots.txt in a browser and find the 'User-agent' group named below.",
-    "Delete the 'Disallow: /' line for that crawler (or add 'Allow: /'). In WordPress: Yoast → Tools → File editor, Rank Math → General → Edit robots.txt, or your host's file manager.",
+    "Delete the 'Disallow: /' line for that crawler (or add 'Allow: /') in robots.txt via your host file manager or site root.",
     "If you use Cloudflare, also check Security → Bots → 'Block AI bots' / AI Crawl Control is not blocking it.",
     "Save, reload robots.txt to confirm, then press Re-check here.",
 ]
@@ -363,7 +363,7 @@ def page_signal_reasons(checks: dict) -> list[dict]:
                            ["Google AI Overviews", "Gemini", "Copilot", "ChatGPT", "Perplexity"],
                            f"The home page tells crawlers not to index it ({where}). Pages that aren't indexed are not shown or cited in AI answers.",
                            ["WordPress: Settings → Reading → untick 'Discourage search engines from indexing this site'.",
-                            "SEO plugin: open the page → Advanced → set 'Allow search engines to show this page' to Yes.",
+                            "Remove noindex from the page meta robots if the page should rank (Searchify drafts do not add noindex).",
                             "Check the host/CDN isn't adding an X-Robots-Tag: noindex header.", "Re-check, then request indexing in Search Console."],
                            [page_row(home.get("url") or "/", status=home.get("status"), detail=where)], help_url=DOC["noindex"]))
     snippet = directives & {"nosnippet", "max-snippet:0"}
@@ -371,7 +371,7 @@ def page_signal_reasons(checks: dict) -> list[dict]:
         out.append(_reason("ai_nosnippet", "nosnippet stops Google using your text in AI Overviews", "Warning", "indexing",
                            ["Google AI Overviews", "Gemini"],
                            f"The home page uses {', '.join(sorted(snippet))} ({where}). Google won't quote this page in snippets or AI Overviews.",
-                           ["Remove nosnippet / max-snippet:0 from the robots meta tag (SEO plugin → Advanced → Robots meta).",
+                           ["Remove nosnippet / max-snippet:0 from the robots meta tag on the page (or the theme/head).",
                             "To hide only part of a page use data-nosnippet on that element instead.", "Re-check here."],
                            [page_row(home.get("url") or "/", detail=where)], help_url=DOC["snippet"]))
     noai = directives & {"noai", "noimageai"}
@@ -399,7 +399,7 @@ def page_signal_reasons(checks: dict) -> list[dict]:
         out.append(_reason("ai_llms_txt_" + problem, name, "Notice", "setup", ["ChatGPT", "Claude", "Perplexity"], fix,
                            ["Create a plain text file named llms.txt in the site root (same place as robots.txt).",
                             "Start with '# Your business name', then a '> one-line summary', then a list of your key pages as '- [Page name](https://…): what it covers'.",
-                            "Yoast and Rank Math can generate it (Yoast → Settings → llms.txt; Rank Math → General → llms.txt).",
+                            "You can create llms.txt by hand in the site root. Searchify guides AI readiness without requiring a third-party SEO plugin.",
                             "Open yoursite/llms.txt to check it shows as plain text, then Re-check."],
                            [page_row("/llms.txt", status=llms.get("status"))], help_url=DOC["llms_txt"]))
     return out
@@ -426,7 +426,7 @@ def content_reasons(scan: dict | None, profile: dict | None = None) -> list[dict
                            ["ChatGPT", "Claude", "Gemini", "Google AI Overviews", "Perplexity", "Copilot"],
                            "None of the scanned pages describes the business in structured data (name, address, phone, area served, logo, sameAs links). "
                            "Answer engines use these facts to match your brand to questions like 'best plumber in Toronto'.",
-                           ["SEO plugin → Schema / Knowledge Graph: choose Organization or LocalBusiness and fill name, logo, address, phone and opening hours.",
+                           ["Approve the home page in Searchify with JSON-LD on so Organization / LocalBusiness schema can ship with name, logo, address, phone and hours.",
                             "Add sameAs links to your Google Business Profile, Facebook, LinkedIn and Yelp pages.",
                             "Test the home page in Google's Rich Results Test, then scan again."],
                            [page_row(home.get("url") or "/", title=home.get("title") or "")], help_url=DOC["business"]))
@@ -469,7 +469,7 @@ def indexing_reasons(scan: dict | None, inspection: dict | None) -> list[dict]:
         out.append(_reason("ai_pages_noindex", "Pages hidden from search and AI answers (noindex)", "Warning", "indexing",
                            ["Google AI Overviews", "Gemini", "Copilot", "ChatGPT", "Perplexity"],
                            "These pages tell search engines not to index them, so they can't appear in AI answers either. Fine for thank-you or login pages; a problem for service pages.",
-                           ["Open each page in the SEO plugin → Advanced and allow indexing if the page should rank.", "Request indexing in Search Console after the change."],
+                           ["Remove noindex from each public service page, then re-check in Searchify → Site audit.", "Request indexing in Search Console after the change."],
                            [page_row(p.get("url") or "", title=p.get("title") or "", detail="meta robots noindex") for p in hidden], help_url=DOC["noindex"]))
     rows = (inspection or {}).get("rows") or []
     not_indexed = [r for r in rows if isinstance(r, list) and len(r) >= 3 and r[2] not in {"PASS", "—"}]

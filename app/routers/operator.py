@@ -2499,8 +2499,8 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
             result["verified"] = False
             result["detail"] = (
                 "WordPress accepted the request, but the live page still shows the old title. "
-                "Install the Searchify SEO Meta helper (deploy/wordpress/searchify-seo-meta.php) so Yoast, "
-                "Rank Math, or SEOPress fields can be written, or clear the page cache and check again."
+                "Install the Searchify SEO Meta helper (deploy/wordpress/searchify-seo-meta.php) so titles "
+                "and descriptions publish from Searchify, or clear the page cache and check again."
             )
         row.proposed = proposed
         row.applied_at = datetime.utcnow()
