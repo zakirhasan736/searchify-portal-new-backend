@@ -300,8 +300,35 @@ def backlink_concepts(payload: dict | None, offers: list[str] | None) -> dict:
             ),
         })
     if not links:
-        note = "No referring domains are stored yet. Refresh live backlink data."
-        rows = []
+        note = "No referring domains in the live index yet. Refresh backlinks, or use the gap moves below from your site reading."
+        # Still return actionable concept rows from the offer (directory / local listing gaps).
+        if offers:
+            rows = [
+                {
+                    "title": f"Local directories for {offers[0]}",
+                    "concept": offers[0],
+                    "domain": "",
+                    "why": (
+                        f"No outside links are indexed yet. Start with trusted local directories and chambers that list {offers[0]} "
+                        "businesses — those are the easiest first referring domains."
+                    ),
+                    "cta": "Open application ideas",
+                    "action": "apply",
+                    "type": "Directory gap",
+                },
+                {
+                    "title": "Partner and supplier pages",
+                    "concept": offers[0],
+                    "domain": "",
+                    "why": (
+                        "Ask partners, suppliers, and community sites that already mention you to add a link to your homepage. "
+                        "A mention without a link is the easiest outreach."
+                    ),
+                    "cta": "Draft outreach",
+                    "action": "email",
+                    "type": "Unlinked mention",
+                },
+            ]
     elif not offers:
         note = "These are the stored links. Read the site so this view can mark which anchors match the offer."
     else:

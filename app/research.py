@@ -576,7 +576,7 @@ def _collect_backlinks(items: list, *, prefer: dict[str, dict] | None = None) ->
     return best
 
 
-BACKLINKS_QUALITY = 3
+BACKLINKS_QUALITY = 4
 
 
 def _soft_call(path: str, payload: list, *, default: list | None = None) -> tuple[list, float]:
@@ -753,6 +753,10 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     except ResearchError:
         live_res, c = _call("POST", "/backlinks/backlinks/live", [live_base])
     cost += c
+    # Spam filter can wipe the list while summary still shows domains — retry unfiltered once.
+    if not (((live_res or [{}])[0] or {}).get("items") or []):
+        live_res, c = _soft_call("/backlinks/backlinks/live", [live_base])
+        cost += c
     lost_res, c = _soft_call(
         "/backlinks/backlinks/live",
         [{
@@ -773,7 +777,7 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     cost += c
     referring_res, c = _soft_call(
         "/backlinks/referring_domains/live",
-        [{"target": host, "limit": 20, "order_by": ["rank,desc"], "exclude_internal_backlinks": True}],
+        [{"target": host, "limit": 40, "order_by": ["rank,desc"], "exclude_internal_backlinks": True}],
     )
     cost += c
     pages_res, c = _soft_call(
@@ -798,8 +802,34 @@ def backlinks(db: Session, user: User, *, site: str, force: bool = False, stored
     lost_page = (lost_res or [{}])[0] or {}
     merged = _collect_backlinks(live_page.get("items") or [])
     merged = _collect_backlinks(lost_page.get("items") or [], prefer=merged)
+    # If backlinks/live is empty but referring_domains has rows, surface those as link cards.
+    if not merged:
+        for item in ((referring_res or [{}])[0] or {}).get("items") or []:
+            domain = str(item.get("domain") or item.get("domain_from") or "").removeprefix("www.")
+            if not domain:
+                continue
+            mapped = {
+                "domain": domain,
+                "source": f"https://{domain}/",
+                "target": f"https://{host}/",
+                "anchor": "",
+                "follow": "Follow" if int(item.get("dofollow") or 0) > 0 else "Nofollow",
+                "state": "Active",
+                "rank": item.get("rank") if item.get("rank") is not None else item.get("domain_from_rank"),
+                "linkRank": item.get("rank"),
+                "domainRank": item.get("rank") if item.get("rank") is not None else item.get("domain_from_rank"),
+                "pageRank": None,
+                "spamScore": item.get("backlink_spam_score"),
+                "pageTitle": "",
+                "firstSeen": str(item.get("first_seen") or "")[:10] or None,
+                "lastSeen": str(item.get("last_seen") or "")[:10] or None,
+                "lostDate": None,
+                "seen": "From referring-domains index",
+                "_raw": item,
+            }
+            merged[domain] = mapped
     links = []
-    for row in sorted(merged.values(), key=lambda r: _link_quality(r["_raw"])):
+    for row in sorted(merged.values(), key=lambda r: _link_quality(r.get("_raw") or {})):
         row.pop("_raw", None)
         links.append(row)
 

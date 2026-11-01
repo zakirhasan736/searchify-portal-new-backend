@@ -286,6 +286,28 @@ def _series_ends(weekly, index: int = 1) -> tuple[int | None, int | None]:
     return round(sum(early) / len(early)), round(sum(late) / len(late))
 
 
+def _scan_health_counts(scan: dict, audit: dict | None = None) -> dict:
+    """Urgent / need-work / healthy page counts from the live site scan (or audit rows)."""
+    counts = scan.get("counts") if isinstance(scan.get("counts"), dict) else {}
+    red = _num0(counts.get("red"))
+    yellow = _num0(counts.get("yellow"))
+    green = _num0(counts.get("green"))
+    if red or yellow or green:
+        return {"red": red, "yellow": yellow, "green": green}
+    # Fall back to audit issue rows when the scan has no heatmap counts yet.
+    for row in (audit or {}).get("rows") or []:
+        if not isinstance(row, (list, tuple)) or len(row) < 2:
+            continue
+        sev = str(row[1] or row[3] or "").lower()
+        if sev in {"fail", "poor", "critical", "error"} or "fail" in sev or "critical" in sev:
+            red += 1
+        elif sev in {"warn", "warning", "average"} or "warn" in sev or "average" in sev:
+            yellow += 1
+        elif sev in {"pass", "good", "ok"} or "pass" in sev:
+            green += 1
+    return {"red": red, "yellow": yellow, "green": green}
+
+
 def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, moves: int) -> dict:
     """TrialReport.html — The numbers, honestly. Always six rows; missing values are 0."""
     stored = _feature(db, user.id, "trial-report-metrics") or _feature(db, user.id, "results-snapshot")
@@ -295,33 +317,35 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
     audit = _feature(db, user.id, "site-audit")
     scan = _feature(db, user.id, "site-scan") or {}
 
+    health_now = _scan_health_counts(scan, audit)
+    health_before = {
+        "red": _num0(stored.get("healthRedFrom")),
+        "yellow": _num0(stored.get("healthYellowFrom")),
+        "green": _num0(stored.get("healthGreenFrom")),
+    }
+    if not (health_before["red"] or health_before["yellow"] or health_before["green"]):
+        # No day-1 health snapshot yet — use current as both ends until baseline saves.
+        health_before = dict(health_now)
+
     # --- Healthy pages (now) ---
-    healthy_now = 0
+    healthy_now = health_now["green"]
     pages = path_board.get("pages") if isinstance(path_board.get("pages"), list) else path_board.get("rows")
     if isinstance(pages, list):
+        board_great = 0
         for p in pages:
             if not isinstance(p, dict):
                 continue
             grade = str(p.get("grade") or p.get("status") or p.get("band") or "").lower()
             if grade in {"great", "excellent", "pass", "passes", "good", "healthy", "green"}:
-                healthy_now += 1
+                board_great += 1
+        if board_great:
+            healthy_now = board_great
     if not healthy_now and path_board.get("greatCount") is not None:
         healthy_now = _num0(path_board.get("greatCount"))
-    if not healthy_now:
-        counts = scan.get("counts") if isinstance(scan.get("counts"), dict) else {}
-        if counts.get("green") is not None:
-            healthy_now = _num0(counts.get("green"))
-        else:
-            # Count passing audit rows as healthy when no path board.
-            for row in audit.get("rows") or []:
-                if isinstance(row, (list, tuple)) and len(row) > 1:
-                    sev = str(row[1] or row[3] or "").lower()
-                    if sev in {"pass", "good", "ok"} or "pass" in sev:
-                        healthy_now += 1
-    healthy_from = _num0(stored.get("healthyFrom")) if stored.get("healthyFrom") is not None else 0
-    if healthy_from == 0 and healthy_now and not stored.get("healthyFrom"):
-        # No baseline saved yet — day 1 stays 0 until we persist a start snapshot.
-        healthy_from = 0
+    healthy_from = _num0(stored.get("healthyFrom")) if stored.get("healthyFrom") is not None else health_before["green"]
+    if stored.get("healthyFrom") is None and not stored.get("trialBaselineSaved"):
+        # No baseline saved yet — day 1 matches now until we persist a start snapshot.
+        healthy_from = healthy_now
 
     # --- Searches / impressions / clicks from GSC organic-search ---
     searches_now = _num0(_kpi_num(organic, "quer", "search", "keyword"))
@@ -452,7 +476,7 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
 
     # Persist a day-1 baseline once when we first see live non-zero "now" values and no baseline yet.
     needs_baseline = not stored.get("trialBaselineSaved")
-    if needs_baseline and any(r["to"] > 0 for r in rows):
+    if needs_baseline and (any(r["to"] > 0 for r in rows) or any(health_now.values())):
         baseline = {
             "trialBaselineSaved": True,
             "healthyFrom": healthy_now,  # first sighting becomes day-1 floor for future diffs
@@ -461,20 +485,51 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
             "pageOneFrom": page_one_now,
             "clicksFrom": clicks_now,
             "leadsFrom": leads_now,
+            "healthRedFrom": health_now["red"],
+            "healthYellowFrom": health_now["yellow"],
+            "healthGreenFrom": health_now["green"],
             "savedAt": datetime.utcnow().isoformat() + "Z",
             "joinedAt": joined.isoformat() + "Z",
         }
+        health_before = dict(health_now)
         # Day-1 display for this first report: use current as both ends (honest start).
         for r in rows:
             r["from"] = r["to"]
             r["change"] = "Too early to call" if r["to"] == 0 else "Early sign"
         try:
-            _save_feature(db, user.id, "trial-report-metrics", "Trial report metrics", {**baseline, "trialMetrics": rows})
+            _save_feature(
+                db,
+                user.id,
+                "trial-report-metrics",
+                "Trial report metrics",
+                {
+                    **baseline,
+                    "trialMetrics": rows,
+                    "trialHealth": {"before": health_before, "after": health_now},
+                },
+            )
         except Exception:
             pass
         # Re-read semantics: after saving baseline, from==to on first view is correct.
+    elif stored.get("trialBaselineSaved"):
+        # Keep "now" health fresh on each account load without rewriting day-1.
+        try:
+            _save_feature(
+                db,
+                user.id,
+                "trial-report-metrics",
+                "Trial report metrics",
+                {
+                    **stored,
+                    "trialMetrics": rows,
+                    "trialHealth": {"before": health_before, "after": {**health_now, "green": healthy_now}},
+                    "healthyNow": healthy_now,
+                },
+            )
+        except Exception:
+            pass
 
-    has_live = any(r["to"] > 0 or r["from"] > 0 for r in rows)
+    has_live = any(r["to"] > 0 or r["from"] > 0 for r in rows) or any(health_now.values())
     return {
         "trialMetrics": rows,
         "trialMetricsLive": has_live,
@@ -482,6 +537,11 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
             "From your Google Search Console and Analytics when connected. "
             '"Too early" means a fix went live recently or we do not have history yet.'
         ),
+        "trialHealth": {
+            "before": health_before,
+            "after": {"red": health_now["red"], "yellow": health_now["yellow"], "green": healthy_now},
+            "pages": _num0(scan.get("pagesRead")) or (health_now["red"] + health_now["yellow"] + healthy_now),
+        },
     }
 
 
@@ -686,6 +746,15 @@ def _account_payload(db: Session, user: User) -> dict:
     elif pause.get("status") == "paused":
         status = "paused"
     paid = _paid_through(checkout, billing)
+    trial_days = int(checkout.get("trialDays") or 0)
+    checkout_status = str(checkout.get("status") or "").lower()
+    # Free-month lock only while checkout is still on trial and the clock has elapsed.
+    # Paid / active / cancelled / paused checkouts are never locked by this gate.
+    trial_active = checkout_status == "trial" and paid >= datetime.utcnow()
+    trial_ended = checkout_status == "trial" and paid < datetime.utcnow()
+    if trial_ended:
+        status = "trial_ended"
+    needs_paid_plan = bool(trial_ended)
     joined = user.created_at or datetime.utcnow()
     moves = (
         db.query(SiteChange)
@@ -749,7 +818,11 @@ def _account_payload(db: Session, user: User) -> dict:
         "allowance": quotas.summary(db, user),
         "email": user.email or "",
         "status": status,
-        "trialDays": int(checkout.get("trialDays") or 0),
+        "trialDays": trial_days,
+        "trialActive": bool(trial_active),
+        "trialEnded": bool(trial_ended),
+        "trialEndsAt": paid.isoformat() + "Z" if (trial_days or checkout_status == "trial" or trial_ended) else None,
+        "needsPaidPlan": bool(needs_paid_plan),
         "joinedAt": joined.isoformat() + "Z",
         "joinedLabel": _fmt_joined(joined),
         "joinedShort": joined_short,
@@ -765,6 +838,7 @@ def _account_payload(db: Session, user: User) -> dict:
         "trialMetrics": trial_pack.get("trialMetrics") or [],
         "trialMetricsLive": bool(trial_pack.get("trialMetricsLive")),
         "trialMetricsNote": trial_pack.get("trialMetricsNote") or "",
+        "trialHealth": trial_pack.get("trialHealth") or {},
         "earlyLaunchTotal": int(early.get("total") or EARLY_LAUNCH_SEED["total"]),
         "cancel": cancel or {},
         "pause": pause or {},
