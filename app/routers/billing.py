@@ -818,6 +818,7 @@ def _account_payload(db: Session, user: User) -> dict:
         "allowance": quotas.summary(db, user),
         "email": user.email or "",
         "status": status,
+        "hasCheckout": bool(checkout),
         "trialDays": trial_days,
         "trialActive": bool(trial_active),
         "trialEnded": bool(trial_ended),
@@ -1159,12 +1160,19 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
         # Journey save is best-effort; account plan already updated.
         pass
 
-    trial_days = 30 if plan.get("freeMonth") else 0
+    prior_checkout = _feature(db, user.id, "billing-checkout")
+    # Solo free month is once per account — renewals / post-trial checkouts go straight to paid.
+    used_free_month = bool(
+        prior_checkout.get("at")
+        or prior_checkout.get("trialDays")
+        or prior_checkout.get("status")
+    )
+    trial_days = 30 if plan.get("freeMonth") and not used_free_month else 0
     status = "trial" if trial_days else "active"
     early = _early_launch_payload(db)
     already_founding = _user_has_early_launch_claim(
         _early_launch_store(db)[1], user.id
-    ) or bool(_feature(db, user.id, "billing-checkout").get("founding"))
+    ) or bool(prior_checkout.get("founding"))
     # Lock early-launch Pro price while spots remain (max 100 unique users).
     # Existing founding subscribers keep the offer even after the cap fills.
     founding = (plan["id"] == "pro") and (already_founding or int(early.get("left") or 0) > 0)

@@ -102,9 +102,13 @@ def _clean_state(state: dict) -> dict:
         })
     if len(sites) > MAX_SITES:
         raise ProfileError(f"A workspace can hold up to {MAX_SITES} websites.")
-    plan = (state or {}).get("planId")
+    raw = (state or {}).get("planId")
+    if isinstance(raw, str):
+        raw = raw.strip().lower()
+        raw = {"solo": "starter", "pro": "growth", "premium": "agency", "scale": "agency"}.get(raw, raw)
+    plan = raw if raw in {"starter", "growth", "agency"} else None
     return {
-        "planId": plan if plan in {"starter", "growth", "agency", None} else None,
+        "planId": plan,
         "billing": "annual" if (state or {}).get("billing") == "annual" else "monthly",
         "sites": sites,
         "activeId": (state or {}).get("activeId"),
@@ -118,6 +122,12 @@ def get_journey(db: Session, user_id: int) -> dict | None:
 
 def save_journey(db: Session, user_id: int, state: dict) -> dict:
     clean = _clean_state(state)
+    # Never wipe a paid/selected plan with a null planId from a stale local sync.
+    existing = get_journey(db, user_id)
+    if clean.get("planId") is None and existing:
+        prev = ((existing.get("state") or {}).get("planId") or "").strip().lower()
+        if prev in {"starter", "growth", "agency"}:
+            clean["planId"] = prev
     now = datetime.utcnow().isoformat(timespec="seconds")
     row = _record(db, user_id, "journey", "Onboarding journey")
     payload = {"state": clean, "updatedAt": now}
