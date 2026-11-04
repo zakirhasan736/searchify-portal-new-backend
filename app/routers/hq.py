@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -794,7 +795,7 @@ def run_partner_payout(body: PayoutRunBody | None = None, db: Session = Depends(
     data = _partners_payload(db, admin)
     paid_n = len([r for r in results if r.get("paid")])
     message = (
-        f"Recorded ${total:,.2f} paid to {paid_n} partner{'s' if paid_n != 1 else ''}. Send each amount with the method on file."
+        f"Recorded ${total:,.2f} for {paid_n} partner{'s' if paid_n != 1 else ''}. Send each amount yourself by PayPal, Wise, or bank."
         if paid_n
         else "Nothing was paid: no approved partner had a cleared balance over the minimum with tax details on file."
     )
@@ -1217,3 +1218,160 @@ def put_shareholders(
     data["state"] = {**data["state"], **state}
     data["holders"] = state.get("holders") or []
     return {"ok": True, "live": True, **data}
+
+
+@router.get("/money")
+def get_money(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """System owner: Stripe balance, MRR, affiliate liability, dividends still to pay."""
+    _require_admin(user)
+    from app import stripe_payments
+
+    return stripe_payments.money_snapshot(db)
+
+
+class DividendDeclareBody(BaseModel):
+    pool: float = 0
+    note: str = ""
+
+
+class DividendPaidBody(BaseModel):
+    reference: str = ""
+
+
+@router.post("/dividends/declare")
+def declare_dividend(body: DividendDeclareBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import stripe_payments
+
+    return stripe_payments.declare_dividend(db, pool=float(body.pool or 0), note=body.note or "")
+
+
+@router.post("/dividends/{run_id}/approve")
+def approve_dividend(run_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import stripe_payments
+
+    return stripe_payments.approve_dividend(db, run_id)
+
+
+@router.post("/dividends/{run_id}/paid")
+def mark_dividend_paid(run_id: str, body: DividendPaidBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Record that the approved dividend was sent by bank or Wise. No Stripe Connect."""
+    _require_admin(user)
+    from app import stripe_payments
+
+    return stripe_payments.mark_dividend_paid(db, run_id, body.reference or "")
+
+
+class PayoutSettingsBody(BaseModel):
+    affiliateSolo: float | None = None
+    affiliatePro: float | None = None
+    affiliateAgency: float | None = None
+    affiliateManaged: float | None = None
+    partnerSolo: float | None = None
+    partnerPro: float | None = None
+    partnerAgency: float | None = None
+    partnerManaged: float | None = None
+    affiliateMonths: int | None = None
+    partnerMonths: int | None = None
+    holdDays: int | None = None
+    minimumPayout: float | None = None
+    reserveRate: float | None = None
+    cashCoverMonths: int | None = None
+    profitableMonthsRequired: int | None = None
+    owners: list[dict] | None = None
+
+
+class StatementBody(BaseModel):
+    month: str = ""
+    note: str = ""
+    bankBalance: float | None = None
+    revenueGross: float | None = None
+    stripeFees: float | None = None
+    refunds: float | None = None
+    salesTax: float | None = None
+    costs: dict | None = None
+
+
+@router.get("/payout-settings")
+def get_payout_settings(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    return {"ok": True, "settings": payout_policy.load_settings(db)}
+
+
+@router.put("/payout-settings")
+def put_payout_settings(body: PayoutSettingsBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    return {"ok": True, "settings": payout_policy.save_settings(db, body.model_dump(exclude_none=True))}
+
+
+@router.get("/statements")
+def get_statements(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    return {"ok": True, "statements": payout_policy.list_statements(db)}
+
+
+@router.post("/statements")
+def draft_statement(body: StatementBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    statement = payout_policy.build_statement(
+        db,
+        (body.month or datetime.utcnow().strftime("%Y-%m")).strip(),
+        costs=body.costs,
+        bank_balance=body.bankBalance,
+        note=body.note,
+        revenue={
+            "revenueGross": body.revenueGross,
+            "stripeFees": body.stripeFees,
+            "refunds": body.refunds,
+            "salesTax": body.salesTax,
+        },
+    )
+    return {"ok": True, "statement": payout_policy.upsert_draft(db, statement)}
+
+
+@router.put("/statements/{statement_id}")
+def edit_statement(statement_id: str, body: StatementBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    return {"ok": True, "statement": payout_policy.update_statement(db, statement_id, body.model_dump(exclude_unset=True))}
+
+
+@router.post("/statements/{statement_id}/approve")
+def approve_payout_statement(statement_id: str, body: StatementBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    return {"ok": True, "statement": payout_policy.approve_statement(db, statement_id, body.note or "")}
+
+
+@router.post("/statements/{statement_id}/reject")
+def reject_payout_statement(statement_id: str, body: StatementBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    return {"ok": True, "statement": payout_policy.reject_statement(db, statement_id, body.note or "")}
+
+
+@router.get("/statements/{statement_id}/csv")
+def statement_csv(statement_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_admin(user)
+    from app import payout_policy
+
+    statement = payout_policy._find(payout_policy.list_statements(db), statement_id)
+    return PlainTextResponse(
+        payout_policy.admin_csv(statement),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{statement_id}.csv"'},
+    )
+
+

@@ -521,7 +521,34 @@ def me(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
 @router.get("/stake")
 def stake(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_investor(user)
-    return _stake_payload(_profile_for(db, user))
+    payload = _stake_payload(_profile_for(db, user))
+    from app import stripe_payments
+
+    live = stripe_payments.dividend_for_user(db, user.id)
+    if live:
+        line = live["line"]
+        run = live["run"]
+        status = str(line.get("status") or run.get("status") or "")
+        payload["dividendStatus"] = {
+            "declared": "Declared — waiting on admin",
+            "approved": "Approved — payment pending",
+            "paid": "Paid",
+        }.get(status, status or "Declared")
+        payload["dividendDetail"] = (
+            f"Your share: ${float(line.get('gross') or 0):.2f}. "
+            f"Withholding ${float(line.get('withhold') or 0):.2f}. "
+            f"You receive ${float(line.get('net') or 0):.2f}."
+            + (f" Reference {line.get('reference')}." if line.get("reference") else "")
+        )
+        payload["dividendColor"] = "#3DDC84" if status == "paid" else "#FFC53D"
+        payload["live"] = True
+        payload["sample"] = False
+    from app import payout_policy
+
+    payload["myDistributions"] = [
+        line for line in payout_policy.statements_for_user(db, user.id) if line.get("kind") == "distribution"
+    ]
+    return payload
 
 
 @router.get("/earnings")

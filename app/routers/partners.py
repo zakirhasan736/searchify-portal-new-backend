@@ -273,7 +273,7 @@ def mature(ledger: dict, today: datetime | None = None) -> dict:
 
 
 def pay_out(db: Session, partner: User, *, paid_on: datetime | None = None, minimum: float = 50.0) -> dict:
-    """Record a payout of the partner's cleared balance. Money is sent outside Searchify (PayPal/Wise/bank)."""
+    """Record a payout after admin approval. Money is sent by PayPal, Wise, or bank, not Stripe Connect."""
     paid_on = paid_on or datetime.utcnow()
     ledger = live_ledger(_feature(db, partner.id, "partner-ledger"))
     totals = dict(ledger.get("totals") or {})
@@ -580,10 +580,14 @@ def record_payment(db: Session, customer: User, amount: float, plan: str, paid_a
         joined = datetime.fromisoformat(str(referred.get("at") or "").replace("Z", ""))
     except ValueError:
         joined = paid_at
-    if paid_at - joined > timedelta(days=365 * COMMISSION_MONTHS / 12):
-        return 0.0
+    from app import payout_policy
+
+    settings = payout_policy.load_settings(db)
     profile = {**_default_profile(partner), **_feature(db, partner.id, "partner-profile")}
-    rate = rate_of(profile)
+    if not payout_policy.still_earning(settings, profile, paid_at, joined):
+        return 0.0
+    rate = payout_policy.rate_for(settings, profile, plan)
+    hold = payout_policy.hold_days(settings)
     commission = round(float(amount) * rate, 2)
     label = PLAN_LABEL.get(str(plan or "").lower(), str(plan or "").title())
     ledger = {**_empty_ledger(), **_feature(db, partner.id, "partner-ledger")}
@@ -592,9 +596,9 @@ def record_payment(db: Session, customer: User, amount: float, plan: str, paid_a
         if isinstance(row, list) and len(row) > 4 and row[4] == f"c{customer.id}":
             first = row[3] != "paying"
             row[2], row[3] = label or row[2], "paying"
-    clears = (paid_at + timedelta(days=HOLD_DAYS)).strftime("%b %d").replace(" 0", " ")
+    clears = (paid_at + timedelta(days=hold)).strftime("%b %d").replace(" 0", " ")
     when = paid_at.strftime("%b %d").replace(" 0", " ")
-    due = (paid_at + timedelta(days=HOLD_DAYS)).isoformat(timespec="seconds")
+    due = (paid_at + timedelta(days=hold)).isoformat(timespec="seconds")
     ledger["earnings"] = [[when, "New customer", label, "hold", f"Clears {clears}", due, commission], *(ledger.get("earnings") or [])][:500]
     totals = dict(ledger.get("totals") or {"cleared": 0, "hold": 0, "rev": 0, "paid": 0})
     totals["hold"] = round(float(totals.get("hold") or 0) + commission, 2)
@@ -837,6 +841,32 @@ def earnings(db: Session = Depends(get_db), user: User = Depends(get_current_use
     }
 
 
+@router.get("/statements")
+def my_statements(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """This affiliate or partner only. No other people's amounts."""
+    _require_partner(user)
+    from app import payout_policy
+
+    lines = payout_policy.statements_for_user(db, user.id)
+    return {"ok": True, "lines": lines}
+
+
+@router.get("/statements.csv")
+def my_statements_csv(year: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _require_partner(user)
+    from fastapi.responses import PlainTextResponse
+    from app import payout_policy
+
+    lines = payout_policy.statements_for_user(db, user.id)
+    if year:
+        lines = [line for line in lines if str(line.get("month") or "").startswith(year)]
+    return PlainTextResponse(
+        payout_policy.csv_for_lines(lines, f"Searchify {year or 'all'} statement"),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="searchify-{year or "statement"}.csv"'},
+    )
+
+
 @router.get("/payout")
 def get_payout(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_partner(user)
@@ -846,7 +876,9 @@ def get_payout(db: Session = Depends(get_db), user: User = Depends(get_current_u
 @router.put("/payout")
 def put_payout(body: PayoutBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_partner(user)
+    existing = _feature(db, user.id, "partner-payout")
     payload = {
+        **existing,
         "method": body.method,
         "email": body.email.strip(),
         "legalName": body.legalName.strip(),

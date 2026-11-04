@@ -350,9 +350,11 @@ def _binding_for(row: GoogleConnection | None, host: str) -> dict | None:
     if row is None or not host:
         return None
     saved = ((row.meta or {}).get("byHost") or {}).get(host)
-    if isinstance(saved, dict):
+    if isinstance(saved, dict) and (saved.get("gscSiteUrl") or saved.get("ga4PropertyId")):
         return saved
-    if host_key(row.gsc_site_url or "") == host:
+    # A website added in the workspace is enough. WordPress does not have to be connected.
+    active = host_key(str((row.meta or {}).get("activeHost") or ""))
+    if host_key(row.gsc_site_url or "") == host or active == host:
         return {
             "gscSiteUrl": row.gsc_site_url or "",
             "ga4PropertyId": row.ga4_property_id or "",
@@ -454,6 +456,8 @@ def activate_site_row(db: Session, user: User, site: str) -> dict:
             "ga4PropertyId": ga.get("selected") if ga.get("status") == "matched" else "",
             "ga4PropertyName": (ga.get("selectedName") or "") if ga.get("status") == "matched" else "",
         }
+        if not binding["gscSiteUrl"] and not binding["ga4PropertyId"]:
+            binding = None
     if binding:
         _save_binding(row, host, binding)
         row.gsc_site_url = binding.get("gscSiteUrl") or ""
@@ -482,10 +486,17 @@ def activate_site_row(db: Session, user: User, site: str) -> dict:
 @router.get("/oauth/google/status")
 def google_status(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    target = (site or "").strip()
+    if row and (row.access_token or row.refresh_token) and (not row.gsc_site_url or not row.ga4_property_id):
+        _auto_match_after_connect(db, row, target or _workspace_site_for_match(db, user.id))
+        db.refresh(row)
+    if not target:
+        target = _workspace_site_for_match(db, user.id)
     return {
         "configured": goauth.google_configured(),
         "redirectUri": config.GOOGLE_OAUTH_REDIRECT_URI,
-        "connection": connection_for_site(row, site),
+        "connection": connection_for_site(row, target),
+        "matchedSite": target,
     }
 
 
@@ -595,12 +606,12 @@ def google_callback(code: str | None = None, state: str | None = None, error: st
 
 
 def _workspace_site_for_match(db: Session, user_id: int) -> str:
-    """Best single website address for auto-matching GSC/GA4 after OAuth."""
+    """Best website address for auto-matching GSC/GA4. A saved site is enough; WordPress is optional."""
     from app import site_profiles
 
     journey = site_profiles.get_journey(db, user_id) or {}
     state = journey.get("state") or {}
-    sites = list(state.get("sites") or [])
+    sites = [s for s in (state.get("sites") or []) if isinstance(s, dict)]
     active_id = state.get("activeId")
     if active_id:
         active = next((s for s in sites if str(s.get("id")) == str(active_id)), None)
@@ -612,6 +623,20 @@ def _workspace_site_for_match(db: Session, user_id: int) -> str:
     pool = ready or with_site
     if len(pool) == 1:
         return str(pool[0]["answers"]["site"]).strip()
+    scans = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "site-scan")
+        .order_by(FeatureRecord.id.desc())
+        .limit(8)
+        .all()
+    )
+    scan_hosts: list[str] = []
+    for rec in scans:
+        host = payload_host(rec.payload) or host_key(str(rec.title or "").replace("Site scan", "").strip())
+        if host and host not in scan_hosts:
+            scan_hosts.append(host)
+    if len(scan_hosts) == 1:
+        return f"https://{scan_hosts[0]}"
     cms = (
         db.query(CmsConnection)
         .filter(CmsConnection.customer_id == user_id, CmsConnection.status == "connected")
@@ -623,12 +648,12 @@ def _workspace_site_for_match(db: Session, user_id: int) -> str:
     return ""
 
 
-def _auto_match_after_connect(db: Session, row: GoogleConnection) -> None:
-    """If the workspace has one clear website and no property is chosen, pick only when the match is unambiguous."""
+def _auto_match_after_connect(db: Session, row: GoogleConnection, site: str = "") -> None:
+    """Pick GSC/GA4 when one property clearly fits the website already added. WordPress is not required."""
     if row.gsc_site_url and row.ga4_property_id:
         return
     try:
-        site = _workspace_site_for_match(db, row.customer_id)
+        site = (site or "").strip() or _workspace_site_for_match(db, row.customer_id)
         if not site:
             return
         token = row.access_token
@@ -957,7 +982,15 @@ def _apply_site_google(db: Session, user_id: int, row: GoogleConnection, cms_con
             .filter(CmsConnection.customer_id == user_id, CmsConnection.status == "connected")
             .all()
         )
-        if len(sites) == 1:
+        active = host_key(row.gsc_site_url or "") or host_key(str((row.meta or {}).get("activeHost") or ""))
+        if active:
+            matched = [item for item in sites if host_key(item.site_url or "") == active]
+            if len(matched) == 1:
+                cms_connection_id = matched[0].id
+            else:
+                # The website is already chosen. Missing WordPress must not clear Search Console or Analytics.
+                return None
+        elif len(sites) == 1:
             cms_connection_id = sites[0].id
         else:
             return None

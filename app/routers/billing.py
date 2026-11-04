@@ -1,15 +1,15 @@
-"""Public pricing checkout + enterprise quote inbox (no Stripe yet — plan is recorded on the account)."""
+"""Pricing checkout. Internal plan record when Stripe is off; Stripe Checkout + webhooks when keys are set."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta
 from calendar import month_abbr
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app import quotas
+from app import config, quotas
 from app.database import get_db
 from app.models import CmsConnection, FeatureRecord, SiteChange, User
 from app.security import get_current_user, get_optional_user
@@ -114,6 +114,7 @@ class CheckoutBody(BaseModel):
     planId: str
     billing: str = "monthly"
     email: str = ""
+    country: str = ""
 
 
 class EnterpriseQuoteBody(BaseModel):
@@ -818,12 +819,14 @@ def _account_payload(db: Session, user: User) -> dict:
         "allowance": quotas.summary(db, user),
         "email": user.email or "",
         "status": status,
-        "hasCheckout": bool(checkout),
         "trialDays": trial_days,
         "trialActive": bool(trial_active),
         "trialEnded": bool(trial_ended),
         "trialEndsAt": paid.isoformat() + "Z" if (trial_days or checkout_status == "trial" or trial_ended) else None,
         "needsPaidPlan": bool(needs_paid_plan),
+        "hasCheckout": bool(checkout) and str(checkout.get("status") or "").lower() in {
+            "trial", "active", "paid", "paused", "cancelled", "trial_ended",
+        },
         "joinedAt": joined.isoformat() + "Z",
         "joinedLabel": _fmt_joined(joined),
         "joinedShort": joined_short,
@@ -1130,6 +1133,17 @@ def catalog(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/stripe")
+def stripe_public():
+    """Publishable key for the active mode. Secret keys stay on the server."""
+    return {
+        "ok": True,
+        "mode": config.STRIPE_MODE,
+        "configured": bool(config.STRIPE_SECRET_KEY),
+        "publishableKey": config.STRIPE_PUBLISHABLE_KEY,
+    }
+
+
 @router.get("/account")
 def account(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     return _account_payload(db, user)
@@ -1141,8 +1155,78 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
     plan = BY_ID.get(raw) or BY_CANONICAL.get(raw)
     if not plan:
         raise HTTPException(400, "Choose Solo, Pro, or Agency.")
-    billing = "annual" if body.billing == "annual" or body.billing == "year" else "monthly"
+    from app import stripe_payments
+
+    billing = stripe_payments.normalize_billing(body.billing)
     canonical = plan["canonical"]
+    prior_checkout = _feature(db, user.id, "billing-checkout")
+    used_free_month = str(prior_checkout.get("status") or "").lower() in {
+        "trial", "active", "paid", "paused", "cancelled", "trial_ended",
+    }
+    trial_days = 30 if plan.get("freeMonth") and not used_free_month else 0
+    early = _early_launch_payload(db)
+    already_founding = _user_has_early_launch_claim(
+        _early_launch_store(db)[1], user.id
+    ) or bool(prior_checkout.get("founding"))
+    founding = (plan["id"] == "pro") and (already_founding or int(early.get("left") or 0) > 0)
+    if founding and plan["id"] == "pro":
+        plan = {**plan, "mo": int(EARLY_LAUNCH_SEED["proLaunchMo"]), "listMo": int(EARLY_LAUNCH_SEED["proListMo"]), "founding": True}
+    elif plan["id"] == "pro":
+        plan = {**plan, "mo": int(EARLY_LAUNCH_SEED["proListMo"]), "listMo": int(EARLY_LAUNCH_SEED["proListMo"]), "founding": False}
+
+    if stripe_payments.configured():
+        try:
+            result = stripe_payments.begin_checkout(
+                db,
+                user=user,
+                plan=plan,
+                canonical=canonical,
+                billing=billing,
+                email=(body.email or user.email or "").strip().lower(),
+                trial_days=trial_days,
+                founding=founding,
+                country=(body.country or "").strip().upper(),
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            log_msg = str(exc)
+            if "sk_" in log_msg or "rk_" in log_msg:
+                log_msg = "Stripe rejected the request."
+            raise HTTPException(400, log_msg or "Stripe could not start checkout.") from exc
+        if result.get("updated") or result.get("already"):
+            if result.get("updated") and founding:
+                _record_early_launch_claim(db, user.id, plan["id"])
+            return {**result, "earlyLaunch": early}
+        # Keep a live plan in place until Stripe confirms. A cancelled card must not wipe it.
+        live = str(prior_checkout.get("status") or "").lower() in {
+            "trial", "active", "paid", "paused", "cancelled", "trial_ended",
+        }
+        _save_feature(
+            db,
+            user.id,
+            "billing-checkout",
+            "Billing checkout",
+            {
+                **prior_checkout,
+                "planId": prior_checkout.get("planId") if live else plan["id"],
+                "canonical": prior_checkout.get("canonical") if live else canonical,
+                "billing": prior_checkout.get("billing") if live else billing,
+                "pendingPlanId": plan["id"],
+                "pendingCanonical": canonical,
+                "pendingBilling": billing,
+                "email": (body.email or user.email or "").strip().lower(),
+                "status": prior_checkout.get("status") if live else "checkout_open",
+                "trialDays": trial_days,
+                "founding": founding,
+                "provider": "stripe",
+                "country": (body.country or prior_checkout.get("country") or "").strip().upper(),
+                "stripeSessionId": result.get("sessionId") or prior_checkout.get("stripeSessionId"),
+                "at": prior_checkout.get("at") or datetime.utcnow().isoformat() + "Z",
+            },
+        )
+        return {**result, "earlyLaunch": early}
+
     user.plan = "scale" if canonical == "agency" else canonical
     user.site_limit = int(plan["siteLimit"] or 1)
     db.add(user)
@@ -1160,27 +1244,7 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
         # Journey save is best-effort; account plan already updated.
         pass
 
-    prior_checkout = _feature(db, user.id, "billing-checkout")
-    # Solo free month is once per account — renewals / post-trial checkouts go straight to paid.
-    used_free_month = bool(
-        prior_checkout.get("at")
-        or prior_checkout.get("trialDays")
-        or prior_checkout.get("status")
-    )
-    trial_days = 30 if plan.get("freeMonth") and not used_free_month else 0
     status = "trial" if trial_days else "active"
-    early = _early_launch_payload(db)
-    already_founding = _user_has_early_launch_claim(
-        _early_launch_store(db)[1], user.id
-    ) or bool(prior_checkout.get("founding"))
-    # Lock early-launch Pro price while spots remain (max 100 unique users).
-    # Existing founding subscribers keep the offer even after the cap fills.
-    founding = (plan["id"] == "pro") and (already_founding or int(early.get("left") or 0) > 0)
-    if founding and plan["id"] == "pro":
-        # Persist launch price on the checkout row.
-        plan = {**plan, "mo": int(EARLY_LAUNCH_SEED["proLaunchMo"]), "listMo": int(EARLY_LAUNCH_SEED["proListMo"]), "founding": True}
-    elif plan["id"] == "pro":
-        plan = {**plan, "mo": int(EARLY_LAUNCH_SEED["proListMo"]), "listMo": int(EARLY_LAUNCH_SEED["proListMo"]), "founding": False}
     _save_feature(
         db,
         user.id,
@@ -1220,6 +1284,41 @@ def checkout(body: CheckoutBody, db: Session = Depends(get_db), user: User = Dep
         "next": "/app/connections",
         "detail": detail,
     }
+
+
+class ConfirmCheckoutBody(BaseModel):
+    sessionId: str = ""
+
+
+@router.post("/checkout/confirm")
+def confirm_checkout(body: ConfirmCheckoutBody, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Apply a Stripe Checkout session after the success redirect (idempotent with the webhook)."""
+    from app import stripe_payments
+
+    session_id = (body.sessionId or "").strip()
+    if not session_id:
+        raise HTTPException(400, "Missing Stripe session.")
+    return stripe_payments.confirm_session(db, user, session_id)
+
+
+@router.post("/webhook")
+async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
+    """Stripe → Searchify. Signature required when STRIPE_WEBHOOK_SECRET is set."""
+    from app import stripe_payments
+
+    raw = await request.body()
+    if not stripe_payments.configured():
+        raise HTTPException(503, "Stripe is not configured.")
+    stripe = stripe_payments._stripe()
+    secret = (config.STRIPE_WEBHOOK_SECRET or "").strip()
+    if not secret:
+        raise HTTPException(503, "Set STRIPE_WEBHOOK_SECRET before accepting webhooks.")
+    try:
+        event = stripe.Webhook.construct_event(raw, request.headers.get("stripe-signature") or "", secret)
+    except Exception as exc:
+        raise HTTPException(400, f"Invalid Stripe signature: {exc}") from exc
+    # StripeObject behaves like a dict.
+    return stripe_payments.handle_event(db, event)
 
 
 @router.post("/enterprise-quote")

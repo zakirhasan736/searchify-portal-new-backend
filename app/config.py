@@ -72,6 +72,33 @@ GITHUB_OAUTH_REDIRECT_URI = (
 DATAFORSEO_LOGIN = (os.getenv("DATAFORSEO_LOGIN") or "").strip()
 DATAFORSEO_PASSWORD = (os.getenv("DATAFORSEO_PASSWORD") or "").strip()
 
+# Stripe Billing (customers) + Connect (affiliate transfers). Empty secret = internal checkout only.
+# STRIPE_MODE=test uses the *_TEST keys. STRIPE_MODE=live uses the *_LIVE keys.
+# A single STRIPE_SECRET_KEY / STRIPE_PUBLISHABLE_KEY / STRIPE_WEBHOOK_SECRET still works as a fallback.
+STRIPE_MODE = (os.getenv("STRIPE_MODE") or "test").strip().lower()
+if STRIPE_MODE not in {"test", "live"}:
+    STRIPE_MODE = "test"
+
+
+def _stripe_pick(test_name: str, live_name: str, fallback_name: str) -> str:
+    primary = live_name if STRIPE_MODE == "live" else test_name
+    chosen = (os.getenv(primary) or "").strip()
+    if chosen:
+        return chosen
+    return (os.getenv(fallback_name) or "").strip()
+
+
+STRIPE_SECRET_KEY = _stripe_pick("STRIPE_SECRET_KEY_TEST", "STRIPE_SECRET_KEY_LIVE", "STRIPE_SECRET_KEY")
+STRIPE_PUBLISHABLE_KEY = _stripe_pick(
+    "STRIPE_PUBLISHABLE_KEY_TEST", "STRIPE_PUBLISHABLE_KEY_LIVE", "STRIPE_PUBLISHABLE_KEY"
+)
+STRIPE_WEBHOOK_SECRET = _stripe_pick(
+    "STRIPE_WEBHOOK_SECRET_TEST", "STRIPE_WEBHOOK_SECRET_LIVE", "STRIPE_WEBHOOK_SECRET"
+)
+AFFILIATE_PAYOUT_MINIMUM = float(os.getenv("AFFILIATE_PAYOUT_MINIMUM") or "50")
+# Basis points taken off an affiliate transfer (0 = platform absorbs Stripe transfer cost).
+STRIPE_TRANSFER_FEE_BPS = int(os.getenv("STRIPE_TRANSFER_FEE_BPS") or "0")
+
 VAPID_PUBLIC_KEY = (os.getenv("VAPID_PUBLIC_KEY") or "").strip()
 VAPID_PRIVATE_KEY = (os.getenv("VAPID_PRIVATE_KEY") or "").strip()
 VAPID_SUBJECT = (os.getenv("VAPID_SUBJECT") or "mailto:alerts@searchify.local").strip()
