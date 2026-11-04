@@ -150,7 +150,7 @@ def list_ga4_streams(access_token: str, property_id: str) -> list[str]:
     """Default URIs of the property's web data streams. Empty if they cannot be read."""
     url = f"https://analyticsadmin.googleapis.com/v1beta/properties/{property_id}/dataStreams"
     try:
-        with httpx.Client(timeout=20.0) as client:
+        with httpx.Client(timeout=6.0) as client:
             response = client.get(url, headers={"Authorization": f"Bearer {access_token}"})
     except httpx.HTTPError:
         return []
@@ -230,7 +230,7 @@ URL_INSPECT = "https://searchconsole.googleapis.com/v1/urlInspection/index:inspe
 
 def inspect_url(access_token: str, site_url: str, url: str, language: str = "en-US") -> dict:
     """Search Console URL Inspection for one URL (quota: 2,000/day, 600/min per property)."""
-    with httpx.Client(timeout=45.0) as client:
+    with httpx.Client(timeout=15.0) as client:
         response = client.post(
             URL_INSPECT,
             headers={"Authorization": f"Bearer {access_token}"},
@@ -291,7 +291,7 @@ def fetch_gsc_dimension(
     from urllib.parse import quote
 
     url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
-    with httpx.Client(timeout=45.0) as client:
+    with httpx.Client(timeout=15.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
         raise GoogleApiError(
@@ -336,7 +336,7 @@ def fetch_gsc_page_queries(access_token: str, site_url: str, page_url: str, days
     from urllib.parse import quote
 
     url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
-    with httpx.Client(timeout=45.0) as client:
+    with httpx.Client(timeout=15.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
         raise RuntimeError(f"GSC page queries failed: {response.text[:300]}")
@@ -357,7 +357,7 @@ def fetch_gsc_page_queries(access_token: str, site_url: str, page_url: str, days
         for variant in _gsc_page_variants(page)[1:]:
             response = None
             body["dimensionFilterGroups"][0]["filters"][0]["expression"] = variant
-            with httpx.Client(timeout=45.0) as client:
+            with httpx.Client(timeout=15.0) as client:
                 response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
             if response.status_code >= 400:
                 continue
@@ -434,7 +434,7 @@ def _gsc_query(access_token: str, site_url: str, body: dict) -> list[dict]:
     from urllib.parse import quote
 
     url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
-    with httpx.Client(timeout=45.0) as client:
+    with httpx.Client(timeout=15.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
         raise RuntimeError(f"GSC page query failed: {response.text[:300]}")
@@ -592,7 +592,7 @@ def fetch_ga4_report(
         "limit": limit,
     }
     url = GA4_RUN_REPORT.format(property_id=property_id)
-    with httpx.Client(timeout=45.0) as client:
+    with httpx.Client(timeout=15.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
         raise GoogleApiError(
@@ -710,7 +710,7 @@ def run_pagespeed(url: str, strategy: str = "mobile") -> dict:
         "category": ["performance", "accessibility", "best-practices", "seo"],
         "key": config.GOOGLE_PAGESPEED_API_KEY,
     }
-    with httpx.Client(timeout=120.0) as client:
+    with httpx.Client(timeout=20.0) as client:
         response = client.get("https://www.googleapis.com/pagespeedonline/v5/runPagespeed", params=params)
     if response.status_code >= 400:
         raise RuntimeError(f"PageSpeed failed: {response.text[:300]}")

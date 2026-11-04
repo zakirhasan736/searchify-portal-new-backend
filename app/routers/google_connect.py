@@ -314,10 +314,11 @@ def _stamp_validated(row: GoogleConnection, key: str, value: str) -> None:
 
 
 def _ga4_with_streams(token: str, properties: list[dict]) -> list[dict]:
+    # Cap the lookup so choosing a property cannot sit until the gateway times out.
     out = []
-    for prop in properties[:25]:
+    for prop in properties[:8]:
         out.append({**prop, "streams": goauth.list_ga4_streams(token, prop["propertyId"])})
-    return out + [{**p, "streams": []} for p in properties[25:]]
+    return out + [{**p, "streams": []} for p in properties[8:]]
 
 
 def _upsert_feature(db: Session, user_id: int, kind: str, title: str, payload: dict, status: str = "stored"):
@@ -970,9 +971,19 @@ def google_select(body: SelectBody, db: Session = Depends(get_db), user: User = 
 
 @router.post("/oauth/google/sync")
 def google_sync(body: SyncBody = SyncBody(), db: Session = Depends(get_db), user: User = Depends(get_current_user)):
-    if body.site:
-        activate_site_row(db, user, body.site)
-    return sync_user_google(db, user.id, None if body.site else body.cms_connection_id)
+    """Pull Search Console and Analytics. WordPress is not required. PageSpeed runs separately."""
+    row = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    if body.site and row is not None:
+        host = host_key(body.site)
+        db.info["site_host"] = host
+        bound = _binding_for(row, host)
+        if bound and (bound.get("gscSiteUrl") or bound.get("ga4PropertyId")):
+            row.gsc_site_url = bound.get("gscSiteUrl") or row.gsc_site_url or ""
+            row.ga4_property_id = bound.get("ga4PropertyId") or row.ga4_property_id or ""
+            row.ga4_property_name = bound.get("ga4PropertyName") or row.ga4_property_name or ""
+        elif not (row.gsc_site_url or row.ga4_property_id):
+            _auto_match_after_connect(db, row, body.site)
+    return sync_user_google(db, user.id, None if body.site else body.cms_connection_id, quick=True)
 
 
 def _apply_site_google(db: Session, user_id: int, row: GoogleConnection, cms_connection_id: int | None) -> int | None:
@@ -1035,7 +1046,7 @@ def _apply_site_google(db: Session, user_id: int, row: GoogleConnection, cms_con
     return cms.id
 
 
-def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = None) -> dict:
+def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = None, quick: bool = False) -> dict:
     user = db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1044,6 +1055,11 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         raise HTTPException(status_code=404, detail="Connect Google first")
     _apply_site_google(db, user.id, row, cms_connection_id)
     db.info["site_host"] = host_key(row.gsc_site_url or "") or host_key(str((row.meta or {}).get("activeHost") or ""))
+    if not row.gsc_site_url and not row.ga4_property_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Choose a Search Console or Analytics property for the website you already added. WordPress is not required for this.",
+        )
     token = _valid_access_token(db, row)
     synced = {"gsc": False, "ga4": False, "pagespeed": False, "places": False, "ads": False}
     overview_rows: list[list] = []
@@ -1488,7 +1504,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         speed_url = row.gsc_site_url or ""
         if speed_url.startswith("sc-domain:"):
             speed_url = f"https://{speed_url.replace('sc-domain:', '', 1)}/"
-        if speed_url and config.GOOGLE_PAGESPEED_API_KEY:
+        if not quick and speed_url and config.GOOGLE_PAGESPEED_API_KEY:
             try:
                 mobile = goauth.run_pagespeed(speed_url, "mobile")
                 desktop = goauth.run_pagespeed(speed_url, "desktop")
@@ -1557,7 +1573,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
                 overview_rows.append([site_label, "PageSpeed", "Error", str(speed_exc)[:120]])
 
         # Places — fill all Local tool kinds from live Places + derived workflows
-        if config.GOOGLE_PLACES_API_KEY:
+        if not quick and config.GOOGLE_PLACES_API_KEY:
             try:
                 host = site_label.replace("https://", "").replace("http://", "").replace("sc-domain:", "").split("/")[0]
                 brand = host.split(".")[0] if host else "seo agency"
@@ -1912,12 +1928,13 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         )
 
         enriched = {}
-        try:
-            from app.enrichment import enrich_from_google
+        if not quick:
+            try:
+                from app.enrichment import enrich_from_google
 
-            enriched = enrich_from_google(db, user.id)
-        except Exception as enrich_exc:  # noqa: BLE001
-            enriched = {"error": str(enrich_exc)[:200]}
+                enriched = enrich_from_google(db, user.id)
+            except Exception as enrich_exc:  # noqa: BLE001
+                enriched = {"error": str(enrich_exc)[:200]}
 
         db.add(
             Job(
