@@ -82,7 +82,8 @@ def run_due_syncs() -> dict:
 
 async def auto_sync_loop(stop: asyncio.Event):
     # First pass after short delay so API is ready
-    interval = max(300, int(float(config.GOOGLE_AUTO_SYNC_HOURS or 6) * 3600))
+    # Wake at least every 3 hours so daily rank checks land close to 24 hours apart.
+    interval = max(300, min(3 * 3600, int(float(config.GOOGLE_AUTO_SYNC_HOURS or 6) * 3600)))
     await asyncio.sleep(45)
     while not stop.is_set():
         if config.GOOGLE_AUTO_SYNC_ENABLED:
@@ -90,6 +91,13 @@ async def auto_sync_loop(stop: asyncio.Event):
                 await asyncio.to_thread(run_due_syncs)
             except Exception as exc:  # noqa: BLE001
                 log.exception("auto-sync loop error: %s", exc)
+        try:
+            # Daily live Google rank checks for tracked keywords (each site at most once a day).
+            from app.rank_tracking import run_due_rank_checks
+
+            await asyncio.to_thread(run_due_rank_checks)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("rank check loop error: %s", exc)
         try:
             await asyncio.wait_for(stop.wait(), timeout=interval)
         except asyncio.TimeoutError:
