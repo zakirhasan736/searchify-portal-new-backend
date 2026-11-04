@@ -17,6 +17,9 @@ log = logging.getLogger(__name__)
 # failure was swallowed, so the content API never contributed a draft.
 SOURCE_CHAR_LIMIT = 1700
 
+# Set when the content API says the function is down, so one request does not call it again per page.
+_content_api_down = False
+
 
 def pack_source_text(
     *,
@@ -65,8 +68,9 @@ def pack_source_text(
 
 def generate_meta_tags(text: str, *, creativity: float = 0.75) -> dict:
     """Call Searchify SEO content generation. Returns {title, description, cost} or {}."""
+    global _content_api_down
     source = " ".join(str(text or "").split())
-    if len(source) < 40:
+    if len(source) < 40 or _content_api_down:
         return {}
     try:
         result, cost = research._call(
@@ -74,9 +78,12 @@ def generate_meta_tags(text: str, *, creativity: float = 0.75) -> dict:
             "/content_generation/generate_meta_tags/live",
             # Field is creativity_index (0–1) per the DataForSEO Content Generation API.
             [{"text": source[:SOURCE_CHAR_LIMIT], "creativity_index": max(0.1, min(1.0, float(creativity)))}],
-            timeout=45,
+            timeout=12,
         )
     except research.ResearchError as exc:
+        message = str(exc).lower()
+        if "temporarily unavailable" in message or "function" in message and "unavailable" in message:
+            _content_api_down = True
         log.warning("DataForSEO generate_meta_tags failed: %s", exc)
         return {}
     row = (result or [{}])[0] or {}

@@ -32,6 +32,7 @@ KINDS = {item[0] for item in list(SCREENS) + list(EXTRA)} | {
     "business-profile",
     "workspace-controls",
     "workspace-backup",
+    "places",
 } | set(DRAFT_SEEDS.keys())
 
 KIND_ALIASES = {

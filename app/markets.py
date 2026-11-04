@@ -23,6 +23,18 @@ TARGET_COUNTRIES: list[dict] = [
     {"iso": "NZ", "name": "New Zealand", "language": "en", "flag": "🇳🇿"},
     {"iso": "IN", "name": "India", "language": "en", "flag": "🇮🇳"},
     {"iso": "AE", "name": "United Arab Emirates", "language": "en", "flag": "🇦🇪"},
+    {"iso": "DE", "name": "Germany", "language": "de", "flag": "🇩🇪"},
+    {"iso": "FR", "name": "France", "language": "fr", "flag": "🇫🇷"},
+    {"iso": "ES", "name": "Spain", "language": "es", "flag": "🇪🇸"},
+    {"iso": "IT", "name": "Italy", "language": "it", "flag": "🇮🇹"},
+    {"iso": "NL", "name": "Netherlands", "language": "nl", "flag": "🇳🇱"},
+    {"iso": "IE", "name": "Ireland", "language": "en", "flag": "🇮🇪"},
+    {"iso": "SG", "name": "Singapore", "language": "en", "flag": "🇸🇬"},
+    {"iso": "ZA", "name": "South Africa", "language": "en", "flag": "🇿🇦"},
+    {"iso": "BR", "name": "Brazil", "language": "pt", "flag": "🇧🇷"},
+    {"iso": "MX", "name": "Mexico", "language": "es", "flag": "🇲🇽"},
+    {"iso": "BD", "name": "Bangladesh", "language": "en", "flag": "🇧🇩"},
+    {"iso": "PK", "name": "Pakistan", "language": "en", "flag": "🇵🇰"},
 ]
 BY_ISO = {row["iso"]: row for row in TARGET_COUNTRIES}
 
@@ -42,6 +54,18 @@ TLD_SUGGESTIONS: dict[str, str] = {
     "co.in": "IN",
     "ae": "AE",
     "us": "US",
+    "de": "DE",
+    "fr": "FR",
+    "es": "ES",
+    "it": "IT",
+    "nl": "NL",
+    "ie": "IE",
+    "sg": "SG",
+    "za": "ZA",
+    "br": "BR",
+    "mx": "MX",
+    "bd": "BD",
+    "pk": "PK",
 }
 GENERIC_TLDS = {"com", "org", "net", "io", "co", "app", "dev", "ai", "xyz", "info", "biz", "online", "site", "tech"}
 
@@ -258,10 +282,15 @@ def resolve_for_site(db: Session, user: User, *, site: str = "", site_id=None) -
     sid = (site_row or {}).get("id") if site_row else site_id
     owned = site_row is not None or user_owns_host(db, user, host)
 
-    # Only resolve a market for websites that belong to this workspace.
+    # A country-code domain is enough to research when the owner has not picked a market yet.
+    # WordPress is not required. The suggestion stays non-explicit so they can change it in the header.
+    suggested = suggest_iso_from_host(host) if host else None
     if not owned:
+        if suggested and country_by_iso(suggested):
+            place = locations.resolve(country_by_iso(suggested)["name"])
+            return _from_location(place, source="domain", host=host, site_id=sid, explicit=False)
         out = _empty(host, sid)
-        out["domainSuggestion"] = suggest_iso_from_host(host) if host else None
+        out["domainSuggestion"] = suggested
         return out
 
     saved = _load_saved(db, user.id, host=host, site_id=sid)
@@ -303,7 +332,6 @@ def resolve_for_site(db: Session, user: User, *, site: str = "", site_id=None) -
             except Exception:
                 pass
 
-    suggested = suggest_iso_from_host(host) if host else None
     if suggested and country_by_iso(suggested):
         place = locations.resolve(country_by_iso(suggested)["name"])
         return _from_location(place, source="domain", host=host, site_id=sid, explicit=False)

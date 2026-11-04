@@ -1998,9 +1998,8 @@ def propose_from_gsc(
 
     open_urls = _open_urls(db, user.id)
     pending = [url for url in candidates if page_key(url) not in open_urls]
-    limit = max(1, min(int(body.limit or 8), 12))
-    if scanned_now:
-        limit = min(limit, 5)
+    # Three pages stay inside the gateway timeout. The rest come back as remaining.
+    limit = max(1, min(int(body.limit or 3), 3))
     batch, remaining = pending[:limit], max(0, len(pending) - limit)
 
     gsc_url = (google.gsc_site_url or "").strip() if google else ""

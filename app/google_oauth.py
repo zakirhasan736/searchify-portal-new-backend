@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
@@ -10,6 +11,8 @@ import httpx
 import jwt
 
 from app import config
+
+log = logging.getLogger(__name__)
 
 # Google Ads (adwords) is not used — do not request it in any OAuth consent.
 # Core Plug-in scopes must match Cloud Console Data Access for verification.
@@ -253,7 +256,12 @@ def list_ga4_properties(access_token: str) -> list[dict]:
             headers={"Authorization": f"Bearer {access_token}"},
         )
     if response.status_code >= 400:
-        raise RuntimeError(f"GA4 properties failed: {response.text[:300]}")
+        text = response.text[:300]
+        # A token granted for Search Console only must not fail the whole connect.
+        if response.status_code == 403 and "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in text:
+            log.warning("GA4 properties skipped: token has no Analytics scope")
+            return []
+        raise RuntimeError(f"GA4 properties failed: {text}")
     out: list[dict] = []
     for account in response.json().get("accountSummaries") or []:
         account_name = account.get("displayName") or account.get("account") or ""
