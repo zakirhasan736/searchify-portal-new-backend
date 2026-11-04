@@ -301,3 +301,23 @@ class PushDelivery(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("customer_id", "kind", "ref"),)
+
+
+class TrackedKeyword(Base):
+    """A search the owner chose to follow for one website. Stored on the server, never in the browser."""
+
+    __tablename__ = "tracked_keywords"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    host: Mapped[str] = mapped_column(String(255), index=True)
+    keyword: Mapped[str] = mapped_column(String(120))
+    # suggestion | current | manual
+    source: Mapped[str] = mapped_column(String(40), default="manual")
+    # Which part of the business this search belongs to (from the AI site read).
+    concept: Mapped[str] = mapped_column(String(200), default="")
+    page_url: Mapped[str] = mapped_column(Text, default="")
+    change_id: Mapped[int | None] = mapped_column(ForeignKey("site_changes.id", ondelete="SET NULL"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("customer_id", "host", "keyword"),)

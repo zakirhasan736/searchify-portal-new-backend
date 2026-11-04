@@ -24,11 +24,14 @@ from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
+import logging
+
 import httpx
 
 from app.openai_client import chat_text, openai_configured
 from app.page_scrape import is_video_src, summarize_json_ld
 
+log = logging.getLogger("searchify.site_scan")
 AGENT = "SearchifyBot/1.0 (+https://searchify.nextcreavo.com)"
 SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "template"}
 CHROME_TAGS = {"nav", "footer", "header", "aside", "form"}
@@ -442,7 +445,8 @@ def crawl(home: str, limit: int = 40) -> dict:
 
 
 # 2: reads every offer + umbrella category, more copy per page, navigation.
-READER_VERSION = 2
+# 3: best model (Astra), about twice the copy per page, failures are reported instead of hidden.
+READER_VERSION = 3
 
 UNDERSTAND = (
     "You are an SEO strategist reading a whole website before writing any Google listing. "
@@ -484,7 +488,7 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
     for index, page in enumerate(pages[:45]):
         schema = ", ".join(page.get("schemaTypes") or []) or "-"
         # The homepage and the first pages carry the service list; give them more copy.
-        copy_room = 1600 if index == 0 else 700
+        copy_room = 3200 if index == 0 else 1400
         digest.append(
             f"URL: {page['url']}\nTITLE: {page.get('title') or '-'}\n"
             f"META DESCRIPTION: {page.get('description') or '-'}\n"
@@ -492,7 +496,7 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
             f"JSON-LD: {schema}; name {page.get('schemaName') or '-'}\n"
             f"H1: {page.get('h1') or '-'}\n"
             f"NAVIGATION: {', '.join(page.get('nav') or [])[:300] or '-'}\n"
-            f"HEADINGS: {' | '.join(page.get('headings') or [])[:500] or '-'}\n"
+            f"HEADINGS: {' | '.join(page.get('headings') or [])[:900] or '-'}\n"
             f"COPY: {(page.get('text') or '')[:copy_room]}"
         )
     owner = "\n".join(
@@ -510,10 +514,24 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
     ) or "(The owner did not fill the setup questions.)"
     user = f"Owner's setup answers:\n{owner}\n\nPages on the site ({len(pages)} read):\n\n" + "\n\n".join(digest)
     try:
-        text, _model, _role = chat_text(system=UNDERSTAND, user=user[:60000], kind="seo", writing_type="Site understanding", tokens=2400, max_tokens=9000)
-    except RuntimeError:
-        return {}
-    return _json_block(text)
+        # The business read decides the category, the offers and every keyword suggestion, so it
+        # runs on the strongest model rather than the short-listing "seo" chain.
+        text, model, _role = chat_text(
+            system=UNDERSTAND,
+            user=user[:120000],
+            kind="analyst",
+            writing_type="Site understanding",
+            force_astra=True,
+            max_tokens=12000,
+        )
+    except RuntimeError as exc:
+        log.warning("site_understanding_failed", extra={"error": str(exc)[:200]})
+        return {"_error": f"The AI read of the website failed: {str(exc)[:160]}"}
+    data = _json_block(text)
+    if not data:
+        return {"_error": "The AI read of the website returned no usable answer."}
+    data["_model"] = model
+    return data
 
 
 def _places_rivals(places_rows: list, own_host: str) -> list[dict]:
@@ -633,6 +651,8 @@ def scan_site(
     except Exception:  # noqa: BLE001
         ai_checks = {}
     understanding = understand(pages, brief, profile)
+    understand_error = str(understanding.pop("_error", "") or "")
+    understand_model = str(understanding.pop("_model", "") or "")
     page_map = {normalize(item.get("url") or ""): item for item in understanding.get("pages") or [] if isinstance(item, dict)}
     targets = [
         str(page_map.get(page["url"], {}).get("target") or "").strip()
@@ -654,6 +674,9 @@ def scan_site(
         "scannedAt": datetime.utcnow().isoformat(timespec="seconds"),
         "pages": pages,
         "business": {k: v for k, v in understanding.items() if k != "pages"},
+        "understandModel": understand_model,
+        # Shown to the owner: without a business read, keyword suggestions stay empty instead of guessing.
+        "understandError": understand_error,
         # Bump when the site reader changes so stored scans are re-read once (operator._scan_fresh).
         "readerVersion": READER_VERSION,
         "pageMap": page_map,

@@ -18,7 +18,8 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app import config, llm_requests, locations, markets, quotas
-from app.concept_reads import backlink_concepts, business_offers, keyword_concepts, match_keyword, site_concept, offer_fit, seed_phrase, visibility_reading
+from app import keyword_tracking
+from app.concept_reads import backlink_concepts, business_offers, business_places, keyword_concepts, match_keyword, site_concept, offer_fit, seed_phrase, visibility_reading
 from app.models import FeatureRecord, User
 
 log = logging.getLogger("searchify.research")
@@ -30,7 +31,7 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 # Bump when keyword seeding changes so suggestions built from old seeds refresh once.
-KEYWORDS_QUALITY = 4
+KEYWORDS_QUALITY = 5
 PROVIDER_ERRORS = {
     40104: "Searchify SEO is not fully set up yet. Ask an admin to finish Searchify SEO setup.",
     40200: "Searchify SEO research credit is empty. Top up Searchify SEO to run live research again.",
@@ -315,11 +316,13 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     if stored_only:
         saved = _stored_keywords(db, user.id, host)
         if not saved:
-            return {"host": host, "state": "none", "ideas": [], "ranked": [], "cached": True, "storedOnly": True}
-        return {**saved, "cached": True, "storedOnly": True}
+            return _with_tracking(db, user, host, {"host": host, "state": "none", "ideas": [], "ranked": [], "cached": True, "storedOnly": True})
+        return _with_tracking(db, user, host, {**saved, "cached": True, "storedOnly": True})
     place, market = _place_for(db, user, site=site, country=country, reach=reach, tool="keywords")
     location, language = place.country, place.language or market.get("language") or "en"
-    clean = [t.strip()[:80] for t in dict.fromkeys(t.strip().lower() for t in terms or [] if t and t.strip())][:50]
+    # Tracked keywords come from the database. Terms in the request are only added for this run.
+    stored_terms = keyword_tracking.tracked_terms(db, user.id, host) if db is not None else []
+    clean = [t.strip()[:80] for t in dict.fromkeys(t.strip().lower() for t in [*stored_terms, *(terms or [])] if t and t.strip())][:200]
     term_limit = quotas.tracked_keyword_limit(db, user)
     dropped = len(clean) - term_limit if term_limit is not None and len(clean) > term_limit else 0
     if dropped:
@@ -329,7 +332,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     offers = business_offers(db, user.id, host)
     if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == KEYWORDS_QUALITY:
         concepts = keyword_concepts(saved, offers)
-        return {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped}
+        return _with_tracking(db, user, host, {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped})
     quotas.check(db, user, "keywords")
     _budget(db, user, 5)
     cost = 0.0
@@ -417,11 +420,14 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 "source": "Searchify SEO keyword overview + ranked keywords" if term.lower() in found or rank else "Not in Searchify SEO keyword data",
             })
 
-    # Keyword ideas come from DataForSEO reading this website itself (Keywords For Site): no seed
-    # phrases and nothing preset by Searchify. Ordered by relevance to the site's own content.
-    ideas = []
+    # Suggestions come only from DataForSEO data about this business:
+    #  1) Keywords For Site — the searches Google associates with this website's own pages;
+    #  2) Keyword Ideas — DataForSEO's category neighbours of the business category and every offer
+    #     the AI read of the website found (no preset or invented phrases).
+    # The AI read then keeps only the searches that belong to what this business sells.
     seeds: list[str] = []
     known = {t.lower() for t in clean} | set(by_term)
+    candidates: list[dict] = []
     site_payload = {
         "target": host,
         "location_name": location,
@@ -442,38 +448,57 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         )
     cost += c
     idea_calls = 1
-    concept = site_concept(db, user.id, host)
-    understood = bool(concept["offers"] or concept["category"] or concept["pages"])
-    for position, item in enumerate(((site_res or [{}])[0] or {}).get("items") or []):
+    for item in ((site_res or [{}])[0] or {}).get("items") or []:
         row = _kw_row(item)
-        key = (row.get("keyword") or "").lower()
-        if not key or key in known:
-            continue
-        known.add(key)
-        intent = row.get("intent") or ""
-        where = match_keyword(row["keyword"], concept) if understood else {"fit": 0.0, "concept": "", "page": "", "pageTarget": ""}
-        ideas.append({
-            **row,
-            "source": f"Searchify SEO keywords for site · DataForSEO read of {host}",
-            # Grouping comes from DataForSEO's own search-intent label, not a Searchify seed.
-            "seed": intent,
-            # Which part of the business this search belongs to and which page should rank for it,
-            # from the AI read of every page of the site.
-            "concept": where["concept"],
-            "page": where["page"],
-            "pageTarget": where["pageTarget"],
-            "_fit": where["fit"],
-            "_order": position,
-        })
+        if row.get("keyword"):
+            candidates.append({**row, "seed": row.get("intent") or "", "source": f"DataForSEO keywords for site · {host}"})
+
+    concept = site_concept(db, user.id, host)
+    seeds = business_topics(concept)
+    if seeds:
+        ideas_payload = {
+            "keywords": seeds,
+            "location_name": location,
+            "language_code": language,
+            "limit": 300,
+            "filters": ["keyword_info.search_volume", ">", 0],
+            "order_by": ["relevance,desc", "keyword_info.search_volume,desc"],
+        }
+        try:
+            try:
+                ideas_res, c = _call("POST", "/dataforseo_labs/google/keyword_ideas/live", [ideas_payload])
+            except ResearchError as exc:
+                if exc.code in {"provider_balance", "provider_not_configured"}:
+                    raise
+                ideas_res, c = _call(
+                    "POST",
+                    "/dataforseo_labs/google/keyword_ideas/live",
+                    [{k: v for k, v in ideas_payload.items() if k not in {"filters", "order_by"}}],
+                )
+            cost += c
+            idea_calls += 1
+            for item in ((ideas_res or [{}])[0] or {}).get("items") or []:
+                row = _kw_row(item)
+                if row.get("keyword"):
+                    candidates.append({**row, "seed": row.get("intent") or "", "source": "DataForSEO keyword ideas for the business category"})
+        except ResearchError as exc:
+            log.warning("keyword_ideas_failed", extra={"host": host, "error": str(exc)[:200]})
+
+    understood = bool(concept["offers"] or concept["category"] or concept["pages"])
     if understood:
-        # Keep what this business actually sells; DataForSEO relevance order breaks ties.
-        on_business = [row for row in ideas if row["_fit"] >= 0.34]
-        if on_business:
-            ideas = on_business
-        ideas.sort(key=lambda row: (-round(row["_fit"], 1), row["_order"]))
-    for row in ideas:
-        row.pop("_fit", None)
-        row.pop("_order", None)
+        picked = keyword_tracking.business_suggestions(concept, business_places(db, user.id, host), candidates, known=known)
+        ideas = picked["rows"]
+        suggestion_meta = {"judged": picked["judged"], "checked": picked["checked"]}
+    else:
+        # No AI read of the website yet: there is no business to judge against, so keep only what
+        # DataForSEO itself associates with this site's pages, in its relevance order, and say so.
+        ideas, taken = [], set(known)
+        for row in candidates:
+            key = row["keyword"].lower()
+            if key not in taken:
+                taken.add(key)
+                ideas.append(row)
+        suggestion_meta = {"judged": "none", "checked": len(candidates), "needsSiteScan": True}
     paid_calls = 1 + bool(clean) + idea_calls
     _spend(db, user, paid_calls, cost)
     quotas.consume(db, user, "keywords")
@@ -494,7 +519,10 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "ranked": ranked,
         "tracked": tracked,
         "ideas": ideas[:idea_limit],
-        "seeds": seeds,
+        # The business topics DataForSEO keyword ideas started from (the category and offers the AI read found).
+        "businessTopics": seeds,
+        "seeds": [],
+        "suggestionMeta": suggestion_meta,
         "termLimit": term_limit,
         "qualityVersion": KEYWORDS_QUALITY,
         "provider": "dataforseo",
@@ -511,7 +539,41 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     payload["concepts"] = concepts["rows"]
     payload["conceptNote"] = concepts["note"]
     _save(db, user.id, "dfs-keywords", title, payload)
-    return {**payload, "cached": False, "termsDropped": dropped}
+    return _with_tracking(db, user, host, {**payload, "cached": False, "termsDropped": dropped})
+
+
+def business_topics(concept: dict, limit: int = 20) -> list[str]:
+    """The business category and every offer from the AI read of the website, as DataForSEO
+    keyword-idea inputs. Empty when the website has not been read."""
+    out: list[str] = []
+    for value in [concept.get("category") or "", *(concept.get("offers") or [])]:
+        text = seed_phrase(value).lower()
+        if text and text not in out:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _with_tracking(db: Session, user: User, host: str, result: dict) -> dict:
+    """Add the live tracked list (database), current keywords (DataForSEO first, then Search Console),
+    and drop suggestions that are already tracked or already ranking."""
+    if db is None:
+        return result
+    ranked = list(result.get("ranked") or [])
+    metrics = [*(result.get("tracked") or []), *ranked]
+    tracked = keyword_tracking.tracked_payload(db, user.id, host, metrics)
+    taken = {row["keyword"] for row in tracked} | {keyword_tracking.clean_keyword(r.get("keyword")) for r in ranked}
+    current = keyword_tracking.current_keywords(db, user.id, host, ranked)
+    suggestions = [row for row in result.get("ideas") or [] if keyword_tracking.clean_keyword(row.get("keyword")) not in taken]
+    return {
+        **result,
+        "trackedList": tracked,
+        "current": current["rows"],
+        "searchConsoleConnected": current["searchConsoleConnected"],
+        "searchConsoleSyncedAt": current["searchConsoleSyncedAt"],
+        "suggestions": suggestions,
+    }
 
 
 def _link_domain(item: dict) -> str:
@@ -1877,3 +1939,52 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
     }
     _save(db, user.id, "dfs-audit", title, payload)
     return {**payload, "cached": False}
+
+
+def track_term_metrics(db: Session, user: User, *, site: str, term: str) -> dict | None:
+    """Live DataForSEO numbers for one newly tracked keyword (one Keyword Overview call), merged into
+    the stored keyword research so the tracked list shows it without re-running the full research."""
+    host = host_of(site)
+    term = keyword_tracking.clean_keyword(term)
+    if not host or not term:
+        return None
+    place, market = _place_for(db, user, site=site, tool="keywords")
+    location, language = place.country, place.language or market.get("language") or "en"
+    _budget(db, user, 1)
+    res, cost = _call(
+        "POST",
+        "/dataforseo_labs/google/keyword_overview/live",
+        [{"keywords": [term], "location_name": location, "language_code": language, "include_serp_info": True}],
+    )
+    _spend(db, user, 1, cost)
+    item = next(iter(((res or [{}])[0] or {}).get("items") or []), None)
+    title = f"Keywords {host} {place.iso or location} {language}"
+    stored = _record(db, user.id, "dfs-keywords", title)
+    payload = dict((stored.payload if stored else {}) or {})
+    rank = next((r for r in payload.get("ranked") or [] if keyword_tracking.clean_keyword(r.get("keyword")) == term), {})
+    row = {
+        **(_kw_row(item) if item else {"volume": None, "difficulty": None, "intent": ""}),
+        "keyword": term,
+        "position": rank.get("position"),
+        "previous": rank.get("previous"),
+        "page": rank.get("page") or "",
+        "url": rank.get("url") or "",
+        "source": "Searchify SEO keyword overview + ranked keywords" if item or rank else "Not in Searchify SEO keyword data",
+    }
+    if stored is not None and payload:
+        tracked = [r for r in payload.get("tracked") or [] if keyword_tracking.clean_keyword(r.get("keyword")) != term]
+        payload["tracked"] = [row, *tracked]
+        payload["terms"] = list(dict.fromkeys([*(payload.get("terms") or []), term]))
+        stored.payload = payload
+        db.commit()
+    return row
+
+
+def ranked_url_for(db: Session, user_id: int, host: str, term: str) -> str:
+    """The page DataForSEO already sees ranking for this keyword, if any."""
+    saved = _stored_keywords(db, user_id, host) or {}
+    term = keyword_tracking.clean_keyword(term)
+    for row in saved.get("ranked") or []:
+        if keyword_tracking.clean_keyword(row.get("keyword")) == term and row.get("url"):
+            return row["url"]
+    return ""

@@ -3118,3 +3118,78 @@ def queue_ai_visibility(body: VisibilityQueueBody, db: Session = Depends(get_db)
 def sync_features(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _sync_operator_features(db, user)
     return {"ok": True}
+
+
+def keyword_page_change(db: Session, user: User, *, keyword: str, page_url: str, concept: str = "") -> dict:
+    """Start a page update for a keyword the owner chose to track.
+
+    Writes a new title and meta description for `page_url` with the keyword as the primary keyword,
+    and leaves it waiting for approval. Nothing is published here: publishing still needs the exact
+    approved text (approval.py) and then /changes/{id}/execute.
+    """
+    from app.site_scan import host_of, page_key
+
+    url = (page_url or "").strip()
+    if not url:
+        return {"change": None, "note": "No page on the website covers this search yet, so only tracking was added."}
+    open_states = ["proposed", "awaiting_approval", "approved", "failed", "needs_review"]
+    change = next(
+        (
+            c
+            for c in db.query(SiteChange)
+            .filter(SiteChange.customer_id == user.id, SiteChange.status.in_(open_states))
+            .order_by(SiteChange.id.desc())
+            .all()
+            if page_key(c.target_url or "") == page_key(url) and (c.change_type or "meta") == "meta"
+        ),
+        None,
+    )
+    if change is None:
+        cms_rows = (
+            db.query(CmsConnection)
+            .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
+            .order_by(CmsConnection.id.desc())
+            .all()
+        )
+        cms = next((c for c in cms_rows if host_of(c.site_url or "") == host_of(url)), None) or (cms_rows[0] if len(cms_rows) == 1 else None)
+        change = SiteChange(
+            customer_id=user.id,
+            cms_connection_id=cms.id if cms else None,
+            source="keyword",
+            opportunity=f"Target “{keyword}” on {url}",
+            target_url=url,
+            change_type="meta",
+            proposed={"changeType": "meta", "targetUrl": url, "primaryKeyword": keyword, "target": keyword},
+            status="awaiting_approval",
+        )
+        db.add(change)
+        db.commit()
+        db.refresh(change)
+        created = True
+    else:
+        proposed = dict(change.proposed or {})
+        proposed["primaryKeyword"] = keyword
+        change.proposed = proposed
+        db.commit()
+        created = False
+    try:
+        result = generate_meta(change.id, GenerateMetaBody(primaryKeyword=keyword, focusTopic=concept or ""), db, user)
+    except HTTPException as exc:
+        if created:
+            db.delete(change)
+            db.commit()
+        detail = exc.detail if isinstance(exc.detail, str) else (exc.detail or {}).get("message") or "The title writer failed."
+        return {"change": None, "note": f"Tracking was added, but the page update could not be written: {detail}"}
+    db.refresh(change)
+    if change.status not in {"awaiting_approval", "approved"}:
+        change.status = "awaiting_approval"
+        db.commit()
+    used = str((change.proposed or {}).get("target") or "")
+    note = ""
+    if used and used.lower() != keyword.lower():
+        note = f"The writer aimed this page at “{used}” because “{keyword}” did not fit the page copy closely enough. Edit it before approving if you want the exact search."
+    if created:
+        from app.push_alerts import notify_waiting
+
+        notify_waiting(db, user.id, change)
+    return {"change": result.get("change") or _change_row(change), "note": note}
