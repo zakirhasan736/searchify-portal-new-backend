@@ -21,6 +21,7 @@ from app import config, llm_requests, locations, markets, quotas
 from app import keyword_tracking
 from app.concept_reads import backlink_concepts, business_offers, business_places, keyword_concepts, match_keyword, site_concept, offer_fit, seed_phrase, visibility_reading
 from app.models import FeatureRecord, User
+from app.site_scope import host_key
 
 log = logging.getLogger("searchify.research")
 
@@ -31,7 +32,15 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 # Bump when keyword seeding changes so suggestions built from old seeds refresh once.
-KEYWORDS_QUALITY = 5
+KEYWORDS_QUALITY = 6
+# Organic keywords read per refresh (DataForSEO ranked keywords; billed per row returned).
+RANKED_LIMIT = 1000
+# Big platforms rank for almost everything; they are not business competitors.
+PLATFORMS = {
+    "wikipedia.org", "youtube.com", "amazon.com", "facebook.com", "reddit.com", "instagram.com", "pinterest.com",
+    "linkedin.com", "yelp.com", "x.com", "twitter.com", "quora.com", "tiktok.com", "google.com", "apple.com",
+    "walmart.com", "ebay.com", "homedepot.com", "lowes.com", "etsy.com", "medium.com", "indeed.com", "tripadvisor.com",
+}
 PROVIDER_ERRORS = {
     40104: "Searchify SEO is not fully set up yet. Ask an admin to finish Searchify SEO setup.",
     40200: "Searchify SEO research credit is empty. Top up Searchify SEO to run live research again.",
@@ -224,7 +233,18 @@ def _kw_row(item: dict) -> dict:
         "cpc": info.get("cpc"),
         "difficulty": props.get("keyword_difficulty"),
         "intent": intent,
+        # Last 12 months of searches, oldest first (DataForSEO keyword_info.monthly_searches).
+        "trend": _trend(info.get("monthly_searches")),
+        "competition": info.get("competition_level") or info.get("competition"),
+        # What Google shows on the results page for this search besides plain links.
+        "serpFeatures": [t for t in ((data.get("serp_info") or {}).get("serp_item_types") or []) if t not in ("organic", "paid")],
     }
+
+
+def _trend(monthly) -> list:
+    rows = [m for m in monthly or [] if isinstance(m, dict)]
+    rows.sort(key=lambda m: (m.get("year") or 0, m.get("month") or 0))
+    return [m.get("search_volume") for m in rows][-12:]
 
 
 def _place_for(db: Session, user: User, *, site: str, country: str = "", reach: str = "", tool: str = "") -> tuple[locations.Location, dict]:
@@ -334,14 +354,15 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         concepts = keyword_concepts(saved, offers)
         return _with_tracking(db, user, host, {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped})
     quotas.check(db, user, "keywords")
-    _budget(db, user, 5)
+    _budget(db, user, 16)
     cost = 0.0
     ranked_payload = {
         "target": host,
         "location_name": location,
         "language_code": language,
-        "limit": 200,
-        "item_types": ["organic"],
+        "limit": RANKED_LIMIT,
+        # Organic links plus the SERP features a site can own.
+        "item_types": ["organic", "featured_snippet", "local_pack"],
         "filters": ["ranked_serp_element.serp_item.rank_group", "<=", 100],
         "order_by": [
             "ranked_serp_element.serp_item.rank_group,asc",
@@ -356,16 +377,21 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             "target": host,
             "location_name": location,
             "language_code": language,
-            "limit": 200,
+            "limit": RANKED_LIMIT,
             "order_by": ["keyword_data.keyword_info.search_volume,desc"],
         }
         ranked_res, c = _call("POST", "/dataforseo_labs/google/ranked_keywords/live", [ranked_payload])
     cost += c
+    ranked_task = (ranked_res or [{}])[0] or {}
     best: dict[str, dict] = {}
-    for item in ((ranked_res or [{}])[0] or {}).get("items") or []:
+    owned_features: dict[str, set] = {}
+    for item in ranked_task.get("items") or []:
         row = _kw_row(item)
         serp = (item.get("ranked_serp_element") or {}).get("serp_item") or {}
-        if (serp.get("type") or "organic") not in ("", "organic"):
+        kind = serp.get("type") or "organic"
+        if kind not in ("", "organic"):
+            if row.get("keyword"):
+                owned_features.setdefault(row["keyword"].lower(), set()).add(kind)
             continue
         changes = serp.get("rank_changes") or {}
         row.update({
@@ -374,6 +400,8 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             "isNew": bool(changes.get("is_new")),
             "url": serp.get("url") or "",
             "page": serp.get("relative_url") or "",
+            # DataForSEO's estimated monthly visits from this search at this position.
+            "traffic": serp.get("etv"),
         })
         if not row["keyword"]:
             continue
@@ -390,7 +418,15 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     ranked = sorted(best.values(), key=_rank_key)
     for row in ranked:
         row["source"] = "Searchify SEO ranked keywords (estimated Google organic position)"
+        row["ownedFeatures"] = sorted(owned_features.get(row["keyword"].lower(), set()))
     by_term = {row["keyword"].lower(): row for row in ranked}
+    organic_summary = _organic_summary(ranked_task, ranked)
+    # Two or more pages of this site ranking for the same search split its strength.
+    cannibalization = [
+        {k: row.get(k) for k in ("keyword", "volume", "position", "url", "otherUrls", "traffic")}
+        for row in ranked
+        if row.get("otherUrls")
+    ]
 
     tracked = []
     if clean:
@@ -451,7 +487,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     for item in ((site_res or [{}])[0] or {}).get("items") or []:
         row = _kw_row(item)
         if row.get("keyword"):
-            candidates.append({**row, "seed": row.get("intent") or "", "source": f"DataForSEO keywords for site · {host}"})
+            candidates.append({**row, "kind": "site", "seed": row.get("intent") or "", "source": f"DataForSEO keywords for site · {host}"})
 
     concept = site_concept(db, user.id, host)
     seeds = business_topics(concept)
@@ -480,9 +516,17 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             for item in ((ideas_res or [{}])[0] or {}).get("items") or []:
                 row = _kw_row(item)
                 if row.get("keyword"):
-                    candidates.append({**row, "seed": row.get("intent") or "", "source": "DataForSEO keyword ideas for the business category"})
+                    candidates.append({**row, "kind": "category", "seed": row.get("intent") or "", "source": "DataForSEO keyword ideas for the business category"})
         except ResearchError as exc:
             log.warning("keyword_ideas_failed", extra={"host": host, "error": str(exc)[:200]})
+
+    rivals: list[dict] = []
+    if seeds:
+        extra = _more_candidates(seeds, host, location, language)
+        candidates.extend(extra["rows"])
+        cost += extra["cost"]
+        idea_calls += extra["calls"]
+        rivals = extra["rivals"]
 
     understood = bool(concept["offers"] or concept["category"] or concept["pages"])
     if understood:
@@ -499,6 +543,22 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 taken.add(key)
                 ideas.append(row)
         suggestion_meta = {"judged": "none", "checked": len(candidates), "needsSiteScan": True}
+    for row in ideas:
+        row["question"] = keyword_tracking.is_question(row.get("keyword") or "")
+
+    local = {"location": "", "available": False}
+    city = _city_location(place)
+    if city:
+        found_local, c, local_calls = _local_volumes(city, language, [*clean, *[r["keyword"] for r in ideas[:400]], *[r["keyword"] for r in ranked[:400]]])
+        cost += c
+        idea_calls += local_calls
+        if found_local:
+            local = {"location": city, "available": True}
+            for row in [*ranked, *tracked, *ideas]:
+                hit = found_local.get((row.get("keyword") or "").lower())
+                if hit:
+                    row["localVolume"] = hit["volume"]
+                    row["localTrend"] = hit["trend"]
     paid_calls = 1 + bool(clean) + idea_calls
     _spend(db, user, paid_calls, cost)
     quotas.consume(db, user, "keywords")
@@ -523,6 +583,10 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         "businessTopics": seeds,
         "seeds": [],
         "suggestionMeta": suggestion_meta,
+        "organicSummary": organic_summary,
+        "cannibalization": cannibalization,
+        "competitors": rivals,
+        "localVolume": local,
         "termLimit": term_limit,
         "qualityVersion": KEYWORDS_QUALITY,
         "provider": "dataforseo",
@@ -561,10 +625,10 @@ def _with_tracking(db: Session, user: User, host: str, result: dict) -> dict:
     if db is None:
         return result
     ranked = list(result.get("ranked") or [])
-    metrics = [*(result.get("tracked") or []), *ranked]
+    current = keyword_tracking.current_keywords(db, user.id, host, ranked)
+    metrics = [*(result.get("tracked") or []), *current["rows"]]
     tracked = keyword_tracking.tracked_payload(db, user.id, host, metrics)
     taken = {row["keyword"] for row in tracked} | {keyword_tracking.clean_keyword(r.get("keyword")) for r in ranked}
-    current = keyword_tracking.current_keywords(db, user.id, host, ranked)
     suggestions = [row for row in result.get("ideas") or [] if keyword_tracking.clean_keyword(row.get("keyword")) not in taken]
     return {
         **result,
@@ -1988,3 +2052,179 @@ def ranked_url_for(db: Session, user_id: int, host: str, term: str) -> str:
         if keyword_tracking.clean_keyword(row.get("keyword")) == term and row.get("url"):
             return row["url"]
     return ""
+
+
+def _organic_summary(task: dict, ranked: list[dict]) -> dict:
+    """Totals like the overview strip in Semrush/Ahrefs: keywords, estimated traffic, position bands."""
+    organic = ((task or {}).get("metrics") or {}).get("organic") or {}
+
+    def band(lo: int, hi: int) -> int:
+        return sum(1 for r in ranked if isinstance(r.get("position"), int) and lo <= r["position"] <= hi)
+
+    total = task.get("total_count") if isinstance(task.get("total_count"), int) else organic.get("count")
+    traffic = organic.get("etv")
+    if traffic is None:
+        values = [r.get("traffic") for r in ranked if isinstance(r.get("traffic"), (int, float))]
+        traffic = sum(values) if values else None
+    top3 = (organic.get("pos_1") or 0) + (organic.get("pos_2_3") or 0) if organic else band(1, 3)
+    top10 = top3 + (organic.get("pos_4_10") or 0) if organic else band(1, 10)
+    return {
+        "keywords": total if total is not None else len(ranked),
+        "loaded": len(ranked),
+        "traffic": round(traffic) if isinstance(traffic, (int, float)) else None,
+        "top3": top3,
+        "top10": top10,
+        "top20": top10 + ((organic.get("pos_11_20") or 0) if organic else band(11, 20)),
+    }
+
+
+def _labs(path: str, payload: dict) -> tuple[list, float]:
+    """One DataForSEO Labs call; retries once without filters/order_by (some accounts reject them)."""
+    try:
+        res, cost = _call("POST", path, [payload])
+    except ResearchError as exc:
+        if exc.code in {"provider_balance", "provider_not_configured"}:
+            raise
+        res, cost = _call("POST", path, [{k: v for k, v in payload.items() if k not in {"filters", "order_by"}}])
+    return list(((res or [{}])[0] or {}).get("items") or []), cost
+
+
+def _more_candidates(seeds: list[str], host: str, location: str, language: str) -> dict:
+    """Long-tail (keyword_suggestions), Google related searches (related_keywords) for the main
+    business topics, and the competitor gap (competitors_domain + domain_intersection)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    base = {"location_name": location, "language_code": language}
+    jobs = []
+    for topic in seeds[:3]:
+        jobs.append(("longtail", topic, "/dataforseo_labs/google/keyword_suggestions/live", {
+            **base, "keyword": topic, "limit": 100,
+            "filters": ["keyword_info.search_volume", ">", 0],
+            "order_by": ["keyword_info.search_volume,desc"],
+        }))
+        jobs.append(("related", topic, "/dataforseo_labs/google/related_keywords/live", {
+            **base, "keyword": topic, "depth": 1, "limit": 100,
+        }))
+
+    def run(job):
+        kind, topic, path, payload = job
+        try:
+            items, cost = _labs(path, payload)
+            return kind, topic, items, cost, ""
+        except ResearchError as exc:
+            return kind, topic, [], 0.0, str(exc)
+
+    rows: list[dict] = []
+    cost, calls = 0.0, 0
+    labels = {"longtail": "DataForSEO long-tail searches", "related": "Google related searches (DataForSEO)"}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for kind, topic, items, spent, error in pool.map(run, jobs):
+            calls += 1
+            cost += spent
+            if error:
+                log.warning("keyword_source_failed", extra={"kind": kind, "error": error[:200]})
+            for item in items:
+                row = _kw_row(item)
+                if row.get("keyword"):
+                    rows.append({**row, "kind": kind, "seed": row.get("intent") or "", "source": f"{labels[kind]} · {topic}"})
+
+    rivals: list[dict] = []
+    try:
+        items, spent = _labs("/dataforseo_labs/google/competitors_domain/live", {
+            "target": host, **base, "limit": 30, "exclude_top_domains": True,
+            "order_by": ["intersections,desc"],
+        })
+        cost += spent
+        calls += 1
+        for item in items:
+            domain = host_key(item.get("domain") or "")
+            if not domain or domain == host or domain in PLATFORMS or any(domain.endswith("." + p) for p in PLATFORMS):
+                continue
+            organic = ((item.get("full_domain_metrics") or item.get("metrics") or {}).get("organic") or {})
+            rivals.append({
+                "domain": domain,
+                "shared": item.get("intersections"),
+                "keywords": organic.get("count"),
+                "traffic": round(organic["etv"]) if isinstance(organic.get("etv"), (int, float)) else None,
+                "avgPosition": item.get("avg_position"),
+            })
+            if len(rivals) >= 5:
+                break
+    except ResearchError as exc:
+        log.warning("competitors_failed", extra={"error": str(exc)[:200]})
+
+    def gap(rival):
+        try:
+            items, spent = _labs("/dataforseo_labs/google/domain_intersection/live", {
+                "target1": rival["domain"], "target2": host, **base,
+                # false = searches the competitor ranks for and this website does not.
+                "intersections": False,
+                "item_types": ["organic"],
+                "limit": 150,
+                "filters": ["first_domain_serp_element.rank_group", "<=", 20],
+                "order_by": ["keyword_data.keyword_info.search_volume,desc"],
+            })
+            return rival, items, spent
+        except ResearchError as exc:
+            log.warning("gap_failed", extra={"rival": rival["domain"], "error": str(exc)[:200]})
+            return rival, [], 0.0
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        for rival, items, spent in pool.map(gap, rivals[:3]):
+            calls += 1
+            cost += spent
+            rival["gapKeywords"] = 0
+            for item in items:
+                row = _kw_row(item)
+                serp = item.get("first_domain_serp_element") or {}
+                if not row.get("keyword"):
+                    continue
+                rival["gapKeywords"] += 1
+                rows.append({
+                    **row,
+                    "kind": "gap",
+                    "seed": row.get("intent") or "",
+                    "gapDomain": rival["domain"],
+                    "gapPosition": serp.get("rank_group"),
+                    "gapUrl": serp.get("url") or "",
+                    "source": f"Competitor gap · {rival['domain']} ranks, you don't",
+                })
+    return {"rows": rows, "cost": cost, "calls": calls, "rivals": rivals}
+
+
+def _city_location(place) -> str:
+    from app.rank_tracking import city_location
+
+    return city_location(place)
+
+
+_ADS_OK = re.compile(r"^[\w\s'&.\-]+$", re.U)
+
+
+def _local_volumes(city: str, language: str, terms: list[str]) -> tuple[dict, float, int]:
+    """City-level monthly searches from Google Ads data (DataForSEO keywords_data). Empty when the
+    city is not a Google Ads location."""
+    clean = []
+    for term in dict.fromkeys(t.strip().lower() for t in terms if t and t.strip()):
+        if len(term) <= 80 and len(term.split()) <= 10 and _ADS_OK.match(term):
+            clean.append(term)
+        if len(clean) >= 1000:
+            break
+    if not clean:
+        return {}, 0.0, 0
+    try:
+        res, cost = _call(
+            "POST",
+            "/keywords_data/google_ads/search_volume/live",
+            [{"keywords": clean, "location_name": city, "language_code": language}],
+            timeout=120,
+        )
+    except ResearchError as exc:
+        log.warning("local_volume_failed", extra={"city": city, "error": str(exc)[:200]})
+        return {}, 0.0, 1
+    out = {}
+    for item in res or []:
+        key = str(item.get("keyword") or "").lower()
+        if key:
+            out[key] = {"volume": item.get("search_volume"), "trend": _trend(item.get("monthly_searches"))}
+    return out, cost, 1

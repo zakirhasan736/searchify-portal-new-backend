@@ -127,3 +127,79 @@ def test_track_without_matching_page_only_tracks(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         drop_user(user.id)
+
+
+def test_parse_serp_finds_position_features_and_owned():
+    from app.rank_tracking import parse_serp
+
+    result = {"items": [
+        {"type": "featured_snippet", "domain": "www.voloair.example", "url": "https://www.voloair.example/merv"},
+        {"type": "people_also_ask", "items": [{"title": "what is merv 13"}]},
+        {"type": "organic", "rank_group": 1, "domain": "rival.example", "url": "https://rival.example/a", "title": "Rival"},
+        {"type": "organic", "rank_group": 2, "domain": "www.voloair.example", "url": "https://www.voloair.example/merv", "title": "Us"},
+        {"type": "local_pack", "domain": "other.example"},
+    ]}
+    out = parse_serp(result, "voloair.example")
+    assert out["position"] == 2 and out["url"].endswith("/merv")
+    assert out["features"] == ["featured_snippet", "people_also_ask", "local_pack"]
+    assert out["owned"] == ["featured_snippet"]
+    assert [t["domain"] for t in out["top"]] == ["rival.example", "voloair.example"]
+
+
+def test_question_detection():
+    assert keyword_tracking.is_question("how often change merv 13 filter")
+    assert keyword_tracking.is_question("merv 13 vs merv 11?")
+    assert not keyword_tracking.is_question("merv 13 filter 20x25x1")
+
+
+def test_competitor_gap_details_survive_dedupe(monkeypatch):
+    monkeypatch.setattr(keyword_tracking, "judge_fit", lambda c, p, pool: {r["keyword"]: {"fit": "core", "concept": "", "page": "", "model": "m"} for r in pool})
+    rows = [
+        {"keyword": "merv 13 filter", "volume": 900, "kind": "site"},
+        {"keyword": "merv 13 filter", "volume": 900, "kind": "gap", "gapDomain": "rival.example", "gapPosition": 4},
+        {"keyword": "how to change hvac filter", "volume": 500, "kind": "longtail"},
+    ]
+    out = keyword_tracking.business_suggestions(CONCEPT, [], rows, known=set())
+    hit = next(r for r in out["rows"] if r["keyword"] == "merv 13 filter")
+    assert hit["gapDomain"] == "rival.example" and hit["gapPosition"] == 4
+    assert {r["kind"] for r in out["rows"]} == {"site", "longtail"}
+
+
+def test_organic_summary_uses_dataforseo_metrics():
+    from app import research
+
+    task = {"total_count": 1840, "metrics": {"organic": {"pos_1": 5, "pos_2_3": 7, "pos_4_10": 20, "pos_11_20": 30, "etv": 5321.4, "count": 1840}}}
+    out = research._organic_summary(task, [{"keyword": "a", "position": 1}])
+    assert out == {"keywords": 1840, "loaded": 1, "traffic": 5321, "top3": 12, "top10": 32, "top20": 62}
+
+
+def test_track_runs_live_check_and_history(monkeypatch):
+    from app import rank_tracking, research
+
+    user = make_user("kwlive")
+    monkeypatch.setattr(research, "track_term_metrics", lambda *a, **k: None)
+    place = research.locations.Location(country="Canada", iso="CA", language="en", city="Calgary", region="Alberta")
+    monkeypatch.setattr(rank_tracking, "_place", lambda db, u, host: (place, "en"))
+    monkeypatch.setattr(research, "_budget", lambda *a, **k: None)
+    seen = []
+
+    def fake_serp(keyword, host, *, location_name, language, device):
+        seen.append((location_name, device))
+        return {"position": 6 if device == "desktop" else 9, "url": "https://voloair.example/x", "features": ["local_pack"], "owned": [], "top": []}, 0.002
+
+    monkeypatch.setattr(rank_tracking, "serp_check", fake_serp)
+    app.dependency_overrides[get_current_user] = lambda: user
+    try:
+        client = TestClient(app)
+        body = client.post("/api/v1/research/keywords/track", json={"site": "voloair.example", "keyword": "merv 13 filter", "apply": False}).json()
+        assert sorted(seen) == [("Calgary,Alberta,Canada", "desktop"), ("Calgary,Alberta,Canada", "mobile")]
+        row = body["tracked"][0]
+        assert row["position"] == 6 and row["rankSource"] == "live" and not row["measuring"]
+        assert row["live"]["mobile"]["latest"]["position"] == 9
+        assert row["live"]["desktop"]["latest"]["features"][0]["label"] == "Local map pack"
+        # A manual re-check straight after is held back for 30 minutes.
+        again = client.post("/api/v1/research/keywords/check-ranks", json={"site": "voloair.example"})
+        assert again.status_code == 424
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+        drop_user(user.id)

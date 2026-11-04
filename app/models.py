@@ -321,3 +321,27 @@ class TrackedKeyword(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     __table_args__ = (UniqueConstraint("customer_id", "host", "keyword"),)
+
+
+class KeywordRankCheck(Base):
+    """One live Google check of a tracked keyword (DataForSEO SERP API). Kept as history."""
+
+    __tablename__ = "keyword_rank_checks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    tracked_keyword_id: Mapped[int] = mapped_column(ForeignKey("tracked_keywords.id", ondelete="CASCADE"), index=True)
+    host: Mapped[str] = mapped_column(String(255), index=True)
+    keyword: Mapped[str] = mapped_column(String(120))
+    device: Mapped[str] = mapped_column(String(16), default="desktop")  # desktop | mobile
+    location: Mapped[str] = mapped_column(String(200), default="")
+    # Organic position of this website (rank_group); null = not in the top results checked.
+    position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    url: Mapped[str] = mapped_column(Text, default="")
+    # SERP features on the page, and the ones this website appears in.
+    features: Mapped[list] = mapped_column(JSONB, default=list)
+    owned: Mapped[list] = mapped_column(JSONB, default=list)
+    top: Mapped[list] = mapped_column(JSONB, default=list)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (Index("ix_rank_checks_kw_device_time", "tracked_keyword_id", "device", "checked_at"),)

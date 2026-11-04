@@ -10,7 +10,7 @@ from sqlalchemy import text
 from app.database import SessionLocal
 from app.models import User
 
-TABLES = ("tracked_keywords", "site_changes", "jobs", "feature_records", "cms_connections", "google_connections", "drafts")
+TABLES = ("keyword_rank_checks", "tracked_keywords", "site_changes", "jobs", "feature_records", "cms_connections", "google_connections", "drafts")
 
 
 def make_user(prefix: str = "pytest", *, role: str = "ROLE_CLIENT", plan: str = "starter", site_limit: int = 5) -> SimpleNamespace:

@@ -22,6 +22,14 @@ from app.site_scope import host_key, payload_host
 log = logging.getLogger("searchify.keywords")
 
 MAX_KEYWORD = 120
+# Searches sent to the AI business-fit check per refresh.
+POOL = 240
+QUESTION = re.compile(r"^(how|what|why|when|where|who|which|can|does|do|is|are|should|will|could|would)\b", re.I)
+
+
+def is_question(keyword: str) -> bool:
+    text = (keyword or "").strip()
+    return bool(QUESTION.match(text)) or text.endswith("?")
 
 
 def clean_keyword(value: str) -> str:
@@ -107,8 +115,20 @@ def untrack(db: Session, user_id: int, host: str, keyword: str) -> bool:
 
 
 def tracked_payload(db: Session, user_id: int, host: str, metrics: list[dict] | None = None) -> list[dict]:
-    """Tracked keywords with their latest numbers and the state of the page update they started."""
-    by_term = {clean_keyword(row.get("keyword")): row for row in metrics or [] if row.get("keyword")}
+    """Tracked keywords with live Google ranks (desktop + mobile history), DataForSEO keyword numbers,
+    Search Console clicks, and the state of the page update they started."""
+    from app.rank_tracking import rank_history
+
+    by_term: dict[str, dict] = {}
+    for item in metrics or []:
+        term = clean_keyword(item.get("keyword"))
+        if not term:
+            continue
+        held = by_term.setdefault(term, {})
+        for key, value in item.items():
+            if value not in (None, "", []) and held.get(key) in (None, "", []):
+                held[key] = value
+    live = rank_history(db, user_id, host)
     rows = tracked_rows(db, user_id, host)
     change_ids = [row.change_id for row in rows if row.change_id]
     changes = {}
@@ -117,17 +137,25 @@ def tracked_payload(db: Session, user_id: int, host: str, metrics: list[dict] | 
     out = []
     for row in rows:
         data = by_term.get(row.keyword) or {}
+        checks = live.get(row.keyword) or {}
+        desk = checks.get("desktop") or {}
         change = changes.get(row.change_id) if row.change_id else None
         proposed = dict(change.proposed or {}) if change else {}
+        has_live = bool(desk.get("history"))
         out.append({
-            **{k: v for k, v in data.items() if k not in {"source"}},
+            **{k: v for k, v in data.items() if k not in {"source", "position", "previous"}},
             "keyword": row.keyword,
+            # Live Google check first; DataForSEO's ranked-keywords estimate only until the first check.
+            "position": (desk.get("latest") or {}).get("position") if has_live else data.get("position"),
+            "previous": desk.get("previous") if has_live else data.get("previous"),
+            "rankSource": "live" if has_live else ("estimate" if data.get("position") is not None else "none"),
+            "live": checks,
             "trackedSource": row.source,
             "concept": row.concept or data.get("concept") or "",
-            "page": row.page_url or data.get("url") or "",
+            "page": row.page_url or (desk.get("latest") or {}).get("url") or data.get("url") or "",
             "trackedAt": row.created_at.isoformat(timespec="seconds") if row.created_at else None,
-            "measuring": data.get("position") is None,
-            "source": data.get("source") or "Waiting for the next DataForSEO rank check",
+            "measuring": not has_live and data.get("position") is None,
+            "source": "Live Google check (DataForSEO SERP)" if has_live else (data.get("source") or "Waiting for the first live Google check"),
             "change": {
                 "id": change.id,
                 "status": change.status,
@@ -296,14 +324,30 @@ def _score(row: dict) -> float:
 def business_suggestions(concept: dict, places: list[str], candidates: list[dict], *, known: set[str]) -> dict:
     """Keep only candidates that fit the business. Each kept row says which offer it belongs to and
     which page of the site should rank for it."""
-    pool, seen = [], set()
+    # One row per search. A competitor-gap hit keeps the rival's details even if another source
+    # found the same search first.
+    merged: dict[str, dict] = {}
     for row in candidates:
         term = clean_keyword(row.get("keyword"))
-        if not term or term in seen or term in known:
+        if not term or term in known:
             continue
-        seen.add(term)
-        pool.append({**row, "keyword": term})
-    pool = pool[:160]
+        held = merged.get(term)
+        if held is None:
+            merged[term] = {**row, "keyword": term, "kind": row.get("kind") or "site"}
+        elif row.get("kind") == "gap" and not held.get("gapDomain"):
+            held.update({k: row.get(k) for k in ("gapDomain", "gapPosition", "gapUrl")})
+            held.setdefault("alsoFrom", []).append("gap")
+    # Take the strongest searches from every source in turn so no source crowds out the others.
+    by_kind: dict[str, list[dict]] = {}
+    for row in merged.values():
+        by_kind.setdefault(row["kind"], []).append(row)
+    for rows in by_kind.values():
+        rows.sort(key=lambda r: -(r.get("volume") or 0))
+    pool = []
+    while len(pool) < POOL and any(by_kind.values()):
+        for kind in list(by_kind):
+            if by_kind[kind]:
+                pool.append(by_kind[kind].pop(0))
     verdicts = judge_fit(concept, places, pool)
     kept = []
     for row in pool:

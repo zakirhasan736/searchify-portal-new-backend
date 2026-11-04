@@ -31,8 +31,8 @@ def test_keywords_keep_location_language_nulls_and_dedupe(offline, monkeypatch):
     def fake_call(method, path, payload=None, timeout=60):
         offline.append((path, payload[0]))
         if "ranked_keywords" in path:
-            assert payload[0]["item_types"] == ["organic"]
-            assert payload[0]["limit"] == 200
+            assert payload[0]["item_types"] == ["organic", "featured_snippet", "local_pack"]
+            assert payload[0]["limit"] == research.RANKED_LIMIT
             return [{"items": [
                 ranked_item("calgary plumber", 9, "https://acme.ca/blog/x", 500),
                 ranked_item("calgary plumber", 3, "https://acme.ca/plumbing", 500),
@@ -45,7 +45,10 @@ def test_keywords_keep_location_language_nulls_and_dedupe(offline, monkeypatch):
     monkeypatch.setattr(research, "_call", fake_call)
     out = research.keywords(None, FakeUser(), site="acme.ca", terms=["Calgary Plumber", "calgary plumber", "unknown term"], country="Calgary, Alberta")
     assert out["location"] == "Canada" and out["language"] == "en" and out["place"]["city"] == "Calgary"
-    assert all(p["location_name"] == "Canada" and p["language_code"] == "en" for _, p in offline)
+    assert all(p["location_name"] == "Canada" and p["language_code"] == "en" for path, p in offline if "google_ads" not in path)
+    # City-level search volume comes from Google Ads data for the city the business serves.
+    local = [p for path, p in offline if "google_ads/search_volume" in path]
+    assert local and local[0]["location_name"].startswith("Calgary,")
     assert out.get("provider") == "dataforseo"
     assert "Search Console" in (out.get("metricsNote") or "")
     ranked = {r["keyword"]: r for r in out["ranked"]}
