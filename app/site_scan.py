@@ -672,19 +672,19 @@ def scan_site(
         ai_checks = {}
         understanding = {}
     else:
-        try:
-            from app.audit_checks import run_site_checks
+    try:
+        from app.audit_checks import run_site_checks
 
-            site_checks = run_site_checks(crawled.get("home") or home, [p["url"] for p in pages[:15]])
-        except Exception:  # noqa: BLE001
-            site_checks = {}
-        try:
-            from app.ai_readiness import run_ai_checks
+        site_checks = run_site_checks(crawled.get("home") or home, [p["url"] for p in pages[:15]])
+    except Exception:  # noqa: BLE001
+        site_checks = {}
+    try:
+        from app.ai_readiness import run_ai_checks
 
-            ai_checks = run_ai_checks(crawled.get("home") or home, [p["url"] for p in pages[:12]])
-        except Exception:  # noqa: BLE001
-            ai_checks = {}
-        understanding = understand(pages, brief, profile)
+        ai_checks = run_ai_checks(crawled.get("home") or home, [p["url"] for p in pages[:12]])
+    except Exception:  # noqa: BLE001
+        ai_checks = {}
+    understanding = understand(pages, brief, profile)
     understand_error = str(understanding.pop("_error", "") or "")
     understand_model = str(understanding.pop("_model", "") or "")
     page_map = {normalize(item.get("url") or ""): item for item in understanding.get("pages") or [] if isinstance(item, dict)}
@@ -695,15 +695,15 @@ def scan_site(
     ]
     competitors = {}
     if not quick:
-        competitors = research_competitors(
-            [t for t in targets if t],
-            crawled.get("host") or host_of(home),
-            places_rows,
-            manual=(brief or {}).get("competitors"),
-            market=" ".join(str(v or "") for v in ((brief or {}).get("market"), profile.get("areas"), profile.get("locations"))),
-            serp_limit=serp_limit,
-            counter=counter,
-        )
+    competitors = research_competitors(
+        [t for t in targets if t],
+        crawled.get("host") or host_of(home),
+        places_rows,
+        manual=(brief or {}).get("competitors"),
+        market=" ".join(str(v or "") for v in ((brief or {}).get("market"), profile.get("areas"), profile.get("locations"))),
+        serp_limit=serp_limit,
+        counter=counter,
+    )
     return {
         "home": crawled.get("home"),
         "host": crawled.get("host"),
