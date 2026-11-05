@@ -69,6 +69,9 @@ def checkout_is_live(checkout: dict | None) -> bool:
 
 # Same rates the checkout page shows. Missing or unknown country adds no tax.
 TAX_RATES = {"CA": 0.05, "US": 0.0, "GB": 0.20, "AU": 0.10}
+# Stripe online card rate, passed through so the plan price is not reduced by the charge.
+CARD_FEE_RATE = 0.029
+CARD_FEE_FIXED_CENTS = 30
 
 
 def normalize_billing(raw: str) -> str:
@@ -83,18 +86,32 @@ def _amount_cents(plan: dict, billing: str) -> int:
     return monthly * 100
 
 
-def quote_cents(plan: dict, billing: str, country: str = "") -> tuple[int, int]:
-    """Return (total cents, tax cents) for the recurring Stripe price."""
+def quote_cents(plan: dict, billing: str, country: str = "") -> dict:
+    """Plan price plus tax plus the card processing charge, in cents.
+
+    Tax is on the plan price. The processing line is 2.9% + $0.30 of the amount
+    Stripe will charge, so a new plan, an upgrade, and a monthly or yearly renewal
+    all collect the same two extras.
+    """
     billing = normalize_billing(billing)
     base = _amount_cents(plan, billing)
     if base <= 0:
         base = 4900 * (10 if billing == "annual" else 1)
     rate = TAX_RATES.get(str(country or "").strip().upper(), 0.0)
     tax = int(round(base * rate))
-    return base + tax, tax
+    # ceil((base + tax + 30) / 0.971) using integer math.
+    total = ((base + tax + CARD_FEE_FIXED_CENTS) * 1000 + 970) // 971
+    fee = total - base - tax
+    return {
+        "baseCents": base,
+        "taxCents": tax,
+        "feeCents": fee,
+        "totalCents": total,
+        "taxRate": rate,
+    }
 
 
-def _meta(*, user: User, plan: dict, canonical: str, billing: str, founding: bool, trial_days: int, country: str, tax: int) -> dict:
+def _meta(*, user: User, plan: dict, canonical: str, billing: str, founding: bool, trial_days: int, country: str, quote: dict) -> dict:
     return {
         "userId": str(user.id),
         "planId": str(plan.get("id") or ""),
@@ -103,8 +120,19 @@ def _meta(*, user: User, plan: dict, canonical: str, billing: str, founding: boo
         "founding": "1" if founding else "0",
         "trialDays": str(int(trial_days or 0)),
         "country": str(country or "").strip().upper(),
-        "taxCents": str(int(tax or 0)),
+        "taxCents": str(int(quote.get("taxCents") or 0)),
+        "feeCents": str(int(quote.get("feeCents") or 0)),
+        "baseCents": str(int(quote.get("baseCents") or 0)),
     }
+
+
+def _charge_description(plan: dict, quote: dict) -> str:
+    name = plan.get("name") or "plan"
+    parts = [f"{name} ${quote['baseCents'] / 100:.2f}"]
+    parts.append(f"card processing ${quote['feeCents'] / 100:.2f}")
+    if quote.get("taxCents"):
+        parts.append(f"tax ${quote['taxCents'] / 100:.2f}")
+    return ", ".join(parts)
 
 
 def _subscription_status(sub: dict, trial_days: int) -> str:
@@ -210,14 +238,18 @@ def _retarget_subscription(
     items = list(((sub.get("items") or {}).get("data")) or [])
     if not items:
         return None
-    amount, tax = quote_cents(plan, billing, country)
+    quote = quote_cents(plan, billing, country)
+    amount = quote["totalCents"]
     interval = "year" if billing == "annual" else "month"
     meta = _meta(
         user=user, plan=plan, canonical=canonical, billing=billing,
-        founding=founding, trial_days=trial_days, country=country, tax=tax,
+        founding=founding, trial_days=trial_days, country=country, quote=quote,
     )
     try:
-        product = stripe.Product.create(name=f"Searchify {plan.get('name') or canonical}")
+        product = stripe.Product.create(
+            name=f"Searchify {plan.get('name') or canonical}",
+            description=_charge_description(plan, quote)[:500],
+        )
         price = stripe.Price.create(
             product=product.id,
             currency="usd",
@@ -310,12 +342,13 @@ def start_customer_checkout(
     country = str(country or "").strip().upper()
     prior = prior or {}
     interval = "year" if billing == "annual" else "month"
-    amount, tax = quote_cents(plan, billing, country)
+    quote = quote_cents(plan, billing, country)
+    amount = quote["totalCents"]
     if amount <= 0 and not trial_days:
         raise HTTPException(400, "This plan has no Stripe price.")
     meta = _meta(
         user=user, plan=plan, canonical=canonical, billing=billing,
-        founding=founding, trial_days=trial_days, country=country, tax=tax,
+        founding=founding, trial_days=trial_days, country=country, quote=quote,
     )
     sub_data: dict = {"metadata": meta}
     if trial_days:
@@ -334,7 +367,10 @@ def start_customer_checkout(
                     "currency": "usd",
                     "unit_amount": amount,
                     "recurring": {"interval": interval},
-                    "product_data": {"name": f"Searchify {plan.get('name') or canonical}"},
+                    "product_data": {
+                        "name": f"Searchify {plan.get('name') or canonical}",
+                        "description": _charge_description(plan, quote)[:500],
+                    },
                 },
             }
         ],
@@ -368,7 +404,9 @@ def start_customer_checkout(
         "trialDays": trial_days,
         "founding": founding,
         "amountCents": amount,
-        "taxCents": tax,
+        "baseCents": quote["baseCents"],
+        "taxCents": quote["taxCents"],
+        "feeCents": quote["feeCents"],
         "detail": "Continue to Stripe to confirm the card. The plan is stored when Stripe confirms.",
         "next": "/app",
     }
