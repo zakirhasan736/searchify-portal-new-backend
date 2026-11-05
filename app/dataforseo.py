@@ -5,6 +5,8 @@ If DATAFORSEO_LOGIN / DATAFORSEO_PASSWORD are empty, returns [] and Sol still wr
 
 from __future__ import annotations
 
+import re
+
 import httpx
 
 from app import config
@@ -14,6 +16,22 @@ LIVE_ORGANIC = "https://api.dataforseo.com/v3/serp/google/organic/live/regular"
 
 def configured() -> bool:
     return bool(config.DATAFORSEO_LOGIN and config.DATAFORSEO_PASSWORD)
+
+
+def _public_url(item: dict) -> str:
+    """Organic url. Google sometimes wraps the listing, with the real site only in the breadcrumb."""
+    url = str(item.get("url") or "").strip()
+    domain = str(item.get("domain") or "").lower()
+    wrapped = "google." in domain or "google.com/goto" in url or url.startswith("https://google.")
+    crumb = str(item.get("breadcrumb") or "").strip()
+    if wrapped and crumb:
+        match = re.search(r"https?://[^\s›>]+", crumb)
+        if match:
+            return match.group(0).strip()
+        hostish = crumb.split("›")[0].split(">")[0].strip()
+        if hostish and "." in hostish and " " not in hostish:
+            return f"https://{hostish.lstrip('/')}"
+    return url
 
 
 def competitor_serp(
@@ -57,7 +75,7 @@ def competitor_serp(
             if str(item.get("type") or "") != "organic":
                 continue
             title = str(item.get("title") or "").strip()
-            url = str(item.get("url") or "").strip()
+            url = _public_url(item)
             desc = str(item.get("description") or "").strip()
             if not title:
                 continue

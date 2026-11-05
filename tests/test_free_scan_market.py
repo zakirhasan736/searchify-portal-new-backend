@@ -1,6 +1,6 @@
 """Public free-scan market detection. No network."""
 
-from app.site_scan import _detect_city, _detect_market, _google_health
+from app.site_scan import _detect_city, _detect_market, _google_health, _rivals_from_rows, _seed_keywords, _usable_category
 
 
 def _page(**extra):
@@ -43,6 +43,39 @@ def test_german_city_comes_from_the_page_copy():
 
 def test_schema_city_wins():
     assert _detect_city([_page(schemaCity="Leipzig", text="Hamburg")], "Germany") == "Leipzig"
+
+
+def test_website_schema_is_not_treated_as_the_business():
+    assert _usable_category("Web Site") == ""
+    assert _usable_category("WebSite") == ""
+    assert _usable_category("Reifenpreisvergleich") == "Reifenpreisvergleich"
+
+
+def test_rival_seeds_use_the_tire_keywords_not_web_site():
+    seeds = _seed_keywords(
+        [{"keyword": "sommerreifen", "volume": 22200}],
+        [{"keyword": "reifen", "volume": 110000}],
+        "Web Site",
+    )
+    assert seeds == ["reifen", "sommerreifen"]
+
+
+def test_rival_bars_come_from_those_search_results():
+    rows = _rivals_from_rows(
+        "reifexa.de",
+        {
+            "reifen": [
+                {"title": "Reifen.com", "url": "https://www.reifen.com/", "rank": 1},
+                {"title": "Websites.ca", "url": "https://websites.ca/", "rank": 8},
+            ]
+        },
+        2,
+    )
+    labels = [row["label"] for row in rows]
+    assert labels[0] == "reifen.com"
+    assert "You · reifexa.de" in labels
+    assert rows[0]["signal"] == "#1 for reifen"
+    assert all("Edmonton" not in (row.get("address") or "") for row in rows)
 
 
 def test_google_health_heatmap_uses_live_rankings():

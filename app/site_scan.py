@@ -1419,8 +1419,12 @@ def _preview_places(host: str, brand_hint: str = "", category: str = "", city: s
     if not getattr(config, "GOOGLE_PLACES_API_KEY", ""):
         return []
     brand = (brand_hint or host or "").split(".")[0].replace("-", " ").strip()
-    category = (category or "").strip() or "local business"
+    category = _usable_category(category)
     city = (city or "").strip()
+    # A Places search with no city is biased to wherever the request comes from,
+    # so a German tire site was matched to web studios in Edmonton.
+    if not category or not city:
+        return []
     queries = []
     if city:
         queries.append(f"{category} in {city}")
@@ -1982,6 +1986,112 @@ def _preview_gaps_from_site(pages: list, category: str, city: str) -> list[dict]
     return out
 
 
+def _seed_keywords(keywords: list, gaps: list, category: str) -> list[str]:
+    """Real searches for this business. A schema label such as Web Site is never a seed."""
+    seeds: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str) -> None:
+        text = " ".join(str(raw or "").split())
+        key = text.lower()
+        if not text or key in seen or not _usable_category(text):
+            return
+        seen.add(key)
+        seeds.append(text)
+
+    for row in sorted(gaps or [], key=lambda item: -(int(item.get("volume") or 0))):
+        add(row.get("keyword") or "")
+        if len(seeds) >= 1:
+            break
+    add(category)
+    for row in sorted(keywords or [], key=lambda item: -(int(item.get("volume") or 0))):
+        add(row.get("keyword") or "")
+        if len(seeds) >= 2:
+            break
+    return seeds[:2]
+
+
+def _rivals_from_rows(host: str, grouped: dict[str, list], visits: int) -> list[dict]:
+    """Turn organic results for the site's own searches into the rival bars."""
+    tallies: dict[str, dict] = {}
+    for keyword, rows in grouped.items():
+        for row in rows or []:
+            rival_host = host_of(str(row.get("url") or ""))
+            if not rival_host or rival_host == host or any(skip in rival_host for skip in _SKIP_RIVAL_HOSTS):
+                continue
+            try:
+                rank = int(row.get("rank") or 99)
+            except (TypeError, ValueError):
+                rank = 99
+            slot = tallies.setdefault(
+                rival_host,
+                {"name": rival_host, "label": rival_host, "best": 99, "terms": [], "you": False},
+            )
+            if keyword not in slot["terms"]:
+                slot["terms"].append(keyword)
+            if rank < slot["best"]:
+                slot["best"] = rank
+    rivals = sorted(tallies.values(), key=lambda item: (-len(item["terms"]), item["best"], item["name"]))[:4]
+    for row in rivals:
+        best = row["best"] if row["best"] < 99 else 10
+        row["score"] = max(1, (11 - min(best, 10)) + 4 * max(0, len(row["terms"]) - 1))
+        lead = row["terms"][0] if row["terms"] else ""
+        row["signal"] = f"#{best} for {lead}" if len(row["terms"]) == 1 else f"#{best} · {len(row['terms'])} searches"
+        row["address"] = ""
+        row["visits"] = None
+    you_score = max(1, int(visits) if visits else 1)
+    rivals.append(
+        {
+            "name": host,
+            "label": f"You · {host}",
+            "score": you_score,
+            "you": True,
+            "visits": visits or None,
+            "terms": [],
+            "best": None,
+            "signal": f"{visits} / mo est." if visits else "your site",
+            "address": "",
+        }
+    )
+    top = max((row["score"] for row in rivals), default=1)
+    for row in rivals:
+        row["pct"] = max(6, round(100 * row["score"] / top))
+    return rivals
+
+
+def _preview_search_rivals(
+    host: str,
+    keywords: list,
+    gaps: list,
+    category: str,
+    country: str,
+    language: str,
+    visits: int,
+) -> tuple[list[dict], str]:
+    """Who ranks in this site's country for its real keywords and category."""
+    seeds = _seed_keywords(keywords, gaps, category)
+    if not seeds or not country:
+        return [], ""
+    try:
+        from app import dataforseo
+    except Exception:
+        return [], ""
+    if not dataforseo.configured():
+        return [], ""
+    grouped: dict[str, list] = {}
+    for seed in seeds:
+        grouped[seed] = dataforseo.competitor_serp(
+            seed,
+            location_name=country,
+            language_code=language or "en",
+            depth=10,
+        )
+    rivals = _rivals_from_rows(host, grouped, visits)
+    if len(rivals) <= 1:
+        return [], ""
+    return rivals, seeds[0]
+
+
 def _preview_competitors(host: str, places: list, visits: int) -> list[dict]:
     """Bars for nearby Places listings + you. Uses review signal when traffic is unknown."""
     rivals = []
@@ -2114,16 +2224,31 @@ def _preview_onpage(home: str) -> dict:
     }
 
 
+_GENERIC_CATEGORY = {
+    "website", "webpage", "web site", "web page", "homepage", "home page", "organization",
+    "local business", "localbusiness", "site", "blog", "home", "page", "menu", "welcome",
+    "breadcrumblist", "imageobject", "searchaction", "entrypoint", "listitem", "wpheader",
+    "wpfooter", "person", "postaladdress",
+}
+_SKIP_RIVAL_HOSTS = ("google.", "youtube.com", "facebook.com", "instagram.com", "wikipedia.org", "pinterest.com")
+
+
+def _usable_category(text: str) -> str:
+    """A business category from the site. Schema types like WebSite are not a category."""
+    cleaned = " ".join(str(text or "").split())
+    key = re.sub(r"[^a-z0-9]+", "", cleaned.lower())
+    if not cleaned or len(cleaned) < 3 or key in {re.sub(r"[^a-z0-9]+", "", item) for item in _GENERIC_CATEGORY}:
+        return ""
+    return cleaned[:80]
+
+
 def _schema_category(pages: list) -> str:
-    skip = {
-        "website", "webpage", "organization", "breadcrumblist", "imageobject", "searchaction",
-        "entrypoint", "listitem", "site", "wpheader", "wpfooter", "person", "postaladdress",
-    }
     for page in pages[:4]:
         for kind in page.get("schemaTypes") or []:
             label = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(kind or "")).strip()
-            if label and label.lower() not in skip:
-                return label[:60]
+            usable = _usable_category(label)
+            if usable:
+                return usable
     return ""
 
 
@@ -2226,10 +2351,11 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         or host.split(".")[0].replace("-", " ")
     )
     city = str(business.get("city") or "").strip() or _detect_city(pages, country)
-    category = str(business.get("category") or "").strip() or _schema_category(pages) or _preview_category(pages, brand)
-    if category.lower() == "local business":
-        category = _schema_category(pages)
-    places = _preview_places(host, brand, category=category, city=city) if category else []
+    category = (
+        _usable_category(business.get("category") or "")
+        or _schema_category(pages)
+        or _usable_category(_preview_category(pages, brand))
+    )
     visibility = visibility_pack.get("visibility") or {}
     if country:
         visibility = {**visibility, "market": country, "language": language, "marketSource": market_source}
@@ -2237,7 +2363,15 @@ def preview_scan(home: str, limit: int = 40) -> dict:
     # Gaps stay empty unless DataForSEO returned searches this site does not rank for.
     gaps = visibility_pack.get("gaps") or []
     visits = int(visibility.get("visits") or 0)
-    competitors = _preview_competitors(host, places, visits)
+    competitors, rival_query = _preview_search_rivals(host, keywords, gaps, category, country, language, visits)
+    rival_source = "search" if competitors else ""
+    places = []
+    if not competitors and category and city:
+        places = _preview_places(host, brand, category=category, city=city)
+        if places:
+            competitors = _preview_competitors(host, places, visits)
+            rival_query = str(places[0].get("query") or "")
+            rival_source = "places"
     rendering = _preview_rendering(pages, pagespeed)
     markup = _preview_markup_quality(pages, str((pages[0] or {}).get("renderHints", {}).get("classSample") or "") if pages else "")
     # Fold PageSpeed + On-Page + SSR/CSR/image + markup into findings.
@@ -2293,7 +2427,17 @@ def preview_scan(home: str, limit: int = 40) -> dict:
     topic_status = []
     for key in topic_keys:
         if key == "places":
-            if places:
+            if rival_source == "search" and len(competitors) > 1:
+                topic_status.append(
+                    {
+                        "topic": "places",
+                        "status": "ok",
+                        "color": "green",
+                        "label": f"{len(competitors) - 1} sites ranking for the same searches",
+                        "detail": rival_query or category,
+                    }
+                )
+            elif places:
                 topic_status.append(
                     {
                         "topic": "places",
@@ -2398,11 +2542,7 @@ def preview_scan(home: str, limit: int = 40) -> dict:
             }
         ]
     more_issues = max(0, len(findings) + len(opportunities) - len(problems))
-    places_query = ""
-    if places:
-        places_query = str(places[0].get("query") or "")
-    elif category:
-        places_query = f"{category} in {city}" if city else category
+    places_query = rival_query or (f"{category} in {city}" if category and city else "")
     return {
         "home": crawled.get("home") or home,
         "host": host,
@@ -2429,6 +2569,8 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "aboutGoogle": about,
         "places": places,
         "placesQuery": places_query,
+        "rivalSource": rival_source,
+        "rivalQuery": rival_query,
         "placesSource": "google_places" if places else "",
         "keywords": keywords,
         "gaps": gaps,
@@ -2449,5 +2591,5 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "topicStatus": topic_status,
         "deepScan": True,
         "scanLimit": deep,
-        "scanVersion": "free-deep-v7",
+        "scanVersion": "free-deep-v8",
     }
