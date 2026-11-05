@@ -96,6 +96,8 @@ class PageReader(HTMLParser):
         self.og_description = ""
         self.og_type = ""
         self.og_image = ""
+        self.site_name = ""
+        self.lang = ""
         self.images: list[dict] = []
         self.nav: list[str] = []
         self.faqs: list[str] = []
@@ -116,6 +118,8 @@ class PageReader(HTMLParser):
     def handle_starttag(self, tag, attrs):
         tag = (tag or "").lower()
         attr = {k.lower(): (v or "") for k, v in attrs}
+        if tag == "html" and not self.lang:
+            self.lang = (attr.get("lang") or "")[:24]
         if tag == "script" and "ld+json" in attr.get("type", "").lower() and len(self.json_ld) < 6:
             self.in_jsonld = True
             self.json_buf = []
@@ -151,6 +155,8 @@ class PageReader(HTMLParser):
                 self.og_type = content
             elif name == "og:image" and not self.og_image:
                 self.og_image = content
+            elif name == "og:site_name" and not self.site_name:
+                self.site_name = content
             elif name in {"og:video", "og:video:url"} and is_video_src(content) and content not in self.videos:
                 self.videos.append(content[:300])
             if name == "robots" and "noindex" in attr.get("content", "").lower():
@@ -289,6 +295,8 @@ def read_page(client: httpx.Client, url: str, timeout: float = 10.0) -> dict:
         "ogDescription": reader.og_description.strip()[:400],
         "ogType": reader.og_type.strip()[:40],
         "ogImage": reader.og_image.strip()[:300],
+        "siteName": reader.site_name.strip()[:120],
+        "lang": reader.lang.strip()[:24],
         "images": reader.images[:8],
         "nav": reader.nav[:12],
         "faqs": faqs,
@@ -1041,10 +1049,18 @@ def _preview_pagespeed(home: str) -> dict:
         return {}
     if not getattr(config, "GOOGLE_PAGESPEED_API_KEY", ""):
         return {}
+    # One strategy at a time. Two PageSpeed calls at once get dropped, and a dropped mobile
+    # call used to wipe the whole speed report.
     try:
         mobile = run_pagespeed(home, "mobile")
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        log.warning("preview_pagespeed_failed", extra={"error": str(exc)[:180]})
         return {}
+    try:
+        desktop = run_pagespeed(home, "desktop")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("preview_pagespeed_desktop_failed", extra={"error": str(exc)[:180]})
+        desktop = {}
 
     vitals = mobile.get("vitals") or {}
     ratings = mobile.get("vitalRatings") or {}
@@ -1148,6 +1164,131 @@ def _preview_pagespeed(home: str) -> dict:
         "issues": unique[:12],
         "performance": scores.get("performance"),
         "seo": scores.get("seo"),
+        "desktop": {
+            "performance": (desktop.get("scores") or {}).get("performance"),
+            "seo": (desktop.get("scores") or {}).get("seo"),
+            "lcp": (desktop.get("vitals") or {}).get("LCP"),
+            "cls": (desktop.get("vitals") or {}).get("CLS"),
+        },
+    }
+
+
+def _grade_from_score(score: float) -> tuple[str, str]:
+    if score >= 92:
+        return "A+", "#3DDC84"
+    if score >= 88:
+        return "A", "#3DDC84"
+    if score >= 80:
+        return "B+", "#3DDC84"
+    if score >= 70:
+        return "B", "#FFC53D"
+    if score >= 55:
+        return "C+", "#FFC53D"
+    if score >= 40:
+        return "C", "#FFC53D"
+    return "D", "#FF5A4E"
+
+
+def _position_color(position: int | None) -> str:
+    if not position or position < 1:
+        return "yellow"
+    if position <= 10:
+        return "green"
+    if position <= 20:
+        return "yellow"
+    return "red"
+
+
+def _as_score(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or number > 100:
+        return None
+    return number
+
+
+def _google_health(*, page_rows: list, ranked: list, onpage: dict, pagespeed: dict) -> dict:
+    """Letter grade and heatmap from measured scores and live rankings. No filler dots."""
+    dots: list[dict] = []
+    kind = "pages"
+    if ranked:
+        kind = "rankings"
+        for row in ranked[:48]:
+            position = row.get("position")
+            dots.append(
+                {
+                    "color": _position_color(position if isinstance(position, int) else None),
+                    "path": str(row.get("page") or row.get("url") or ""),
+                    "label": str(row.get("keyword") or ""),
+                    "position": position,
+                }
+            )
+    else:
+        for row in page_rows[:48]:
+            dots.append(
+                {
+                    "color": str(row.get("color") or "yellow"),
+                    "path": str(row.get("path") or "/"),
+                    "label": str(row.get("label") or row.get("path") or ""),
+                }
+            )
+    counts = {"red": 0, "yellow": 0, "green": 0, "blue": 0}
+    for dot in dots:
+        color = dot["color"] if dot["color"] in counts else "yellow"
+        dot["color"] = color
+        counts[color] += 1
+
+    weighted: list[tuple[float, float]] = []
+    onpage_score = _as_score((onpage or {}).get("score"))
+    if onpage_score is not None:
+        weighted.append((onpage_score, 0.4))
+    seo_score = _as_score((pagespeed or {}).get("seo"))
+    if seo_score is not None:
+        weighted.append((seo_score, 0.2))
+    if ranked:
+        points = []
+        for row in ranked:
+            position = row.get("position")
+            try:
+                position = int(position) if position is not None else 100
+            except (TypeError, ValueError):
+                position = 100
+            points.append(100 if position <= 10 else 55 if position <= 20 else 15)
+        weighted.append((sum(points) / len(points), 0.4))
+    score = None
+    if weighted:
+        weight = sum(item[1] for item in weighted)
+        score = sum(item[0] * item[1] for item in weighted) / weight
+        grade, color = _grade_from_score(score)
+    else:
+        grade, color, _note = _preview_grade(counts)
+
+    page_one = sum(1 for row in ranked if isinstance(row.get("position"), int) and row["position"] <= 10)
+    if ranked:
+        note = f"{page_one} of {len(ranked)} searches on page one"
+    elif dots:
+        note = f"{counts['green']} of {len(dots)} pages listing-ready"
+    else:
+        note = "no pages read yet"
+    detail_bits = []
+    if onpage_score is not None:
+        detail_bits.append(f"On-page {onpage_score:g}")
+    if seo_score is not None:
+        detail_bits.append(f"PageSpeed SEO {int(seo_score)}")
+    perf = _as_score((pagespeed or {}).get("performance"))
+    if perf is not None:
+        detail_bits.append(f"mobile speed {int(perf)}")
+    return {
+        "grade": grade,
+        "gradeColor": color,
+        "gradeNote": note,
+        "gradeDetail": " · ".join(detail_bits),
+        "score": round(score, 1) if score is not None else None,
+        "dots": dots,
+        "counts": counts,
+        "kind": kind,
     }
 
 
@@ -1367,31 +1508,132 @@ def _rank_status(position: int | None) -> tuple[str, str]:
     return f"Buried · page {page}", "red"
 
 
-def _guess_market(pages: list, places: list) -> tuple[str, str]:
-    """Best-effort country for public ranked keywords. Falls back to United States."""
-    blob = " ".join(
-        [
-            " ".join(str(p.get("title") or "") for p in pages),
-            " ".join(str(p.get("text") or "")[:800] for p in pages[:8]),
-            " ".join(str(p.get("address") or "") for p in places),
-        ]
-    ).lower()
+# Country-code TLD → DataForSEO location + language. Used only when the pages do not name a country.
+_TLD_MARKET = {
+    "de": ("Germany", "de"),
+    "at": ("Austria", "de"),
+    "ch": ("Switzerland", "de"),
+    "fr": ("France", "fr"),
+    "es": ("Spain", "es"),
+    "it": ("Italy", "it"),
+    "nl": ("Netherlands", "nl"),
+    "be": ("Belgium", "nl"),
+    "pt": ("Portugal", "pt"),
+    "br": ("Brazil", "pt"),
+    "mx": ("Mexico", "es"),
+    "uk": ("United Kingdom", "en"),
+    "ie": ("Ireland", "en"),
+    "ca": ("Canada", "en"),
+    "au": ("Australia", "en"),
+    "nz": ("New Zealand", "en"),
+    "in": ("India", "en"),
+    "za": ("South Africa", "en"),
+    "ae": ("United Arab Emirates", "en"),
+    "sg": ("Singapore", "en"),
+}
+_LANG_MARKET = {
+    "de": ("Germany", "de"),
+    "fr": ("France", "fr"),
+    "es": ("Spain", "es"),
+    "it": ("Italy", "it"),
+    "nl": ("Netherlands", "nl"),
+    "pt": ("Portugal", "pt"),
+    "en": ("United States", "en"),
+}
+_DE_CITIES = (
+    "berlin", "munich", "münchen", "hamburg", "cologne", "köln", "frankfurt", "stuttgart",
+    "düsseldorf", "dusseldorf", "leipzig", "dortmund", "essen", "bremen", "dresden",
+    "hannover", "nuremberg", "nürnberg", "duisburg", "bochum", "wuppertal", "bielefeld",
+    "bonn", "münster", "karlsruhe", "mannheim", "augsburg", "wiesbaden", "freiburg",
+)
+
+
+def _market_from_text(blob: str) -> tuple[str, str] | None:
+    """Country named on the site. None when the copy does not say."""
+    text = (blob or "").lower()
+    if re.search(r"\b(deutschland|bundesrepublik)\b", text):
+        return "Germany", "de"
+    if re.search(r"\b(österreich|oesterreich)\b", text):
+        return "Austria", "de"
+    if re.search(r"\b(schweiz|switzerland)\b", text):
+        return "Switzerland", "de"
     try:
         from app import locations as loc
 
         for key, (country, _iso, lang) in loc.COUNTRIES.items():
-            if re.search(rf"\b{re.escape(key)}\b", blob):
+            if re.search(rf"\b{re.escape(key)}\b", text):
                 return country, lang
         for key, (_label, country_key) in loc.REGIONS.items():
-            if re.search(rf"\b{re.escape(key)}\b", blob):
-                country, _iso, lang = loc.COUNTRIES.get(country_key, ("United States", "US", "en"))
-                return country, lang
+            if re.search(rf"\b{re.escape(key)}\b", text):
+                country, _iso, lang = loc.COUNTRIES.get(country_key, ("", "", "en"))
+                if country:
+                    return country, lang
+        for key, country_key in loc.CITIES.items():
+            if key in loc.AMBIGUOUS_CITIES:
+                continue
+            if re.search(rf"\b{re.escape(key)}\b", text):
+                country, _iso, lang = loc.COUNTRIES.get(country_key, ("", "", "en"))
+                if country:
+                    return country, lang
     except Exception:
         pass
-    return "United States", "en"
+    return None
 
 
-def _preview_visibility(host: str, pages: list, places: list) -> dict:
+def _page_lang(pages: list) -> str:
+    for page in pages[:4]:
+        raw = str(page.get("lang") or "").lower().replace("_", "-").strip()
+        if raw:
+            return raw.split("-", 1)[0]
+    return ""
+
+
+def _detect_market(home: str, pages: list) -> tuple[str, str, str]:
+    """Country and language for search data. Source is tld, page copy, or html lang — never a silent US guess for a local TLD."""
+    blob = _page_blob(pages)
+    named = _market_from_text(blob)
+    host = host_of(home)
+    tld = "uk" if host.endswith(".uk") else (host.rsplit(".", 1)[-1] if "." in host else "")
+    tld_market = _TLD_MARKET.get(tld)
+    lang = _page_lang(pages)
+    if named and not tld_market:
+        return (*named, "page")
+    if tld_market:
+        country, language = tld_market
+        if tld == "ch" and lang in {"de", "fr", "it", "en"}:
+            language = lang
+        elif lang in {"de", "fr", "es", "it", "nl", "pt", "en"} and tld not in {"ch"}:
+            # Keep the country from the domain. Use the page language when it is a real language code.
+            if lang != "en" or language == "en":
+                language = lang if lang else language
+        return country, language, "tld"
+    if named:
+        return (*named, "page")
+    if lang in _LANG_MARKET:
+        country, language = _LANG_MARKET[lang]
+        return country, language, "lang"
+    return "United States", "en", "default"
+
+
+def _detect_city(pages: list, country: str) -> str:
+    for page in pages[:6]:
+        city = str(page.get("schemaCity") or "").strip()
+        if city:
+            return city
+    blob = _page_blob(pages)
+    if country == "Germany":
+        for city in _DE_CITIES:
+            if re.search(rf"\b{re.escape(city)}\b", blob):
+                return city.title() if city not in {"münchen", "köln", "düsseldorf", "nürnberg"} else {
+                    "münchen": "München",
+                    "köln": "Köln",
+                    "düsseldorf": "Düsseldorf",
+                    "nürnberg": "Nürnberg",
+                }[city]
+    return _preview_city(pages)
+
+
+def _preview_visibility(host: str, pages: list, places: list, *, location: str = "", language: str = "") -> dict:
     """Real ranked keywords + opportunity ideas when Searchify SEO (DataForSEO) is connected.
 
     Empty buckets stay empty — nothing is invented for the free report.
@@ -1415,7 +1657,8 @@ def _preview_visibility(host: str, pages: list, places: list) -> dict:
         return empty
     if not research.configured():
         return empty
-    location, language = _guess_market(pages, places)
+    if not location:
+        location, language, _source = _detect_market(host if "://" in host else f"https://{host}", pages)
     ranked: list[dict] = []
     gaps: list[dict] = []
     try:
@@ -1553,6 +1796,7 @@ def _preview_visibility(host: str, pages: list, places: list) -> dict:
 
     return {
         "keywords": ranked[:12],
+        "heatmap": ranked[:48],
         "gaps": gaps[:6],
         "visibility": {
             "searches": len(ranked),
@@ -1784,6 +2028,127 @@ def _preview_competitors(host: str, places: list, visits: int) -> list[dict]:
     return rivals
 
 
+_ONPAGE_TOPIC = {
+    "no_title": "title",
+    "title_too_long": "title",
+    "title_too_short": "title",
+    "duplicate_title": "title",
+    "duplicate_title_tag": "title",
+    "irrelevant_title": "title",
+    "no_description": "description",
+    "description_too_long": "description",
+    "description_too_short": "description",
+    "duplicate_description": "description",
+    "irrelevant_description": "description",
+    "no_h1_tag": "heading",
+    "no_image_alt": "image",
+    "no_image_title": "image",
+    "has_render_blocking_resources": "css",
+    "high_loading_time": "speed",
+    "high_waiting_time": "ssr",
+    "large_page_size": "speed",
+    "size_greater_than_3mb": "speed",
+    "low_content_rate": "content",
+    "low_character_count": "content",
+    "has_micromarkup_errors": "heading",
+    "is_4xx_code": "grade",
+    "is_5xx_code": "grade",
+}
+
+
+def _preview_onpage(home: str) -> dict:
+    """DataForSEO On-Page instant audit of the homepage. Empty when the API is not connected."""
+    try:
+        from app import research
+    except Exception:
+        return {}
+    if not research.configured():
+        return {}
+    try:
+        result, _cost = research._call(
+            "POST",
+            "/on_page/instant_pages",
+            [{"url": home, "enable_javascript": False, "enable_browser_rendering": False}],
+            timeout=40.0,
+        )
+    except Exception as exc:
+        log.warning("preview_onpage_failed", extra={"error": str(exc)[:180]})
+        return {}
+    item = next(iter(((result or [{}])[0] or {}).get("items") or []), None)
+    if not isinstance(item, dict):
+        return {}
+    checks = item.get("checks") if isinstance(item.get("checks"), dict) else {}
+    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+    issues: list[dict] = []
+    for key, (name, severity, fix, _meta_flag) in research.PAGE_CHECKS.items():
+        if checks.get(key) is not True:
+            continue
+        if severity == "Notice" and key not in {"title_too_long", "title_too_short", "description_too_long", "description_too_short"}:
+            continue
+        title = str(meta.get("title") or "")[:180]
+        detail = fix
+        if key.startswith("title") and title:
+            detail = f"{fix} Live title: “{title}”."
+        issues.append(
+            {
+                "topic": _ONPAGE_TOPIC.get(key, "grade"),
+                "color": "red" if severity == "Critical" else "yellow",
+                "path": urlparse(str(item.get("url") or home)).path or "/",
+                "label": name,
+                "detail": detail[:240],
+                "title": title,
+                "source": "dataforseo_onpage",
+                "key": key,
+            }
+        )
+    raw_score = item.get("onpage_score")
+    try:
+        score = round(float(raw_score), 1) if raw_score is not None else None
+    except (TypeError, ValueError):
+        score = None
+    return {
+        "source": "dataforseo_on_page",
+        "score": score,
+        "url": str(item.get("url") or home)[:300],
+        "issues": issues[:12],
+    }
+
+
+def _schema_category(pages: list) -> str:
+    skip = {
+        "website", "webpage", "organization", "breadcrumblist", "imageobject", "searchaction",
+        "entrypoint", "listitem", "site", "wpheader", "wpfooter", "person", "postaladdress",
+    }
+    for page in pages[:4]:
+        for kind in page.get("schemaTypes") or []:
+            label = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(kind or "")).strip()
+            if label and label.lower() not in skip:
+                return label[:60]
+    return ""
+
+
+def _preview_business(pages: list) -> dict:
+    """Read the crawled pages into one business summary. Empty when the model is not available."""
+    if not pages or not openai_configured():
+        return {}
+    data = understand(pages[:18], {}, {})
+    if not isinstance(data, dict) or data.get("_error"):
+        return {"error": str((data or {}).get("_error") or "")}
+    places = [str(p).strip() for p in (data.get("places") or []) if str(p).strip()]
+    offers = [str(o).strip() for o in (data.get("offers") or []) if str(o).strip()]
+    return {
+        "brand": str(data.get("brand") or "").strip()[:120],
+        "category": str(data.get("category") or "").strip()[:80],
+        "city": places[0][:80] if places else "",
+        "places": places[:6],
+        "offers": offers[:12],
+        "audience": str(data.get("audience") or "").strip()[:160],
+        "sentence": str(data.get("business") or "").strip()[:400],
+        "voice": str(data.get("voice") or "").strip()[:80],
+        "model": str(data.get("_model") or ""),
+    }
+
+
 def preview_scan(home: str, limit: int = 40) -> dict:
     """Free public deep scan: sitemap + internal links, heatmap grade, optional live ranked keywords."""
     deep = max(1, min(int(limit or 40), 50))
@@ -1836,23 +2201,48 @@ def preview_scan(home: str, limit: int = 40) -> dict:
     order = {"red": 0, "yellow": 1, "green": 2}
     host = crawled.get("host") or host_of(home)
     platform = _preview_platform(pages)
-    brand = (titles[0].split("|")[0].split("-")[0].strip() if titles else host.split(".")[0].replace("-", " "))
-    city = _preview_city(pages)
-    category = _preview_category(pages, brand)
-    places = _preview_places(host, brand, category=category, city=city)
-    visibility_pack = _preview_visibility(host, pages, places)
+    scan_home = crawled.get("home") or home
+    country, language, market_source = _detect_market(scan_home, pages)
+    # PageSpeed, ranked keywords, On-Page, and the business read are independent after the crawl.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        speed_job = pool.submit(_preview_pagespeed, scan_home)
+        rank_job = pool.submit(_preview_visibility, host, pages, [], location=country, language=language)
+        onpage_job = pool.submit(_preview_onpage, scan_home)
+        business_job = pool.submit(_preview_business, pages)
+        pagespeed = speed_job.result() or {}
+        visibility_pack = rank_job.result() or {}
+        onpage = onpage_job.result() or {}
+        business = business_job.result() or {}
+    schema_name = next((str(p.get("schemaName") or "").strip() for p in pages if p.get("schemaName")), "")
+    site_name = next((str(p.get("siteName") or "").strip() for p in pages if p.get("siteName")), "")
+    title_brand = titles[0].split("|")[0].split("–")[0].split("-")[0].strip() if titles else ""
+    if title_brand and len(title_brand.split()) > 5:
+        title_brand = ""
+    brand = (
+        str(business.get("brand") or "").strip()
+        or site_name
+        or schema_name
+        or title_brand
+        or host.split(".")[0].replace("-", " ")
+    )
+    city = str(business.get("city") or "").strip() or _detect_city(pages, country)
+    category = str(business.get("category") or "").strip() or _schema_category(pages) or _preview_category(pages, brand)
+    if category.lower() == "local business":
+        category = _schema_category(pages)
+    places = _preview_places(host, brand, category=category, city=city) if category else []
     visibility = visibility_pack.get("visibility") or {}
+    if country:
+        visibility = {**visibility, "market": country, "language": language, "marketSource": market_source}
     keywords = visibility_pack.get("keywords") or []
+    # Gaps stay empty unless DataForSEO returned searches this site does not rank for.
     gaps = visibility_pack.get("gaps") or []
-    if not gaps:
-        gaps = _preview_gaps_from_site(pages, category, city)
     visits = int(visibility.get("visits") or 0)
     competitors = _preview_competitors(host, places, visits)
-    pagespeed = _preview_pagespeed(crawled.get("home") or home)
     rendering = _preview_rendering(pages, pagespeed)
     markup = _preview_markup_quality(pages, str((pages[0] or {}).get("renderHints", {}).get("classSample") or "") if pages else "")
-    # Fold PageSpeed + SSR/CSR/image + markup (BEM/typography/CSS/JS) into findings.
+    # Fold PageSpeed + On-Page + SSR/CSR/image + markup into findings.
     for issue in [
+        *(onpage.get("issues") or []),
         *(pagespeed.get("issues") or []),
         *(rendering.get("issues") or []),
         *(markup.get("issues") or []),
@@ -1873,7 +2263,15 @@ def preview_scan(home: str, limit: int = 40) -> dict:
             }
         )
     findings.sort(key=lambda item: order.get(item["color"], 9))
-    grade, gradeColor, gradeNote = _preview_grade(counts)
+    health = _google_health(
+        page_rows=page_rows,
+        ranked=visibility_pack.get("heatmap") or keywords,
+        onpage=onpage,
+        pagespeed=pagespeed,
+    )
+    counts = health["counts"]
+    dots = health["dots"]
+    grade, gradeColor, gradeNote = health["grade"], health["gradeColor"], health["gradeNote"]
 
     # Topic checklist for FreeAnalysis major-issue showcase (HTML layout + tech topics).
     topic_keys = (
@@ -1927,8 +2325,8 @@ def preview_scan(home: str, limit: int = 40) -> dict:
                     "topic": "grade",
                     "status": "error" if tone == "red" else ("warning" if tone == "yellow" else "ok"),
                     "color": tone,
-                    "label": f"Site rank grade {grade}",
-                    "detail": gradeNote or "",
+                    "label": f"Google health {grade}",
+                    "detail": " · ".join(part for part in (gradeNote, health.get("gradeDetail")) if part),
                 }
             )
             continue
@@ -1947,6 +2345,13 @@ def preview_scan(home: str, limit: int = 40) -> dict:
             }
         )
     about = _preview_about(pages, brand, host, findings, category=category, city=city)
+    if business.get("sentence"):
+        extra = []
+        if business.get("audience"):
+            extra.append(f"They sell to {business['audience']}.")
+        if business.get("offers"):
+            extra.append("Offers on the site: " + ", ".join(business["offers"][:6]) + ".")
+        about = " ".join([business["sentence"], *extra, about])
     opportunities = _preview_opportunities(pages, brand, category, city, places, findings)
     name_bit = brand.split()[0] if brand else "there"
     if visibility.get("searches"):
@@ -2014,6 +2419,9 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "grade": grade,
         "gradeColor": gradeColor,
         "gradeNote": gradeNote,
+        "gradeDetail": health.get("gradeDetail") or "",
+        "healthKind": health.get("kind") or "pages",
+        "healthScore": health.get("score"),
         "brand": brand,
         "category": category,
         "city": city,
@@ -2029,10 +2437,17 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "researchSource": visibility_pack.get("researchSource") or "",
         "pagespeed": pagespeed or None,
         "pagespeedSource": pagespeed.get("source") if pagespeed else "",
+        "onpage": onpage or None,
+        "onpageSource": onpage.get("source") if onpage else "",
+        "onpageScore": onpage.get("score") if onpage else None,
+        "business": {k: v for k, v in business.items() if k != "error" and v} or None,
+        "offers": business.get("offers") or [],
+        "language": language,
+        "country": country,
         "rendering": rendering or None,
         "markup": markup or None,
         "topicStatus": topic_status,
         "deepScan": True,
         "scanLimit": deep,
-        "scanVersion": "free-deep-v5",
+        "scanVersion": "free-deep-v7",
     }

@@ -718,7 +718,7 @@ def run_pagespeed(url: str, strategy: str = "mobile") -> dict:
         "category": ["performance", "accessibility", "best-practices", "seo"],
         "key": config.GOOGLE_PAGESPEED_API_KEY,
     }
-    with httpx.Client(timeout=20.0) as client:
+    with httpx.Client(timeout=40.0) as client:
         response = client.get("https://www.googleapis.com/pagespeedonline/v5/runPagespeed", params=params)
     if response.status_code >= 400:
         raise RuntimeError(f"PageSpeed failed: {response.text[:300]}")

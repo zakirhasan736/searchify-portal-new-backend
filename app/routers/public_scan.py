@@ -18,7 +18,7 @@ MAX_SCANS = 6
 CACHE_TTL = 900
 # Deep public crawl — sitemap + link expansion up to this many HTML pages.
 PUBLIC_SCAN_PAGES = 40
-CACHE_VER = "free-deep-v5"
+CACHE_VER = "free-deep-v7"
 _hits: dict[str, list[float]] = {}
 _cache: dict[str, tuple[float, dict]] = {}
 

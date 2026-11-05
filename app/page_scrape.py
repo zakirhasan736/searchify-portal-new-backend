@@ -26,6 +26,7 @@ def summarize_json_ld(blocks: list[str]) -> dict:
     faqs: list[str] = []
     rating = ""
     count = ""
+    localities: list[str] = []
 
     def walk(node) -> None:
         nonlocal rating, count
@@ -58,6 +59,11 @@ def summarize_json_ld(blocks: list[str]) -> dict:
         if str(kind) in {"Review", "AggregateRating"} and not rating:
             rating = str(node.get("ratingValue") or "")
             count = str(node.get("reviewCount") or node.get("ratingCount") or count or "")
+        address = node.get("address")
+        if isinstance(address, dict):
+            locality = address.get("addressLocality")
+            if isinstance(locality, str) and locality.strip() and locality.strip() not in localities:
+                localities.append(locality.strip())
         if str(kind) in {"FAQPage", "Question"} or node.get("acceptedAnswer"):
             question = node.get("name") if str(kind) == "Question" or node.get("acceptedAnswer") else ""
             if isinstance(question, str) and question.strip().endswith("?") and question.strip() not in faqs:
@@ -74,6 +80,7 @@ def summarize_json_ld(blocks: list[str]) -> dict:
     return {
         "schemaTypes": types[:8],
         "schemaName": (names[0] if names else "")[:200],
+        "schemaCity": (localities[0] if localities else "")[:80],
         "schemaDescription": (descriptions[0] if descriptions else "")[:400],
         "faqs": faqs[:8],
         "reviewRating": rating[:20],
