@@ -242,6 +242,17 @@ def test_track_runs_live_check_and_history(monkeypatch):
         drop_user(user.id)
 
 
+def test_suggestions_are_picked_for_tracking_within_the_plan_limit():
+    ideas = [
+        {"keyword": "merv 13 filter", "volume": 800, "difficulty": 20, "kind": "site"},
+        {"keyword": "plumber near me", "volume": 9000, "difficulty": 10, "kind": "gap"},
+        {"keyword": "air purifier", "volume": 400, "difficulty": 25, "kind": "category"},
+        {"keyword": "already stored", "volume": 5000, "difficulty": 5, "kind": "site"},
+    ]
+    picks = keyword_tracking.suggestion_track_picks(ideas, {"already stored"}, limit=2)
+    assert [row["keyword"] for row in picks] == ["merv 13 filter"]
+
+
 def test_website_topics_lead_keyword_seeds():
     seeds = keyword_tracking.website_topic_seeds(
         {

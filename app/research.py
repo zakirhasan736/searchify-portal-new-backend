@@ -337,6 +337,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         saved = _stored_keywords(db, user.id, host)
         if not saved:
             return _with_tracking(db, user, host, {"host": host, "state": "none", "ideas": [], "ranked": [], "cached": True, "storedOnly": True})
+        keyword_tracking.track_suggestions(db, user.id, host, saved.get("ideas") or [], limit=quotas.tracked_keyword_limit(db, user))
         return _with_tracking(db, user, host, {**saved, "cached": True, "storedOnly": True})
     place, market = _place_for(db, user, site=site, country=country, reach=reach, tool="keywords")
     location, language = place.country, place.language or market.get("language") or "en"
@@ -352,6 +353,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     offers = business_offers(db, user.id, host)
     if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == KEYWORDS_QUALITY:
         concepts = keyword_concepts(saved, offers)
+        keyword_tracking.track_suggestions(db, user.id, host, saved.get("ideas") or [], limit=term_limit)
         keyword_tracking.track_current(db, user.id, host, saved.get("ranked") or [], limit=term_limit)
         return _with_tracking(db, user, host, {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped})
     quotas.check(db, user, "keywords")
@@ -628,6 +630,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     payload["concepts"] = concepts["rows"]
     payload["conceptNote"] = concepts["note"]
     _save(db, user.id, "dfs-keywords", title, payload)
+    keyword_tracking.track_suggestions(db, user.id, host, payload.get("ideas") or [], limit=term_limit)
     keyword_tracking.track_current(db, user.id, host, ranked, limit=term_limit)
     return _with_tracking(db, user, host, {**payload, "cached": False, "termsDropped": dropped})
 
@@ -646,8 +649,11 @@ def business_topics(concept: dict, limit: int = 20) -> list[str]:
 
 
 def _with_tracking(db: Session, user: User, host: str, result: dict) -> dict:
-    """Add the live tracked list (database), current keywords (DataForSEO first, then Search Console),
-    and drop suggestions that are already tracked or already ranking."""
+    """Add the live tracked list (database) and current keywords (DataForSEO first, then Search Console).
+
+    Suggestions stay listed after they are stored as tracked, so the suggestion cards can show
+    Tracking. Only searches already in the top 3 are left off the suggestion list.
+    """
     if db is None:
         return result
     ranked = list(result.get("ranked") or [])
@@ -659,8 +665,7 @@ def _with_tracking(db: Session, user: User, host: str, result: dict) -> dict:
         for row in ranked
         if isinstance(row.get("position"), int) and row["position"] <= 3
     }
-    taken = {row["keyword"] for row in tracked} | winning
-    suggestions = [row for row in result.get("ideas") or [] if keyword_tracking.clean_keyword(row.get("keyword")) not in taken]
+    suggestions = [row for row in result.get("ideas") or [] if keyword_tracking.clean_keyword(row.get("keyword")) not in winning]
     return {
         **result,
         "trackedList": tracked,

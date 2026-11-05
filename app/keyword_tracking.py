@@ -100,6 +100,51 @@ def track(
     return row, True
 
 
+def suggestion_track_picks(ideas: list[dict], existing: set[str] | list[str], *, limit: int | None) -> list[dict]:
+    """Best suggested keywords that are not stored as tracked yet, within the plan limit."""
+    have = {clean_keyword(term) for term in existing}
+    remaining = None if limit is None else max(0, int(limit) - len(have))
+    if remaining == 0:
+        return []
+    cap = 25 if remaining is None else min(25, remaining)
+    picks = []
+    for row in sorted(ideas or [], key=_score, reverse=True):
+        if row.get("kind") == "gap":
+            continue
+        term = clean_keyword(row.get("keyword"))
+        if not term or term in have:
+            continue
+        picks.append({**row, "keyword": term})
+        have.add(term)
+        if len(picks) >= cap:
+            break
+    return picks
+
+
+def track_suggestions(db: Session, user_id: int, host: str, ideas: list[dict], *, limit: int | None) -> int:
+    """Store suggested keywords in the tracked list for this website."""
+    if db is None or not host:
+        return 0
+    picks = suggestion_track_picks(ideas, tracked_terms(db, user_id, host), limit=limit)
+    added = 0
+    for row in picks:
+        try:
+            track(
+                db,
+                user_id,
+                host,
+                row["keyword"],
+                source="suggestion",
+                concept=str(row.get("concept") or "")[:200],
+                page_url=str(row.get("page") or row.get("url") or ""),
+                limit=limit,
+            )
+        except ValueError:
+            break
+        added += 1
+    return added
+
+
 def track_current(db: Session, user_id: int, host: str, ranked: list[dict], *, limit: int | None) -> int:
     """Track searches this website already ranks for, up to the plan limit.
 
