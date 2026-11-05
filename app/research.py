@@ -32,7 +32,7 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 # Bump when keyword seeding changes so suggestions built from old seeds refresh once.
-KEYWORDS_QUALITY = 6
+KEYWORDS_QUALITY = 7
 # Organic keywords read per refresh (DataForSEO ranked keywords; billed per row returned).
 RANKED_LIMIT = 1000
 # Big platforms rank for almost everything; they are not business competitors.
@@ -462,7 +462,8 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     #     the AI read of the website found (no preset or invented phrases).
     # The AI read then keeps only the searches that belong to what this business sells.
     seeds: list[str] = []
-    known = {t.lower() for t in clean} | set(by_term)
+    winning = {key for key, row in by_term.items() if isinstance(row.get("position"), int) and row["position"] <= 3}
+    known = {t.lower() for t in clean} | winning
     candidates: list[dict] = []
     site_payload = {
         "target": host,
@@ -528,21 +529,30 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         idea_calls += extra["calls"]
         rivals = extra["rivals"]
 
+    gsc_rows = keyword_tracking._gsc_queries(db, user.id, host)[0] if db is not None else []
+    candidates.extend(keyword_tracking.opportunity_candidates(ranked, gsc_rows))
+    landings = keyword_tracking.analytics_landings(db, user.id, host) if db is not None else {}
+
     understood = bool(concept["offers"] or concept["category"] or concept["pages"])
     if understood:
         picked = keyword_tracking.business_suggestions(concept, business_places(db, user.id, host), candidates, known=known)
         ideas = picked["rows"]
-        suggestion_meta = {"judged": picked["judged"], "checked": picked["checked"]}
+        keyword_tracking.stamp_analytics(ideas, landings)
+        ideas.sort(key=keyword_tracking._score, reverse=True)
+        suggestion_meta = {"judged": picked["judged"], "checked": picked["checked"], "sources": ["dataforseo", "search_console", "ga4"]}
     else:
         # No AI read of the website yet: there is no business to judge against, so keep only what
         # DataForSEO itself associates with this site's pages, in its relevance order, and say so.
         ideas, taken = [], set(known)
-        for row in candidates:
+        own = [row for row in candidates if row.get("kind") in {"organic", "console"}]
+        rest = [row for row in candidates if row.get("kind") not in {"organic", "console"}]
+        for row in [*own, *rest]:
             key = row["keyword"].lower()
             if key not in taken:
                 taken.add(key)
                 ideas.append(row)
-        suggestion_meta = {"judged": "none", "checked": len(candidates), "needsSiteScan": True}
+        keyword_tracking.stamp_analytics(ideas, landings)
+        suggestion_meta = {"judged": "none", "checked": len(candidates), "needsSiteScan": True, "sources": ["dataforseo", "search_console", "ga4"]}
     for row in ideas:
         row["question"] = keyword_tracking.is_question(row.get("keyword") or "")
 
@@ -628,7 +638,12 @@ def _with_tracking(db: Session, user: User, host: str, result: dict) -> dict:
     current = keyword_tracking.current_keywords(db, user.id, host, ranked)
     metrics = [*(result.get("tracked") or []), *current["rows"]]
     tracked = keyword_tracking.tracked_payload(db, user.id, host, metrics)
-    taken = {row["keyword"] for row in tracked} | {keyword_tracking.clean_keyword(r.get("keyword")) for r in ranked}
+    winning = {
+        keyword_tracking.clean_keyword(row.get("keyword"))
+        for row in ranked
+        if isinstance(row.get("position"), int) and row["position"] <= 3
+    }
+    taken = {row["keyword"] for row in tracked} | winning
     suggestions = [row for row in result.get("ideas") or [] if keyword_tracking.clean_keyword(row.get("keyword")) not in taken]
     return {
         **result,
@@ -2111,7 +2126,7 @@ def _more_candidates(seeds: list[str], host: str, location: str, language: str) 
 
     base = {"location_name": location, "language_code": language}
     jobs = []
-    for topic in seeds[:3]:
+    for topic in seeds[:5]:
         jobs.append(("longtail", topic, "/dataforseo_labs/google/keyword_suggestions/live", {
             **base, "keyword": topic, "limit": 100,
             "filters": ["keyword_info.search_volume", ">", 0],

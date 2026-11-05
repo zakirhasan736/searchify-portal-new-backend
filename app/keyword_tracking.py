@@ -237,6 +237,115 @@ def current_keywords(db: Session, user_id: int, host: str, ranked: list[dict]) -
     return {"rows": out, "searchConsoleSyncedAt": synced, "searchConsoleConnected": bool(gsc_rows)}
 
 
+def _position(value) -> int | None:
+    try:
+        pos = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    return pos if pos > 0 else None
+
+
+def _winning(position) -> bool:
+    """Top 3 is already a win. Everything else is still a suggestion."""
+    pos = _position(position)
+    return pos is not None and pos <= 3
+
+
+def opportunity_candidates(ranked: list[dict], gsc_rows: list) -> list[dict]:
+    """Searches worth ranking for, taken from live data only.
+
+    Organic keywords this site already appears for, but not in the top 3, plus Search Console
+    queries that are not already winning. Volume stays null when DataForSEO did not return it.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for row in ranked or []:
+        term = clean_keyword(row.get("keyword"))
+        if not term or term in seen or _winning(row.get("position")):
+            continue
+        seen.add(term)
+        rows.append({
+            **row,
+            "keyword": term,
+            "kind": "organic",
+            "source": "DataForSEO organic keywords · indexed, not in the top 3 yet",
+        })
+    for raw in gsc_rows or []:
+        if not isinstance(raw, (list, tuple)) or not raw or not str(raw[0]).strip():
+            continue
+        term = clean_keyword(raw[0])
+        pos = _num(raw[4]) if len(raw) > 4 else None
+        if not term or _winning(pos):
+            continue
+        extra = {
+            "clicks": _num(raw[1]) if len(raw) > 1 else None,
+            "impressions": _num(raw[2]) if len(raw) > 2 else None,
+            "ctr": str(raw[3]) if len(raw) > 3 else "",
+            "position": round(pos) if isinstance(pos, float) else None,
+            "gscPosition": pos,
+        }
+        if term in seen:
+            held = next((row for row in rows if row["keyword"] == term), None)
+            if held is not None:
+                held.update({k: v for k, v in extra.items() if v not in (None, "")})
+                held["alsoInSearchConsole"] = True
+            continue
+        seen.add(term)
+        rows.append({
+            "keyword": term,
+            "volume": None,
+            "difficulty": None,
+            "kind": "console",
+            "alsoInSearchConsole": True,
+            "source": "Search Console query report",
+            **extra,
+        })
+    return rows
+
+
+def analytics_landings(db: Session, user_id: int, host: str) -> dict[str, int]:
+    """GA4 landing-page sessions for this site, keyed by path. Empty until a sync stores them."""
+    if db is None:
+        return {}
+    rows = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "traffic-analytics")
+        .order_by(FeatureRecord.id.desc())
+        .limit(12)
+        .all()
+    )
+    pages: dict[str, int] = {}
+    for rec in rows:
+        payload = rec.payload or {}
+        if payload_host(payload) not in {"", host}:
+            continue
+        for row in payload.get("landingPages") or []:
+            if not isinstance(row, (list, tuple)) or not row:
+                continue
+            path = str(row[0] or "").split("?")[0].strip()
+            if not path.startswith("/"):
+                continue
+            sessions = _num(row[1]) if len(row) > 1 else None
+            if sessions:
+                pages[path.rstrip("/") or "/"] = int(sessions)
+        if pages:
+            break
+    return pages
+
+
+def stamp_analytics(rows: list[dict], landings: dict[str, int]) -> None:
+    if not landings:
+        return
+    for row in rows:
+        raw = str(row.get("page") or row.get("url") or "")
+        path = raw
+        if "://" in raw:
+            path = "/" + raw.split("://", 1)[-1].split("/", 1)[-1]
+        path = (path.split("?")[0].rstrip("/") or "/")
+        if path in landings:
+            row["analyticsSessions"] = landings[path]
+
+
 # ---------------------------------------------------------------- business-fit judging
 
 JUDGE = (
@@ -314,11 +423,38 @@ def judge_fit(concept: dict, places: list[str], candidates: list[dict]) -> dict[
     return out if out else None
 
 
+def _rising(row: dict) -> bool:
+    trend = row.get("localTrend") or row.get("trend")
+    nums = [n for n in trend if isinstance(n, (int, float))] if isinstance(trend, list) else []
+    if len(nums) < 4:
+        return False
+    early = sum(nums[:3]) / 3
+    late = sum(nums[-3:]) / 3
+    return late > early * 1.1 and late > 0
+
+
 def _score(row: dict) -> float:
+    """Best rank opportunities first: on-topic, searched, winnable, rising, and close on Google."""
     volume = row.get("volume") if isinstance(row.get("volume"), (int, float)) else 0
     difficulty = row.get("difficulty") if isinstance(row.get("difficulty"), (int, float)) else 50
     weight = 1.0 if row.get("fit") == "core" else 0.6
-    return weight * (volume or 0) / (10 + difficulty)
+    score = weight * (volume or 0) / (10 + difficulty)
+    pos = _position(row.get("position"))
+    if pos is not None and 4 <= pos <= 20:
+        score *= 1.8
+    elif pos is not None and pos > 20:
+        score *= 1.25
+    if _rising(row):
+        score *= 1.35
+    impressions = row.get("impressions") if isinstance(row.get("impressions"), (int, float)) else 0
+    if impressions:
+        score += min(impressions, 5000) * 0.02
+    sessions = row.get("analyticsSessions") if isinstance(row.get("analyticsSessions"), (int, float)) else 0
+    if sessions:
+        score *= 1.15
+    if row.get("kind") == "organic":
+        score *= 1.1
+    return score
 
 
 def business_suggestions(concept: dict, places: list[str], candidates: list[dict], *, known: set[str]) -> dict:

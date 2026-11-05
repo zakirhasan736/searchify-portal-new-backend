@@ -1079,7 +1079,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         site_label = row.gsc_site_url or row.ga4_property_name or "Connected site"
 
         if row.gsc_site_url:
-            queries = goauth.fetch_gsc_top_queries(token, row.gsc_site_url, row_limit=40)
+            queries = goauth.fetch_gsc_top_queries(token, row.gsc_site_url, row_limit=200)
             pages = goauth.fetch_gsc_top_pages(token, row.gsc_site_url, row_limit=30)
             countries = goauth.fetch_gsc_by_country(token, row.gsc_site_url, row_limit=15)
             devices = goauth.fetch_gsc_by_device(token, row.gsc_site_url, row_limit=10)
@@ -1323,6 +1323,7 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
                     "summary": f"Live GA4 traffic for {row.ga4_property_name or row.ga4_property_id} (last 28 days).",
                     "columns": ["Date", "Sessions", "Users"],
                     "rows": daily,
+                    "landingPages": landings,
                     "kpis": ga4_kpis,
                     "panels": {
                         "kpis": ga4_kpis,

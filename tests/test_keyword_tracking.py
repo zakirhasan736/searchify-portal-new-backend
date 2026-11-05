@@ -165,6 +165,29 @@ def test_competitor_gap_details_survive_dedupe(monkeypatch):
     assert {r["kind"] for r in out["rows"]} == {"site", "longtail"}
 
 
+def test_opportunities_keep_weak_ranks_and_search_console_queries():
+    ranked = [
+        {"keyword": "merv 13 filter", "position": 2, "volume": 2400, "difficulty": 20},
+        {"keyword": "hvac filter subscription", "position": 14, "volume": 800, "difficulty": 18, "url": "https://voloair.example/filters"},
+    ]
+    gsc = [["furnace filter sizes", "4", "220", "1.8%", "18.4"], ["merv 13 filter", "30", "90", "33%", "2.1"]]
+    rows = keyword_tracking.opportunity_candidates(ranked, gsc)
+    words = {row["keyword"]: row for row in rows}
+    assert "merv 13 filter" not in words
+    assert words["hvac filter subscription"]["kind"] == "organic"
+    assert words["furnace filter sizes"]["kind"] == "console"
+    assert words["furnace filter sizes"]["impressions"] == 220
+    landings = {"/filters": 86}
+    keyword_tracking.stamp_analytics(list(words.values()), landings)
+    assert words["hvac filter subscription"]["analyticsSessions"] == 86
+
+
+def test_score_prefers_a_close_rising_search():
+    close = {"keyword": "merv 13 filter", "volume": 400, "difficulty": 20, "fit": "core", "position": 8, "trend": [10, 10, 10, 40, 40, 40]}
+    far = {"keyword": "air purifier", "volume": 400, "difficulty": 20, "fit": "core", "position": 80, "trend": [40, 40, 40, 10, 10, 10]}
+    assert keyword_tracking._score(close) > keyword_tracking._score(far)
+
+
 def test_organic_summary_uses_dataforseo_metrics():
     from app import research
 
