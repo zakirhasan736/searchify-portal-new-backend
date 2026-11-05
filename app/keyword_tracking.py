@@ -333,6 +333,31 @@ def analytics_landings(db: Session, user_id: int, host: str) -> dict[str, int]:
     return pages
 
 
+def include_google_rows(ideas: list[dict], candidates: list[dict], known: set[str]) -> list[dict]:
+    """Always keep this site's own organic rankings and Search Console queries.
+
+    The business-fit judge can drop them. They are still the best rank targets, because Google
+    already shows the site for them or already sends impressions.
+    """
+    have = {clean_keyword(row.get("keyword")) for row in ideas}
+    extra: list[dict] = []
+    for row in candidates:
+        if row.get("kind") not in {"organic", "console"}:
+            continue
+        term = clean_keyword(row.get("keyword"))
+        if not term or term in known or term in have:
+            continue
+        have.add(term)
+        extra.append({
+            **row,
+            "keyword": term,
+            "fit": "ranked" if row.get("kind") == "organic" else "console",
+            "concept": row.get("concept") or ("Already ranking" if row.get("kind") == "organic" else "Search Console"),
+        })
+    extra.sort(key=_score, reverse=True)
+    return [*ideas, *extra[:80]]
+
+
 def stamp_analytics(rows: list[dict], landings: dict[str, int]) -> None:
     if not landings:
         return

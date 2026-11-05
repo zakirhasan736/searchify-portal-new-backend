@@ -32,7 +32,7 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 # Bump when keyword seeding changes so suggestions built from old seeds refresh once.
-KEYWORDS_QUALITY = 7
+KEYWORDS_QUALITY = 8
 # Organic keywords read per refresh (DataForSEO ranked keywords; billed per row returned).
 RANKED_LIMIT = 1000
 # Big platforms rank for almost everything; they are not business competitors.
@@ -553,6 +553,8 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
                 ideas.append(row)
         keyword_tracking.stamp_analytics(ideas, landings)
         suggestion_meta = {"judged": "none", "checked": len(candidates), "needsSiteScan": True, "sources": ["dataforseo", "search_console", "ga4"]}
+    ideas = keyword_tracking.include_google_rows(ideas, candidates, known)
+    ideas.sort(key=keyword_tracking._score, reverse=True)
     for row in ideas:
         row["question"] = keyword_tracking.is_question(row.get("keyword") or "")
 

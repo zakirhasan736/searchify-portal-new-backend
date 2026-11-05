@@ -182,6 +182,20 @@ def test_opportunities_keep_weak_ranks_and_search_console_queries():
     assert words["hvac filter subscription"]["analyticsSessions"] == 86
 
 
+def test_google_rows_stay_even_when_the_judge_drops_them():
+    ideas = [{"keyword": "air purifier", "kind": "category", "volume": 100, "fit": "core"}]
+    candidates = [
+        {"keyword": "hvac filter subscription", "kind": "organic", "position": 11, "volume": 400},
+        {"keyword": "furnace filter sizes", "kind": "console", "impressions": 220},
+        {"keyword": "already tracked", "kind": "organic", "position": 9, "volume": 50},
+    ]
+    out = keyword_tracking.include_google_rows(ideas, candidates, known={"already tracked"})
+    words = [row["keyword"] for row in out]
+    assert words[0] == "air purifier"
+    assert "hvac filter subscription" in words and "furnace filter sizes" in words
+    assert "already tracked" not in words
+
+
 def test_score_prefers_a_close_rising_search():
     close = {"keyword": "merv 13 filter", "volume": 400, "difficulty": 20, "fit": "core", "position": 8, "trend": [10, 10, 10, 40, 40, 40]}
     far = {"keyword": "air purifier", "volume": 400, "difficulty": 20, "fit": "core", "position": 80, "trend": [40, 40, 40, 10, 10, 10]}

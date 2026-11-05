@@ -345,8 +345,9 @@ def run_visibility_report(db: Session, user: User, profile: dict) -> dict:
             profile,
             prompts,
             site,
-            "OpenAI is not configured, so this is a rules-based gap report — not a live crawl of ChatGPT or Gemini.",
+            "OpenAI is not configured, so this is a rules-based gap report until DataForSEO returns a live answer.",
         )
+        report = _observe_with_dataforseo(db, user, site, biz, report)
         _save(db, user.id, report)
         return report
 
@@ -385,6 +386,7 @@ def run_visibility_report(db: Session, user: User, profile: dict) -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         report = _fallback_report(profile, prompts, site, f"Visibility model failed: {exc}"[:240])
+        report = _observe_with_dataforseo(db, user, site, biz, report)
         _save(db, user.id, report)
         return report
 
@@ -411,7 +413,74 @@ def run_visibility_report(db: Session, user: User, profile: dict) -> dict:
         model=model,
         note="Likelihood report from your profile + Search Console. Not a live crawl of ChatGPT, Gemini, Perplexity, or Claude.",
     )
+    report = _observe_with_dataforseo(db, user, site, biz, report)
     _save(db, user.id, report)
+    return report
+
+
+def _observe_with_dataforseo(db: Session, user: User, site: str, brand: str, report: dict) -> dict:
+    """Ask DataForSEO's live LLM endpoints for the first prompts. Observed mention/citation replaces the estimate."""
+    prompts = [str(p).strip() for p in (report.get("prompts") or []) if str(p).strip()][:2]
+    if not site or not prompts:
+        return report
+    live_prompts = [
+        {"id": f"live-{engine}-{index}", "text": text, "engine": engine}
+        for index, text in enumerate(prompts)
+        for engine in ("ChatGPT", "Gemini", "Perplexity", "Claude")
+    ]
+    try:
+        from app import research
+
+        live = research.visibility(db, user, site=site, brand=brand or "", prompts=live_prompts, force=False)
+    except Exception as exc:  # noqa: BLE001 - keep the estimate when DataForSEO is unavailable
+        report["liveNote"] = f"DataForSEO live check did not run: {type(exc).__name__}"
+        return report
+    observed = {
+        (str(row.get("engine") or ""), str(row.get("text") or "").strip().lower()): row
+        for row in (live.get("results") or [])
+        if row.get("status") == "ok" and row.get("mention") is not None
+    }
+    if not observed:
+        report["liveNote"] = "DataForSEO returned no live answer for these prompts."
+        return report
+    checks = []
+    for check in report.get("checks") or []:
+        hit = observed.get((str(check.get("engine") or ""), str(check.get("prompt") or "").strip().lower()))
+        if not hit:
+            checks.append(check)
+            continue
+        mentioned = bool(hit.get("mention"))
+        cited = bool(hit.get("citation"))
+        checks.append({
+            **check,
+            "mention": mentioned,
+            "citation": cited,
+            "status": "ok" if mentioned or cited else "error",
+            "error": "" if mentioned or cited else "DataForSEO asked this engine. The answer did not name the business.",
+            "excerpt": hit.get("snippet") or check.get("excerpt") or "",
+            "observed": True,
+            "provider": "dataforseo",
+            "sources": hit.get("sources") or [],
+            "citationUrl": hit.get("citationUrl") or "",
+        })
+    engines = [_score_engine(checks, e["name"]) for e in ENGINES]
+    mentions = sum(1 for c in checks if c.get("mention") is True and c.get("observed"))
+    citations = sum(1 for c in checks if c.get("citation") is True and c.get("observed"))
+    report.update({
+        "checks": checks,
+        "engines": engines,
+        "rows": [[c.get("prompt"), c.get("engine"), "Named" if c.get("mention") else "Not named" if c.get("observed") else "Not estimated", "Cited" if c.get("citation") else "Not cited" if c.get("observed") else "Not estimated", c.get("excerpt") or ""] for c in checks],
+        "columns": ["Prompt", "Engine", "Mention", "Citation", "Excerpt"],
+        "summary": f"DataForSEO asked ChatGPT, Gemini, Perplexity, and Claude. {mentions} live mentions, {citations} live citations. Other engines stay estimates.",
+        "live": True,
+        "observed": True,
+        "measured": True,
+        "estimate": any(not c.get("observed") for c in checks),
+        "provider": "dataforseo",
+        "dataKind": "ai_visibility_live",
+        "method": "dataforseo-llm-responses",
+        "disclaimer": "ChatGPT, Gemini, Perplexity, and Claude rows marked observed are live DataForSEO answers. Copilot, Google AI Overviews, and Grok stay estimates.",
+    })
     return report
 
 
