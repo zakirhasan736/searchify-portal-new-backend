@@ -1,6 +1,14 @@
 """Public free-scan market detection. No network."""
 
-from app.site_scan import _detect_city, _detect_market, _google_health, _rivals_from_rows, _seed_keywords, _usable_category
+from app.site_scan import (
+    _detect_city,
+    _detect_market,
+    _google_health,
+    _rivals_from_rows,
+    _schema_category,
+    _seed_keywords,
+    _usable_category,
+)
 
 
 def _page(**extra):
@@ -48,7 +56,10 @@ def test_schema_city_wins():
 def test_website_schema_is_not_treated_as_the_business():
     assert _usable_category("Web Site") == ""
     assert _usable_category("WebSite") == ""
+    assert _usable_category("FAQPage") == ""
+    assert _usable_category("FAQ Page") == ""
     assert _usable_category("Reifenpreisvergleich") == "Reifenpreisvergleich"
+    assert _schema_category([_page(schemaTypes=["FAQPage", "WebSite", "Product"])]) == ""
 
 
 def test_rival_seeds_use_the_tire_keywords_not_web_site():
@@ -60,6 +71,21 @@ def test_rival_seeds_use_the_tire_keywords_not_web_site():
     assert seeds == ["reifen", "sommerreifen"]
 
 
+def test_rival_seeds_skip_faqpage_and_keep_the_tire_category():
+    seeds = _seed_keywords(
+        [{"keyword": "sommerreifen", "volume": 22200}],
+        [{"keyword": "reifen", "volume": 110000}, {"keyword": "FAQPage", "volume": 50000}],
+        "FAQPage",
+    )
+    assert seeds == ["reifen", "sommerreifen"]
+    typed = _seed_keywords(
+        [{"keyword": "sommerreifen", "volume": 22200}],
+        [{"keyword": "reifen", "volume": 110000}],
+        "Reifenpreisvergleich",
+    )
+    assert typed == ["Reifenpreisvergleich", "reifen"]
+
+
 def test_rival_bars_come_from_those_search_results():
     rows = _rivals_from_rows(
         "reifexa.de",
@@ -67,7 +93,11 @@ def test_rival_bars_come_from_those_search_results():
             "reifen": [
                 {"title": "Reifen.com", "url": "https://www.reifen.com/", "rank": 1},
                 {"title": "Websites.ca", "url": "https://websites.ca/", "rank": 8},
-            ]
+            ],
+            "FAQPage": [
+                {"title": "Dribbble", "url": "https://dribbble.com/shots/faq", "rank": 2},
+                {"title": "Elfsight", "url": "https://elfsight.com/faq-widget/", "rank": 3},
+            ],
         },
         2,
     )
@@ -75,6 +105,8 @@ def test_rival_bars_come_from_those_search_results():
     assert labels[0] == "reifen.com"
     assert "You · reifexa.de" in labels
     assert rows[0]["signal"] == "#1 for reifen"
+    assert "dribbble.com" not in labels
+    assert "elfsight.com" not in labels
     assert all("Edmonton" not in (row.get("address") or "") for row in rows)
 
 

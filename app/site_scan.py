@@ -481,7 +481,7 @@ UNDERSTAND = (
     "about and contact pages. A business that lists several services must be described by all of them, never by "
     "only the first one you read.\n"
     '{"business":"one sentence: who they are and the full range of what they sell",'
-    '"category":"the umbrella term that covers ALL of the offers, in the words the site itself uses",'
+    '"category":"the search a customer types for this whole business, in the site\'s own words, 1-4 words. Never a schema.org type such as WebSite, FAQPage, Product, Organization, Article, or ItemList",'
     '"offers":["EVERY distinct service or product the site lists, merged where two names mean the same thing. Not a single case study, not the brand, and not the city by itself"],'
     '"audience":"who buys",'
     '"places":["cities or regions the site serves, only if stated"],'
@@ -1327,6 +1327,7 @@ _CATEGORY_HINTS: list[tuple[str, tuple[str, ...]]] = [
     ("restaurant", ("restaurant", "cafe", "bistro", "dining")),
     ("fitness gym", ("gym", "fitness", "personal trainer")),
     ("auto repair", ("auto repair", "mechanic", "car service")),
+    ("Reifen", ("reifen", "sommerreifen", "winterreifen", "ganzjahresreifen", "reifenpreis")),
 ]
 
 
@@ -1986,25 +1987,30 @@ def _preview_gaps_from_site(pages: list, category: str, city: str) -> list[dict]
     return out
 
 
+def _search_phrase(raw: str) -> str:
+    """A short query a customer would type. Schema types such as FAQPage are not queries."""
+    text = _usable_category(raw)
+    if not text or len(text.split()) > 4:
+        return ""
+    return text
+
+
 def _seed_keywords(keywords: list, gaps: list, category: str) -> list[str]:
-    """Real searches for this business. A schema label such as Web Site is never a seed."""
+    """Real searches for this business. A schema label such as FAQPage is never a seed."""
     seeds: list[str] = []
     seen: set[str] = set()
 
     def add(raw: str) -> None:
-        text = " ".join(str(raw or "").split())
+        text = _search_phrase(raw)
         key = text.lower()
-        if not text or key in seen or not _usable_category(text):
+        if not text or key in seen:
             return
         seen.add(key)
         seeds.append(text)
 
-    for row in sorted(gaps or [], key=lambda item: -(int(item.get("volume") or 0))):
-        add(row.get("keyword") or "")
-        if len(seeds) >= 1:
-            break
     add(category)
-    for row in sorted(keywords or [], key=lambda item: -(int(item.get("volume") or 0))):
+    rows = list(gaps or []) + list(keywords or [])
+    for row in sorted(rows, key=lambda item: -(int(item.get("volume") or 0))):
         add(row.get("keyword") or "")
         if len(seeds) >= 2:
             break
@@ -2230,14 +2236,49 @@ _GENERIC_CATEGORY = {
     "breadcrumblist", "imageobject", "searchaction", "entrypoint", "listitem", "wpheader",
     "wpfooter", "person", "postaladdress",
 }
-_SKIP_RIVAL_HOSTS = ("google.", "youtube.com", "facebook.com", "instagram.com", "wikipedia.org", "pinterest.com")
+# schema.org types describe the page, not the business a customer searches for.
+_SCHEMA_TYPES = _GENERIC_CATEGORY | {
+    "faqpage", "faq page", "qapage", "qa page", "product", "offer", "aggregateoffer",
+    "itemlist", "review", "aggregaterating", "rating", "question", "answer", "howto",
+    "howtostep", "article", "newsarticle", "blogposting", "collectionpage", "itempage",
+    "profilepage", "searchresultspage", "aboutpage", "contactpage", "checkoutpage",
+    "sitenavigationelement", "speakablespecification", "offercatalog", "merchantreturnpolicy",
+    "quantitativevalue", "propertyvalue", "openinghoursspecification", "geocoordinates",
+    "place", "videoobject", "dataset", "definedterm", "thing", "creativework",
+    "webpageelement", "softwareapplication", "webapplication", "mobileapplication",
+    "contactpoint", "monetaryamount", "unitpricespecification", "pricespecification",
+    "interactioncounter", "claimreview", "mediaobject", "event", "saleevent",
+    "specialannouncement", "comment", "viewaction", "readaction", "buyaction",
+    "orderaction", "service", "store", "onlinestore", "corporation", "brand",
+    "autopartsstore", "autodealer", "automotivebusiness",
+}
+_SKIP_RIVAL_HOSTS = (
+    "google.", "youtube.com", "facebook.com", "instagram.com", "wikipedia.org", "pinterest.com",
+    "dribbble.com", "behance.net", "elfsight.com", "schema.org", "github.com", "codepen.io",
+    "stackoverflow.com", "wordpress.org", "wordpress.com", "medium.com", "reddit.com",
+    "quora.com", "linkedin.com", "w3.org", "mozilla.org",
+)
+
+
+def _type_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def _is_schema_type(text: str) -> bool:
+    """FAQPage, Web Site, and other schema.org labels are not a business category."""
+    raw = " ".join(str(text or "").split())
+    if not raw:
+        return False
+    if _type_key(raw) in {_type_key(item) for item in _SCHEMA_TYPES}:
+        return True
+    # An internal capital (FAQPage, ItemList) is a type name, not a search.
+    return " " not in raw and bool(re.search(r"[A-Za-z][A-Z]", raw))
 
 
 def _usable_category(text: str) -> str:
-    """A business category from the site. Schema types like WebSite are not a category."""
+    """A business category from the site. Schema types like FAQPage are not a category."""
     cleaned = " ".join(str(text or "").split())
-    key = re.sub(r"[^a-z0-9]+", "", cleaned.lower())
-    if not cleaned or len(cleaned) < 3 or key in {re.sub(r"[^a-z0-9]+", "", item) for item in _GENERIC_CATEGORY}:
+    if not cleaned or len(cleaned) < 3 or _is_schema_type(cleaned):
         return ""
     return cleaned[:80]
 
@@ -2591,5 +2632,5 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "topicStatus": topic_status,
         "deepScan": True,
         "scanLimit": deep,
-        "scanVersion": "free-deep-v8",
+        "scanVersion": "free-deep-v9",
     }
