@@ -228,10 +228,10 @@ def page_key(url: str) -> str:
     return f"{(parts.netloc or '').removeprefix('www.')}{parts.path.rstrip('/') or '/'}"
 
 
-def read_page(client: httpx.Client, url: str) -> dict:
+def read_page(client: httpx.Client, url: str, timeout: float = 10.0) -> dict:
     fetched = datetime.utcnow().isoformat(timespec="seconds")
     try:
-        response = client.get(url, timeout=10.0, follow_redirects=True)
+        response = client.get(url, timeout=timeout, follow_redirects=True)
     except httpx.HTTPError as exc:
         return {"url": url, "requestedUrl": url, "error": f"could not load ({type(exc).__name__})", "status": None, "fetchedAt": fetched}
     final = str(response.url)
@@ -317,10 +317,10 @@ def read_page(client: httpx.Client, url: str) -> dict:
     }
 
 
-def _sitemap_urls(client: httpx.Client, url: str, depth: int = 0, cap: int = 400) -> list[str]:
+def _sitemap_urls(client: httpx.Client, url: str, depth: int = 0, cap: int = 400, *, max_children: int = 12, timeout: float = 10.0) -> list[str]:
     if depth > 2:
         return []
-    response = _get(client, url, timeout=10.0)
+    response = _get(client, url, timeout=timeout)
     if response is None:
         return []
     try:
@@ -332,8 +332,8 @@ def _sitemap_urls(client: httpx.Client, url: str, depth: int = 0, cap: int = 400
     locs = [node.text.strip() for node in root.iter() if node.tag.lower().endswith("loc") and node.text]
     if tag.endswith("sitemapindex"):
         preferred = sorted(locs, key=lambda loc: (0 if re.search(r"page|service|product|location|categor", loc, re.I) else 1, loc))
-        for child in preferred[:12]:
-            out.extend(_sitemap_urls(client, child, depth + 1, cap))
+        for child in preferred[:max_children]:
+            out.extend(_sitemap_urls(client, child, depth + 1, cap, max_children=max_children, timeout=timeout))
             if len(out) >= cap:
                 break
         return out[:cap]
@@ -351,22 +351,32 @@ def _allowed(path_url: str, home_host: str) -> bool:
     return True
 
 
-def discover(home: str, limit: int) -> tuple[list[str], RobotFileParser | None]:
+def discover(home: str, limit: int, *, quick: bool = False) -> tuple[list[str], RobotFileParser | None]:
     home = normalize(home)
     home_host = host_of(home)
     robots = RobotFileParser()
     sitemaps: list[str] = []
     found: list[str] = []
+    sitemap_timeout = 4.0 if quick else 10.0
     with httpx.Client(headers={"User-Agent": AGENT}) as client:
-        robots_txt = _get(client, urljoin(home, "/robots.txt"), timeout=6.0)
+        robots_txt = _get(client, urljoin(home, "/robots.txt"), timeout=4.0 if quick else 6.0)
         if robots_txt is not None:
             lines = robots_txt.text.splitlines()
             robots.parse(lines)
             sitemaps = [line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("sitemap:")]
         else:
             robots = None
-        for candidate in [*sitemaps, urljoin(home, "/sitemap.xml"), urljoin(home, "/sitemap_index.xml"), urljoin(home, "/wp-sitemap.xml")]:
-            urls = _sitemap_urls(client, candidate)
+        candidates = [*sitemaps, urljoin(home, "/sitemap.xml"), urljoin(home, "/sitemap_index.xml"), urljoin(home, "/wp-sitemap.xml")]
+        if quick:
+            candidates = candidates[:2]
+        for candidate in candidates:
+            urls = _sitemap_urls(
+                client,
+                candidate,
+                cap=limit if quick else 400,
+                max_children=1 if quick else 12,
+                timeout=sitemap_timeout,
+            )
             if urls:
                 found.extend(urls)
                 break
@@ -395,31 +405,38 @@ def _priority(url: str) -> tuple[int, int]:
     return (1 if path.count("/") <= 1 else 2, path.count("/"))
 
 
-def crawl(home: str, limit: int = 40) -> dict:
-    """Read up to `limit` pages. Sitemap first, then internal links from the pages already read."""
+def crawl(home: str, limit: int = 40, *, quick: bool = False) -> dict:
+    """Read up to `limit` pages. Sitemap first, then internal links from the pages already read.
+
+    ``quick`` is the SearchLites replay: a short page list, no sitemap-index walk, so the colour map
+    can refresh without waiting on every URL on a large site.
+    """
     home = normalize(home if home.startswith(("http://", "https://")) else f"https://{home}")
     if not public_host(home):
         return {"home": home, "pages": [], "error": "This address is not a public website."}
     home_host = host_of(home)
-    queue, robots = discover(home, limit)
+    page_limit = min(limit, 8) if quick else limit
+    queue, robots = discover(home, page_limit, quick=quick)
     queue = sorted(queue, key=_priority)
     pages: list[dict] = []
     failed: list[dict] = []
     seen: set[str] = set()
     keys: set[str] = set()
+    page_timeout = 6.0 if quick else 10.0
+    max_rounds = 2 if quick else 4
     with httpx.Client(headers={"User-Agent": AGENT}) as client, ThreadPoolExecutor(max_workers=6) as pool:
         rounds = 0
-        while queue and len(pages) < limit and rounds < 4:
+        while queue and len(pages) < page_limit and rounds < max_rounds:
             rounds += 1
             batch = []
             for url in queue:
                 if url not in seen and page_key(url) not in keys:
                     seen.add(url)
                     batch.append(url)
-                if len(batch) >= limit - len(pages):
+                if len(batch) >= page_limit - len(pages):
                     break
             queue = [url for url in queue if url not in seen]
-            results = list(pool.map(lambda url: read_page(client, url), batch))
+            results = list(pool.map(lambda url: read_page(client, url, timeout=page_timeout), batch))
             fresh_links: list[str] = []
             for page in results:
                 if page.get("error"):
@@ -635,22 +652,30 @@ def scan_site(
     limit: int = 40,
     serp_limit: int | None = None,
     counter: dict | None = None,
+    quick: bool = False,
 ) -> dict:
-    crawled = crawl(home, limit=limit)
+    crawled = crawl(home, limit=limit, quick=quick)
     pages = crawled.get("pages") or []
-    try:
-        from app.audit_checks import run_site_checks
-
-        site_checks = run_site_checks(crawled.get("home") or home, [p["url"] for p in pages[:15]])
-    except Exception:  # noqa: BLE001
+    # Replay only needs titles, headings and meta. The model read, competitor lookups and
+    # AI-bot probes are what make "Replay the scan" sit at 100% for minutes.
+    if quick:
         site_checks = {}
-    try:
-        from app.ai_readiness import run_ai_checks
-
-        ai_checks = run_ai_checks(crawled.get("home") or home, [p["url"] for p in pages[:12]])
-    except Exception:  # noqa: BLE001
         ai_checks = {}
-    understanding = understand(pages, brief, profile)
+        understanding = {}
+    else:
+        try:
+            from app.audit_checks import run_site_checks
+
+            site_checks = run_site_checks(crawled.get("home") or home, [p["url"] for p in pages[:15]])
+        except Exception:  # noqa: BLE001
+            site_checks = {}
+        try:
+            from app.ai_readiness import run_ai_checks
+
+            ai_checks = run_ai_checks(crawled.get("home") or home, [p["url"] for p in pages[:12]])
+        except Exception:  # noqa: BLE001
+            ai_checks = {}
+        understanding = understand(pages, brief, profile)
     understand_error = str(understanding.pop("_error", "") or "")
     understand_model = str(understanding.pop("_model", "") or "")
     page_map = {normalize(item.get("url") or ""): item for item in understanding.get("pages") or [] if isinstance(item, dict)}
@@ -659,15 +684,17 @@ def scan_site(
         for page in pages
         if page_map.get(page["url"], {}).get("role") not in {"legal", "contact", "about", "blog"}
     ]
-    competitors = research_competitors(
-        [t for t in targets if t],
-        crawled.get("host") or host_of(home),
-        places_rows,
-        manual=(brief or {}).get("competitors"),
-        market=" ".join(str(v or "") for v in ((brief or {}).get("market"), profile.get("areas"), profile.get("locations"))),
-        serp_limit=serp_limit,
-        counter=counter,
-    )
+    competitors = {}
+    if not quick:
+        competitors = research_competitors(
+            [t for t in targets if t],
+            crawled.get("host") or host_of(home),
+            places_rows,
+            manual=(brief or {}).get("competitors"),
+            market=" ".join(str(v or "") for v in ((brief or {}).get("market"), profile.get("areas"), profile.get("locations"))),
+            serp_limit=serp_limit,
+            counter=counter,
+        )
     return {
         "home": crawled.get("home"),
         "host": crawled.get("host"),

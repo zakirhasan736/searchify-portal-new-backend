@@ -1539,7 +1539,7 @@ def _places_rows(db: Session, user_id: int) -> list:
     return list(payload.get("rows") or [])
 
 
-def _ensure_scan(db: Session, user: User, home: str, brief: dict | None, force: bool = False) -> tuple[dict, bool]:
+def _ensure_scan(db: Session, user: User, home: str, brief: dict | None, force: bool = False, quick: bool = False) -> tuple[dict, bool]:
     from app import site_scan
 
     host = site_scan.host_of(home)
@@ -1548,15 +1548,29 @@ def _ensure_scan(db: Session, user: User, home: str, brief: dict | None, force: 
         return scan, False
     profile = _brief_profile(_profile_for(db, user.id), brief)
     counter = {"serp": 0}
-    scan = site_scan.scan_site(
+    fresh = site_scan.scan_site(
         home,
         brief=brief or {},
         profile=profile,
         places_rows=_places_rows(db, user.id),
-        serp_limit=quotas.left(db, user, "competitors"),
+        serp_limit=0 if quick else quotas.left(db, user, "competitors"),
         counter=counter,
+        quick=quick,
     )
-    quotas.consume(db, user, "competitors", counter["serp"])
+    if not quick:
+        quotas.consume(db, user, "competitors", counter["serp"])
+    if quick and scan and fresh.get("pages"):
+        # Keep the business read and competitor notes. Only the live HTML is stale.
+        fresh = {
+            **scan,
+            "pages": fresh["pages"],
+            "failed": fresh.get("failed") or [],
+            "scannedAt": fresh.get("scannedAt") or "",
+            "error": fresh.get("error") or "",
+            "home": fresh.get("home") or scan.get("home"),
+            "host": fresh.get("host") or scan.get("host"),
+        }
+    scan = fresh
     if scan.get("pages"):
         _upsert_feature(db, user.id, "site-scan", _scan_title(host), scan)
     return scan, True
@@ -1661,6 +1675,8 @@ class SiteScanBody(BaseModel):
     site: str = ""
     brief: dict = Field(default_factory=dict)
     force: bool = False
+    # SearchLites replay: read titles and headings only. Skips the model read and paid lookups.
+    quick: bool = False
 
 
 def _stored_brief(db: Session, user: User, home: str, fallback: dict | None) -> dict:
@@ -1753,7 +1769,7 @@ def run_site_scan(body: SiteScanBody, db: Session = Depends(get_db), user: User 
     if not home:
         message = "Add the website address in setup or connect WordPress first."
         raise problems.ProblemError(400, problems.make("site_required", "site_scan", message=message), message)
-    scan, ran = _ensure_scan(db, user, home, _stored_brief(db, user, home, body.brief), force=body.force)
+    scan, ran = _ensure_scan(db, user, home, _stored_brief(db, user, home, body.brief), force=body.force, quick=body.quick)
     if not scan.get("pages"):
         message = scan.get("error") or "No readable pages were found on this website."
         raise problems.ProblemError(422, problems.scan_error_problem(message, scan.get("failed")), message)

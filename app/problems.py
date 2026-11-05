@@ -470,6 +470,8 @@ def research_warnings(area: str, result: dict) -> list[dict]:
         if soon:
             out.append(make("visibility_soon", area, engines=", ".join(soon)))
     elif area == "site_audit":
+        if result.get("limited"):
+            out.append(make("quota_exceeded", area, message=str(result.get("message") or "")))
         report = result.get("report") or {}
         if result.get("state") == "crawling" and result.get("startedAt"):
             from datetime import datetime, timedelta

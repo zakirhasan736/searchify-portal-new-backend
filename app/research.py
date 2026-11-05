@@ -1937,7 +1937,9 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
         payload = {**saved, "crawled": crawl.get("pages_crawled") or 0, "queued": crawl.get("pages_in_queue") or 0}
         return {**payload, "cached": False}
 
-    if saved.get("state") == "ready" and not force and age(saved.get("fetchedAt")) < WINDOWS["audit"]:
+    # A stored report is enough for the colour map. Starting another crawl is a paid call, so the
+    # scan screen (force=false) keeps the last report instead of burning the monthly audit allowance.
+    if saved.get("state") == "ready" and saved.get("report") and not force:
         report = saved.get("report") or {}
         # Rebuild once for older crawls (dropped critical findings, or built before the
         # status-code / redirect / canonical / spelling checks). Reading results is free.
@@ -1957,7 +1959,20 @@ def audit(db: Session, user: User, *, site: str, force: bool = False) -> dict:
                 return {**payload, "cached": False}
         return {**saved, "cached": True}
 
-    quotas.check(db, user, "audits")
+    try:
+        quotas.check(db, user, "audits")
+    except quotas.QuotaError as exc:
+        # The allowance is used. Hand back the last report instead of a 429 the scan screen cannot use.
+        if saved.get("report") or saved.get("state") in {"ready", "crawling"}:
+            return {**saved, "cached": True, "limited": True, "message": str(exc)}
+        return {
+            "host": host,
+            "state": "limited",
+            "report": None,
+            "cached": True,
+            "limited": True,
+            "message": str(exc),
+        }
     _budget(db, user, 1)
     netloc, start = _audit_target(site)
     limit = _audit_limit(user)
