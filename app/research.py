@@ -32,7 +32,7 @@ AUDIT_PAGES = {"starter": 100, "growth": 300, "agency": 1000, "scale": 1000}
 AUDIT_STALE = timedelta(hours=3)
 ENGINES = llm_requests.ENGINES
 # Bump when keyword seeding changes so suggestions built from old seeds refresh once.
-KEYWORDS_QUALITY = 8
+KEYWORDS_QUALITY = 9
 # Organic keywords read per refresh (DataForSEO ranked keywords; billed per row returned).
 RANKED_LIMIT = 1000
 # Big platforms rank for almost everything; they are not business competitors.
@@ -352,6 +352,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     offers = business_offers(db, user.id, host)
     if saved and set(clean) <= set(saved.get("terms") or []) and saved.get("qualityVersion") == KEYWORDS_QUALITY:
         concepts = keyword_concepts(saved, offers)
+        keyword_tracking.track_current(db, user.id, host, saved.get("ranked") or [], limit=term_limit)
         return _with_tracking(db, user, host, {**saved, "concepts": concepts["rows"], "conceptNote": concepts["note"], "cached": True, "termsDropped": dropped})
     quotas.check(db, user, "keywords")
     _budget(db, user, 16)
@@ -485,13 +486,20 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         )
     cost += c
     idea_calls = 1
+    site_keywords: list[str] = []
     for item in ((site_res or [{}])[0] or {}).get("items") or []:
         row = _kw_row(item)
         if row.get("keyword"):
             candidates.append({**row, "kind": "site", "seed": row.get("intent") or "", "source": f"DataForSEO keywords for site · {host}"})
+            site_keywords.append(row["keyword"])
 
     concept = site_concept(db, user.id, host)
-    seeds = business_topics(concept)
+    # Category and offers from the site read, then the searches DataForSEO already ties to this domain,
+    # then a few keywords the site already ranks for. Those seeds are what keyword ideas expand.
+    seeds = keyword_tracking.website_topic_seeds(
+        concept,
+        [*site_keywords, *[row.get("keyword") or "" for row in ranked[:20]]],
+    )
     if seeds:
         ideas_payload = {
             "keywords": seeds,
@@ -517,7 +525,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
             for item in ((ideas_res or [{}])[0] or {}).get("items") or []:
                 row = _kw_row(item)
                 if row.get("keyword"):
-                    candidates.append({**row, "kind": "category", "seed": row.get("intent") or "", "source": "DataForSEO keyword ideas for the business category"})
+                    candidates.append({**row, "kind": "category", "seed": row.get("intent") or "", "source": "DataForSEO keyword ideas from this website's topics"})
         except ResearchError as exc:
             log.warning("keyword_ideas_failed", extra={"host": host, "error": str(exc)[:200]})
 
@@ -544,8 +552,13 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
         # No AI read of the website yet: there is no business to judge against, so keep only what
         # DataForSEO itself associates with this site's pages, in its relevance order, and say so.
         ideas, taken = [], set(known)
-        own = [row for row in candidates if row.get("kind") in {"organic", "console"}]
-        rest = [row for row in candidates if row.get("kind") not in {"organic", "console"}]
+        anchors = keyword_tracking.topic_tokens([*seeds, *site_keywords])
+        own = [row for row in candidates if row.get("kind") in {"organic", "console", "site"}]
+        rest = [
+            row for row in candidates
+            if row.get("kind") not in {"organic", "console", "site"}
+            and keyword_tracking.on_website_topic(row.get("keyword") or "", anchors)
+        ]
         for row in [*own, *rest]:
             key = row["keyword"].lower()
             if key not in taken:
@@ -615,6 +628,7 @@ def keywords(db: Session, user: User, *, site: str, terms: list[str], country: s
     payload["concepts"] = concepts["rows"]
     payload["conceptNote"] = concepts["note"]
     _save(db, user.id, "dfs-keywords", title, payload)
+    keyword_tracking.track_current(db, user.id, host, ranked, limit=term_limit)
     return _with_tracking(db, user, host, {**payload, "cached": False, "termsDropped": dropped})
 
 

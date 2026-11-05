@@ -240,3 +240,22 @@ def test_track_runs_live_check_and_history(monkeypatch):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         drop_user(user.id)
+
+
+def test_website_topics_lead_keyword_seeds():
+    seeds = keyword_tracking.website_topic_seeds(
+        {
+            "category": "air filters",
+            "offers": ["merv 13 air filter"],
+            "pages": [{"role": "product", "target": "home air purifier"}, {"role": "legal", "target": "privacy policy"}],
+        },
+        ["furnace filter replacement", "running shoes sale"],
+        limit=4,
+    )
+    assert seeds[0] == "air filters"
+    assert "merv 13 air filter" in seeds
+    assert "home air purifier" in seeds
+    assert "privacy policy" not in seeds
+    tokens = keyword_tracking.topic_tokens(seeds)
+    assert keyword_tracking.on_website_topic("best merv 13 filter", tokens)
+    assert keyword_tracking.on_website_topic("plumber near me", tokens) is False

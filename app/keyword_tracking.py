@@ -100,6 +100,108 @@ def track(
     return row, True
 
 
+def track_current(db: Session, user_id: int, host: str, ranked: list[dict], *, limit: int | None) -> int:
+    """Track searches this website already ranks for, up to the plan limit.
+
+    Leaves a few free slots once the customer has picked their own keywords, so a refresh
+    does not fill the plan with every ranking.
+    """
+    if db is None or not host:
+        return 0
+    existing = {clean_keyword(term) for term in tracked_terms(db, user_id, host)}
+    remaining = None if limit is None else max(0, int(limit) - len(existing))
+    if remaining == 0:
+        return 0
+    cap = 15 if remaining is None else remaining
+    if remaining is not None and existing and remaining > 5:
+        cap = min(cap, remaining - 5)
+    cap = min(cap, 15)
+    picks = sorted(
+        (row for row in ranked or [] if clean_keyword(row.get("keyword")) and _position(row.get("position"))),
+        key=lambda row: (_position(row.get("position")) or 999, -(row.get("volume") or 0)),
+    )
+    added = 0
+    for row in picks:
+        if added >= cap:
+            break
+        term = clean_keyword(row.get("keyword"))
+        if not term or term in existing:
+            continue
+        try:
+            track(
+                db,
+                user_id,
+                host,
+                term,
+                source="organic",
+                concept="Already ranking",
+                page_url=str(row.get("url") or row.get("page") or ""),
+                limit=limit,
+            )
+        except ValueError:
+            break
+        existing.add(term)
+        added += 1
+    return added
+
+
+def website_topic_seeds(concept: dict, site_keywords: list[str], limit: int = 8) -> list[str]:
+    """What DataForSEO should expand for this website.
+
+    The site read comes first (category, offers, each page's target search). Then the searches
+    DataForSEO already associates with the domain, including keywords the site ranks for.
+    """
+    from app.concept_reads import seed_phrase
+
+    out: list[str] = []
+
+    def add(value: str) -> None:
+        text = seed_phrase(value).lower()
+        if text and len(text) >= 3 and text not in out:
+            out.append(text)
+
+    add((concept or {}).get("category") or "")
+    for offer in (concept or {}).get("offers") or []:
+        add(offer)
+        if len(out) >= limit:
+            return out
+    for page in (concept or {}).get("pages") or []:
+        if page.get("role") in {"legal", "contact", "about"}:
+            continue
+        add(page.get("target") or "")
+        if len(out) >= limit:
+            return out
+    for keyword in site_keywords or []:
+        add(keyword)
+        if len(out) >= limit:
+            return out
+    return out
+
+
+def topic_tokens(phrases: list[str]) -> set[str]:
+    from app.meta_writer import _content_tokens
+
+    tokens: set[str] = set()
+    for phrase in phrases or []:
+        tokens.update(word for word in _content_tokens(phrase) if len(word) >= 4)
+    return tokens
+
+
+def on_website_topic(keyword: str, tokens: set[str]) -> bool:
+    """True when a suggested search shares a real word with this website's topics."""
+    from app.meta_writer import _content_tokens
+
+    if not tokens:
+        return False
+    words = [word for word in _content_tokens(keyword) if len(word) >= 4]
+    for word in words:
+        if word in tokens:
+            return True
+        if len(word) >= 5 and any(len(other) >= 5 and word[:5] == other[:5] for other in tokens):
+            return True
+    return False
+
+
 def untrack(db: Session, user_id: int, host: str, keyword: str) -> bool:
     term = clean_keyword(keyword)
     row = (
