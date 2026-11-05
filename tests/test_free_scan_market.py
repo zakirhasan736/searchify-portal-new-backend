@@ -4,10 +4,9 @@ from app.site_scan import (
     _detect_city,
     _detect_market,
     _google_health,
+    _read_category_and_topics,
     _rivals_from_rows,
-    _schema_category,
     _seed_keywords,
-    _usable_category,
 )
 
 
@@ -53,37 +52,49 @@ def test_schema_city_wins():
     assert _detect_city([_page(schemaCity="Leipzig", text="Hamburg")], "Germany") == "Leipzig"
 
 
-def test_website_schema_is_not_treated_as_the_business():
-    assert _usable_category("Web Site") == ""
-    assert _usable_category("WebSite") == ""
-    assert _usable_category("FAQPage") == ""
-    assert _usable_category("FAQ Page") == ""
-    assert _usable_category("Reifenpreisvergleich") == "Reifenpreisvergleich"
-    assert _schema_category([_page(schemaTypes=["FAQPage", "WebSite", "Product"])]) == ""
-
-
-def test_rival_seeds_use_the_tire_keywords_not_web_site():
-    seeds = _seed_keywords(
-        [{"keyword": "sommerreifen", "volume": 22200}],
-        [{"keyword": "reifen", "volume": 110000}],
-        "Web Site",
+def test_category_and_topics_come_from_the_ai_read():
+    pages = [_page(schemaTypes=["FAQPage", "WebSite", "Product"], text="Sommerreifen und Winterreifen")]
+    category, topics = _read_category_and_topics(
+        {
+            "category": "Reifenpreisvergleich",
+            "topics": ["Sommerreifen", "Winterreifen"],
+            "offers": ["Ganzjahresreifen", "FAQPage"],
+        },
+        pages,
     )
-    assert seeds == ["reifen", "sommerreifen"]
+    assert category == "Reifenpreisvergleich"
+    assert topics[:3] == ["Sommerreifen", "Winterreifen", "Ganzjahresreifen"]
+    assert "FAQPage" not in topics
 
 
-def test_rival_seeds_skip_faqpage_and_keep_the_tire_category():
+def test_schema_type_on_the_page_is_not_the_category():
+    pages = [_page(schemaTypes=["FAQPage", "WebSite", "Product"])]
+    category, topics = _read_category_and_topics(
+        {"category": "FAQPage", "topics": ["WebSite"], "offers": ["Product"]},
+        pages,
+    )
+    assert category == ""
+    assert topics == []
+
+
+def test_rival_seeds_use_the_read_not_a_schema_type():
+    schema_keys = {"faqpage", "website", "product"}
     seeds = _seed_keywords(
         [{"keyword": "sommerreifen", "volume": 22200}],
         [{"keyword": "reifen", "volume": 110000}, {"keyword": "FAQPage", "volume": 50000}],
         "FAQPage",
+        ["WebSite"],
+        schema_keys,
     )
     assert seeds == ["reifen", "sommerreifen"]
     typed = _seed_keywords(
         [{"keyword": "sommerreifen", "volume": 22200}],
         [{"keyword": "reifen", "volume": 110000}],
         "Reifenpreisvergleich",
+        ["Sommerreifen"],
+        schema_keys,
     )
-    assert typed == ["Reifenpreisvergleich", "reifen"]
+    assert typed == ["Reifenpreisvergleich", "Sommerreifen"]
 
 
 def test_rival_bars_come_from_those_search_results():

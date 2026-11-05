@@ -481,7 +481,8 @@ UNDERSTAND = (
     "about and contact pages. A business that lists several services must be described by all of them, never by "
     "only the first one you read.\n"
     '{"business":"one sentence: who they are and the full range of what they sell",'
-    '"category":"the search a customer types for this whole business, in the site\'s own words, 1-4 words. Never a schema.org type such as WebSite, FAQPage, Product, Organization, Article, or ItemList",'
+    '"category":"what this website actually is, in the site\'s own words, 1-4 words. Name the business from the pages you read. Never copy a schema.org @type.",'
+    '"topics":["the distinct subjects this website is about, in the site\'s own words, 1-4 words each. Taken from the pages, not from a preset list, and never a schema.org @type, the brand, or the city alone"],'
     '"offers":["EVERY distinct service or product the site lists, merged where two names mean the same thing. Not a single case study, not the brand, and not the city by itself"],'
     '"audience":"who buys",'
     '"places":["cities or regions the site serves, only if stated"],'
@@ -1314,23 +1315,6 @@ def _preview_grade(counts: dict) -> tuple[str, str, str]:
     return "D", "#FF5A4E", "urgent fixes first"
 
 
-_CATEGORY_HINTS: list[tuple[str, tuple[str, ...]]] = [
-    ("web design agency", ("web design", "website design", "web development", "wordpress agency", "web agency")),
-    ("digital marketing agency", ("digital marketing", "seo agency", "marketing agency", "ppc agency", "content marketing")),
-    ("software company", ("saas", "software company", "software development", "app development", "product studio")),
-    ("roofing contractor", ("roofing", "roof repair", "roof replacement", "roofer")),
-    ("plumbing company", ("plumber", "plumbing", "drain cleaning")),
-    ("hvac company", ("hvac", "air conditioning", "furnace", "heating and cooling")),
-    ("dentist", ("dentist", "dental clinic", "orthodont")),
-    ("law firm", ("law firm", "attorney", "lawyer", "legal services")),
-    ("real estate agency", ("real estate", "realtor", "property management")),
-    ("restaurant", ("restaurant", "cafe", "bistro", "dining")),
-    ("fitness gym", ("gym", "fitness", "personal trainer")),
-    ("auto repair", ("auto repair", "mechanic", "car service")),
-    ("Reifen", ("reifen", "sommerreifen", "winterreifen", "ganzjahresreifen", "reifenpreis")),
-]
-
-
 _CITY_HINTS = (
     "calgary", "edmonton", "toronto", "vancouver", "ottawa", "montreal", "winnipeg", "halifax",
     "london", "manchester", "birmingham", "glasgow", "edinburgh",
@@ -1371,43 +1355,6 @@ def _preview_city(pages: list) -> str:
     except Exception:
         pass
     return ""
-
-
-def _preview_category(pages: list, brand: str = "") -> str:
-    """Infer the business category from schema, titles, nav and copy — not the brand alone."""
-    blob = _page_blob(pages)
-    schema_types = " ".join(
-        str(t).lower() for page in pages for t in (page.get("schemaTypes") or []) if t
-    )
-    schema_name = " ".join(str(page.get("schemaName") or "") for page in pages[:4]).strip()
-    scored: list[tuple[int, str]] = []
-    for label, needles in _CATEGORY_HINTS:
-        hits = sum(1 for needle in needles if needle in blob)
-        if hits:
-            scored.append((hits, label))
-    if scored:
-        scored.sort(key=lambda item: (-item[0], item[1]))
-        return scored[0][1]
-    if "localbusiness" in schema_types or "professionalservice" in schema_types:
-        if schema_name and brand and schema_name.lower() != brand.lower():
-            return schema_name[:60]
-        return "local business"
-    # Fall back to a concrete homepage H1 / nav phrase (skip pure brand).
-    home = next((p for p in pages if (urlparse(p.get("url") or "").path or "/") in {"", "/"}), pages[0] if pages else None)
-    for candidate in (
-        str((home or {}).get("h1") or "").split("|")[0].strip(),
-        *((home or {}).get("nav") or [])[:6],
-        str((home or {}).get("title") or "").split("|")[0].strip(),
-    ):
-        text = " ".join(str(candidate or "").split())
-        if len(text) < 4:
-            continue
-        if brand and text.lower() == brand.lower():
-            continue
-        if text.lower() in {"home", "welcome", "menu"}:
-            continue
-        return text[:60]
-    return "local business"
 
 
 def _preview_places(host: str, brand_hint: str = "", category: str = "", city: str = "") -> list[dict]:
@@ -1987,28 +1934,31 @@ def _preview_gaps_from_site(pages: list, category: str, city: str) -> list[dict]
     return out
 
 
-def _search_phrase(raw: str) -> str:
-    """A short query a customer would type. Schema types such as FAQPage are not queries."""
-    text = _usable_category(raw)
-    if not text or len(text.split()) > 4:
-        return ""
-    return text
-
-
-def _seed_keywords(keywords: list, gaps: list, category: str) -> list[str]:
-    """Real searches for this business. A schema label such as FAQPage is never a seed."""
+def _seed_keywords(
+    keywords: list,
+    gaps: list,
+    category: str,
+    topics: list | None = None,
+    schema_keys: set[str] | None = None,
+) -> list[str]:
+    """Searches from the AI read of this site, then the live keywords. Schema @types are never seeds."""
     seeds: list[str] = []
     seen: set[str] = set()
+    blocked = schema_keys or set()
 
     def add(raw: str) -> None:
-        text = _search_phrase(raw)
+        text = _from_the_read(raw, blocked)
         key = text.lower()
-        if not text or key in seen:
+        if not text or len(text.split()) > 4 or key in seen:
             return
         seen.add(key)
         seeds.append(text)
 
     add(category)
+    for topic in topics or []:
+        add(topic)
+        if len(seeds) >= 2:
+            return seeds[:2]
     rows = list(gaps or []) + list(keywords or [])
     for row in sorted(rows, key=lambda item: -(int(item.get("volume") or 0))):
         add(row.get("keyword") or "")
@@ -2073,9 +2023,11 @@ def _preview_search_rivals(
     country: str,
     language: str,
     visits: int,
+    topics: list | None = None,
+    schema_keys: set[str] | None = None,
 ) -> tuple[list[dict], str]:
-    """Who ranks in this site's country for its real keywords and category."""
-    seeds = _seed_keywords(keywords, gaps, category)
+    """Who ranks in this site's country for the category and topics the AI read on the site."""
+    seeds = _seed_keywords(keywords, gaps, category, topics, schema_keys)
     if not seeds or not country:
         return [], ""
     try:
@@ -2230,28 +2182,6 @@ def _preview_onpage(home: str) -> dict:
     }
 
 
-_GENERIC_CATEGORY = {
-    "website", "webpage", "web site", "web page", "homepage", "home page", "organization",
-    "local business", "localbusiness", "site", "blog", "home", "page", "menu", "welcome",
-    "breadcrumblist", "imageobject", "searchaction", "entrypoint", "listitem", "wpheader",
-    "wpfooter", "person", "postaladdress",
-}
-# schema.org types describe the page, not the business a customer searches for.
-_SCHEMA_TYPES = _GENERIC_CATEGORY | {
-    "faqpage", "faq page", "qapage", "qa page", "product", "offer", "aggregateoffer",
-    "itemlist", "review", "aggregaterating", "rating", "question", "answer", "howto",
-    "howtostep", "article", "newsarticle", "blogposting", "collectionpage", "itempage",
-    "profilepage", "searchresultspage", "aboutpage", "contactpage", "checkoutpage",
-    "sitenavigationelement", "speakablespecification", "offercatalog", "merchantreturnpolicy",
-    "quantitativevalue", "propertyvalue", "openinghoursspecification", "geocoordinates",
-    "place", "videoobject", "dataset", "definedterm", "thing", "creativework",
-    "webpageelement", "softwareapplication", "webapplication", "mobileapplication",
-    "contactpoint", "monetaryamount", "unitpricespecification", "pricespecification",
-    "interactioncounter", "claimreview", "mediaobject", "event", "saleevent",
-    "specialannouncement", "comment", "viewaction", "readaction", "buyaction",
-    "orderaction", "service", "store", "onlinestore", "corporation", "brand",
-    "autopartsstore", "autodealer", "automotivebusiness",
-}
 _SKIP_RIVAL_HOSTS = (
     "google.", "youtube.com", "facebook.com", "instagram.com", "wikipedia.org", "pinterest.com",
     "dribbble.com", "behance.net", "elfsight.com", "schema.org", "github.com", "codepen.io",
@@ -2264,33 +2194,55 @@ def _type_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
 
 
-def _is_schema_type(text: str) -> bool:
-    """FAQPage, Web Site, and other schema.org labels are not a business category."""
-    raw = " ".join(str(text or "").split())
-    if not raw:
-        return False
-    if _type_key(raw) in {_type_key(item) for item in _SCHEMA_TYPES}:
-        return True
-    # An internal capital (FAQPage, ItemList) is a type name, not a search.
-    return " " not in raw and bool(re.search(r"[A-Za-z][A-Z]", raw))
+def _schema_keys(pages: list) -> set[str]:
+    """@type values found on this crawl. They describe the markup, not the business."""
+    keys: set[str] = set()
+    for page in pages or []:
+        for kind in page.get("schemaTypes") or []:
+            key = _type_key(kind)
+            if key:
+                keys.add(key)
+    return keys
 
 
-def _usable_category(text: str) -> str:
-    """A business category from the site. Schema types like FAQPage are not a category."""
+def _from_the_read(text: str, schema_keys: set[str] | None = None) -> str:
+    """A phrase the AI read on this site. A schema @type from these pages is not a phrase."""
     cleaned = " ".join(str(text or "").split())
-    if not cleaned or len(cleaned) < 3 or _is_schema_type(cleaned):
+    if not cleaned or len(cleaned) < 3:
+        return ""
+    if schema_keys and _type_key(cleaned) in schema_keys:
+        return ""
+    if " " not in cleaned and re.search(r"[A-Za-z][A-Z]", cleaned):
         return ""
     return cleaned[:80]
 
 
-def _schema_category(pages: list) -> str:
-    for page in pages[:4]:
-        for kind in page.get("schemaTypes") or []:
-            label = re.sub(r"([a-z])([A-Z])", r"\1 \2", str(kind or "")).strip()
-            usable = _usable_category(label)
-            if usable:
-                return usable
-    return ""
+def _usable_category(text: str, schema_keys: set[str] | None = None) -> str:
+    return _from_the_read(text, schema_keys)
+
+
+def _read_category_and_topics(business: dict, pages: list) -> tuple[str, list[str]]:
+    """Category and topics from the AI read. Nothing is filled from a preset vertical list."""
+    schema_keys = _schema_keys(pages)
+    category = _from_the_read((business or {}).get("category") or "", schema_keys)
+    topics: list[str] = []
+    seen = {_type_key(category)} if category else set()
+    sources: list = []
+    sources.extend((business or {}).get("topics") or [])
+    sources.extend((business or {}).get("offers") or [])
+    sources.extend((business or {}).get("targets") or [])
+    for raw in sources:
+        text = _from_the_read(raw, schema_keys)
+        if not text or len(text.split()) > 6:
+            continue
+        key = _type_key(text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        topics.append(text)
+        if len(topics) >= 8:
+            break
+    return category, topics
 
 
 def _preview_business(pages: list) -> dict:
@@ -2302,9 +2254,17 @@ def _preview_business(pages: list) -> dict:
         return {"error": str((data or {}).get("_error") or "")}
     places = [str(p).strip() for p in (data.get("places") or []) if str(p).strip()]
     offers = [str(o).strip() for o in (data.get("offers") or []) if str(o).strip()]
+    topics = [str(t).strip() for t in (data.get("topics") or []) if str(t).strip()]
+    targets = [
+        str(page.get("target") or "").strip()
+        for page in (data.get("pages") or [])
+        if isinstance(page, dict) and str(page.get("target") or "").strip()
+    ]
     return {
         "brand": str(data.get("brand") or "").strip()[:120],
         "category": str(data.get("category") or "").strip()[:80],
+        "topics": topics[:12],
+        "targets": targets[:12],
         "city": places[0][:80] if places else "",
         "places": places[:6],
         "offers": offers[:12],
@@ -2392,11 +2352,8 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         or host.split(".")[0].replace("-", " ")
     )
     city = str(business.get("city") or "").strip() or _detect_city(pages, country)
-    category = (
-        _usable_category(business.get("category") or "")
-        or _schema_category(pages)
-        or _usable_category(_preview_category(pages, brand))
-    )
+    category, topics = _read_category_and_topics(business, pages)
+    schema_keys = _schema_keys(pages)
     visibility = visibility_pack.get("visibility") or {}
     if country:
         visibility = {**visibility, "market": country, "language": language, "marketSource": market_source}
@@ -2404,7 +2361,9 @@ def preview_scan(home: str, limit: int = 40) -> dict:
     # Gaps stay empty unless DataForSEO returned searches this site does not rank for.
     gaps = visibility_pack.get("gaps") or []
     visits = int(visibility.get("visits") or 0)
-    competitors, rival_query = _preview_search_rivals(host, keywords, gaps, category, country, language, visits)
+    competitors, rival_query = _preview_search_rivals(
+        host, keywords, gaps, category, country, language, visits, topics, schema_keys,
+    )
     rival_source = "search" if competitors else ""
     places = []
     if not competitors and category and city:
@@ -2605,6 +2564,7 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "healthScore": health.get("score"),
         "brand": brand,
         "category": category,
+        "topics": topics,
         "city": city,
         "headline": headline,
         "aboutGoogle": about,
@@ -2632,5 +2592,5 @@ def preview_scan(home: str, limit: int = 40) -> dict:
         "topicStatus": topic_status,
         "deepScan": True,
         "scanLimit": deep,
-        "scanVersion": "free-deep-v9",
+        "scanVersion": "free-deep-v10",
     }
