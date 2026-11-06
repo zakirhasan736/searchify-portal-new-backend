@@ -288,18 +288,19 @@ def fetch_gsc_dimension(
     days: int = 28,
     row_limit: int = 25,
 ) -> list[list]:
-    end = datetime.now(timezone.utc).date()
+    # Search Console is about 2–3 days behind. The end date is the last complete day.
+    end = datetime.now(timezone.utc).date() - timedelta(days=3)
     start = end - timedelta(days=days)
     body = {
         "startDate": start.isoformat(),
         "endDate": end.isoformat(),
-        "dimensions": [dimension],
+        "dimensions": [dimension] if isinstance(dimension, str) else list(dimension),
         "rowLimit": row_limit,
     }
     from urllib.parse import quote
 
     url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/searchAnalytics/query"
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=45.0) as client:
         response = client.post(url, headers={"Authorization": f"Bearer {access_token}"}, json=body)
     if response.status_code >= 400:
         raise GoogleApiError(
@@ -309,9 +310,10 @@ def fetch_gsc_dimension(
     rows = []
     for row in response.json().get("rows") or []:
         keys = row.get("keys") or [""]
+        head = list(keys) if len(keys) > 1 else [keys[0]]
         rows.append(
             [
-                keys[0],
+                *head,
                 str(int(row.get("clicks") or 0)),
                 str(int(row.get("impressions") or 0)),
                 f"{(row.get('ctr') or 0) * 100:.1f}%",
@@ -319,6 +321,31 @@ def fetch_gsc_dimension(
             ]
         )
     return rows
+
+
+def list_gsc_sitemaps(access_token: str, site_url: str) -> list[str]:
+    """Sitemap URLs Search Console already knows about, including Yoast's sitemap index."""
+    from urllib.parse import quote
+
+    url = f"https://www.googleapis.com/webmasters/v3/sites/{quote(site_url, safe='')}/sitemaps"
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            response = client.get(url, headers={"Authorization": f"Bearer {access_token}"})
+    except httpx.HTTPError:
+        return []
+    if response.status_code >= 400:
+        return []
+    found = []
+    for item in response.json().get("sitemap") or []:
+        path = str(item.get("path") or "").strip()
+        if path and path not in found:
+            found.append(path)
+    return found
+
+
+def fetch_gsc_page_query_pairs(access_token: str, site_url: str, days: int = 480, row_limit: int = 500) -> list[list]:
+    """[page, query, clicks, impressions, ctr, position] for the history window."""
+    return fetch_gsc_dimension(access_token, site_url, ["page", "query"], days=days, row_limit=row_limit)
 
 
 def fetch_gsc_top_queries(access_token: str, site_url: str, days: int = 28, row_limit: int = 25) -> list[list]:
@@ -330,7 +357,7 @@ def fetch_gsc_page_queries(access_token: str, site_url: str, page_url: str, days
     page = str(page_url or "").strip()
     if not page:
         return []
-    end = datetime.now(timezone.utc).date()
+    end = datetime.now(timezone.utc).date() - timedelta(days=3)
     start = end - timedelta(days=days)
     body = {
         "startDate": start.isoformat(),

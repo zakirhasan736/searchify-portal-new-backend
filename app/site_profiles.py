@@ -98,6 +98,10 @@ def _clean_state(state: dict) -> dict:
             "status": status,
             "answers": clean_answers(site.get("answers")),
             "createdAt": site.get("createdAt") or site["id"],
+            # Read-only sites can be connected for Search Console and the audit, and never published to.
+            "readOnly": bool(site.get("readOnly")),
+            # Off until the owner asks Searchify to write titles. Yoast / Rank Math / AIOSEO stay in place.
+            "manageTitles": bool(site.get("manageTitles")),
             **({"step": int(site["step"])} if isinstance(site.get("step"), int) else {}),
         })
     if len(sites) > MAX_SITES:
@@ -168,6 +172,18 @@ def save_journey(db: Session, user_id: int, state: dict) -> dict:
         profiles.append({"host": host, "changed": changed, "location": profile["location"]})
     db.commit()
     return {"journey": payload, "profiles": profiles}
+
+
+def site_flags(db: Session, user_id: int, host: str) -> dict:
+    """Per-site publish switches. manageTitles defaults off. readOnly blocks every publish."""
+    journey = get_journey(db, user_id) or {}
+    state = journey.get("state") if isinstance(journey.get("state"), dict) else journey
+    wanted = host_of(host)
+    for site in (state or {}).get("sites") or []:
+        if host_of((site.get("answers") or {}).get("site") or "") != wanted:
+            continue
+        return {"readOnly": bool(site.get("readOnly")), "manageTitles": bool(site.get("manageTitles"))}
+    return {"readOnly": False, "manageTitles": False}
 
 
 def profile_for_host(db: Session, user_id: int, host: str) -> dict | None:

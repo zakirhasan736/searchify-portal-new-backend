@@ -55,23 +55,71 @@ def undo_change(provider: str, credentials: dict, site_url: str, change: dict, p
 _WP_META_TITLE_KEYS = (
     "_yoast_wpseo_title",
     "rank_math_title",
+    "_aioseo_title",
     "_seopress_titles_title",
 )
 _WP_META_DESC_KEYS = (
     "_yoast_wpseo_metadesc",
     "rank_math_description",
+    "_aioseo_description",
     "_seopress_titles_desc",
 )
 _WP_OG_TITLE_KEYS = (
     "_yoast_wpseo_opengraph-title",
     "rank_math_facebook_title",
+    "_aioseo_og_title",
     "_seopress_social_fb_title",
 )
 _WP_OG_DESC_KEYS = (
     "_yoast_wpseo_opengraph-description",
     "rank_math_facebook_description",
+    "_aioseo_og_description",
     "_seopress_social_fb_desc",
 )
+_PLUGIN_META = {
+    "yoast": {
+        "title": ("_yoast_wpseo_title",),
+        "desc": ("_yoast_wpseo_metadesc",),
+        "og_title": ("_yoast_wpseo_opengraph-title",),
+        "og_desc": ("_yoast_wpseo_opengraph-description",),
+        "name": "Yoast",
+    },
+    "rankmath": {
+        "title": ("rank_math_title",),
+        "desc": ("rank_math_description",),
+        "og_title": ("rank_math_facebook_title",),
+        "og_desc": ("rank_math_facebook_description",),
+        "name": "Rank Math",
+    },
+    "aioseo": {
+        "title": ("_aioseo_title",),
+        "desc": ("_aioseo_description",),
+        "og_title": ("_aioseo_og_title",),
+        "og_desc": ("_aioseo_og_description",),
+        "name": "All in One SEO",
+    },
+    "seopress": {
+        "title": ("_seopress_titles_title",),
+        "desc": ("_seopress_titles_desc",),
+        "og_title": ("_seopress_social_fb_title",),
+        "og_desc": ("_seopress_social_fb_desc",),
+        "name": "SEOPress",
+    },
+}
+
+
+def detect_seo_plugin(html: str) -> str:
+    """Which SEO plugin is already on the site. Empty when none of these is in the HTML."""
+    text = (html or "")[:400_000].lower()
+    if "yoast seo" in text or "/plugins/wordpress-seo/" in text:
+        return "yoast"
+    if "rank math" in text or "/plugins/seo-by-rank-math/" in text:
+        return "rankmath"
+    if "all in one seo" in text or "/plugins/all-in-one-seo-pack/" in text or "aioseo" in text:
+        return "aioseo"
+    if "seopress" in text:
+        return "seopress"
+    return ""
 
 
 def _truthy(value: Any) -> bool:
@@ -91,23 +139,29 @@ def _wp_meta_payload(
     include_open_graph: bool = False,
     og_title: str | None = None,
     og_desc: str | None = None,
+    plugin: str = "",
 ) -> dict[str, str]:
+    chosen = _PLUGIN_META.get(plugin or "")
+    title_keys = chosen["title"] if chosen else _WP_META_TITLE_KEYS
+    desc_keys = chosen["desc"] if chosen else _WP_META_DESC_KEYS
+    og_title_keys = chosen["og_title"] if chosen else _WP_OG_TITLE_KEYS
+    og_desc_keys = chosen["og_desc"] if chosen else _WP_OG_DESC_KEYS
     meta: dict[str, str] = {}
     title = (meta_title or "").strip()
     desc = (meta_desc or "").strip()
     if title:
-        for key in _WP_META_TITLE_KEYS:
+        for key in title_keys:
             meta[key] = title
         if include_open_graph:
             social = (og_title or title).strip()
-            for key in _WP_OG_TITLE_KEYS:
+            for key in og_title_keys:
                 meta[key] = social
     if desc:
-        for key in _WP_META_DESC_KEYS:
+        for key in desc_keys:
             meta[key] = desc
         if include_open_graph:
             social_desc = (og_desc or desc).strip()
-            for key in _WP_OG_DESC_KEYS:
+            for key in og_desc_keys:
                 meta[key] = social_desc
     return meta
 
@@ -421,12 +475,21 @@ def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
     # Explicit content body only when requested — never remap meta title → WP title.
     if change.get("updateContent") and change.get("content"):
         payload["content"] = change["content"]
+    plugin = str(change.get("seoPlugin") or "")
+    if not plugin and not dry:
+        try:
+            with httpx.Client(timeout=12.0, follow_redirects=True) as sniff:
+                home = sniff.get(base if base.endswith("/") else f"{base}/", headers={"User-Agent": "Mozilla/5.0"})
+            plugin = detect_seo_plugin(home.text if home.status_code < 400 else "")
+        except Exception:  # noqa: BLE001
+            plugin = ""
     meta = _wp_meta_payload(
         meta_title,
         meta_desc,
         include_open_graph=include_og,
         og_title=og_title,
         og_desc=og_desc,
+        plugin=plugin,
     )
     if meta:
         payload["meta"] = meta
@@ -566,9 +629,13 @@ def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
                 extras.append("JSON-LD")
             elif include_json_ld:
                 extras.append("JSON-LD (requested)")
-            detail_core = "WordPress meta title and meta description updated" if verified_ok else (
-                "WordPress updated (SEO meta could not be verified via REST — check live page)"
-            )
+            plugin_name = (_PLUGIN_META.get(plugin) or {}).get("name") or ""
+            if plugin_name and verified_ok:
+                detail_core = f"{plugin_name} detected. Searchify wrote the title and description into {plugin_name}'s fields and left the plugin installed."
+            elif verified_ok:
+                detail_core = "WordPress meta title and meta description updated"
+            else:
+                detail_core = "WordPress updated (SEO meta could not be verified via REST — check live page)"
             if extras:
                 detail_core = f"{detail_core}; also wrote {' + '.join(extras)}"
             return {
@@ -583,6 +650,8 @@ def _wordpress(creds: dict, site_url: str, change: dict) -> dict[str, Any]:
                 "pageNameUnchanged": page_name_unchanged,
                 "includeOpenGraph": include_og,
                 "includeJsonLd": include_json_ld,
+                "seoPlugin": plugin,
+                "seoPluginName": plugin_name,
                 "jsonLd": json_ld,
                 "before": {
                     "title": before.get("metaTitle") or before.get("title"),

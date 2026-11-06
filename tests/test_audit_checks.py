@@ -218,6 +218,7 @@ def test_robots_rules():
     assert r["sitemaps"] == ["https://a.com/s.xml"]
     assert ac.check_robots("", 503)["problems"][0]["key"] == "robots_5xx"
     assert ac.check_robots("", 404)["problems"][0]["key"] == "robots_missing"
+    assert ac.check_robots("", 403)["problems"][0]["key"] == "robots_unreachable"
     allow_all = ac.check_robots("User-agent: *\nDisallow: /\nAllow: /\n", 200)
     assert "robots_blocks_site" not in [p["key"] for p in allow_all["problems"]]
 
@@ -270,14 +271,48 @@ def test_audit_report_end_to_end_with_fake_provider(monkeypatch):
         raise research.ResearchError("unexpected " + path)
 
     monkeypatch.setattr(research, "_call", fake_call)
-    summary = {"page_metrics": {"checks": {"is_4xx_code": 1}, "onpage_score": 71.5}, "crawl_status": {"pages_crawled": 2}, "domain_info": {"name": "acme.com", "checks": {}}}
+    monkeypatch.setattr(ac, "read_robots", lambda home, timeout=8.0: {
+        "status": 200,
+        "sitemaps": ["https://acme.com/sitemap.xml"],
+        "preview": ["User-agent: *", "Disallow: /wp-content/"],
+        "bytes": 48,
+        "problems": [{"key": "robots_blocks_assets", "severity": "Warning", "detail": "Rules block CSS Google needs."}],
+    })
+    summary = {"page_metrics": {"checks": {"is_4xx_code": 1}, "onpage_score": 71.5}, "crawl_status": {"pages_crawled": 2}, "domain_info": {"name": "acme.com", "checks": {"robots_txt": False}}}
     report = research._audit_report("task-1", summary)
     found = {i["key"] for i in report["issues"]}
-    assert {"status_404", "redirect_loop", "non_indexable_meta_tag", "canonical_other_domain", "typo_heading", "broken_resources", "no_doctype", "broken_links"} <= found
+    assert {"status_404", "redirect_loop", "non_indexable_meta_tag", "canonical_other_domain", "typo_heading", "broken_resources", "no_doctype", "broken_links", "robots_blocks_assets"} <= found
+    assert "robots_txt" not in found
+    assert report["robots"]["status"] == 200
+    assert report["robots"]["preview"][0] == "User-agent: *"
     assert "is_4xx_code" not in found  # replaced by the exact 404 report
     assert report["reportVersion"] == research.AUDIT_REPORT_VERSION
     assert report["statusCounts"] == {"2xx": 1, "404": 1}
     assert report["issues"][0]["severity"] == "Critical"
+
+
+def test_sitemap_index_is_a_sitemap():
+    index = b"""<?xml version="1.0"?><sitemapindex><sitemap><loc>https://example.com/post-sitemap.xml</loc></sitemap></sitemapindex>"""
+    child = b"""<?xml version="1.0"?><urlset><url><loc>https://example.com/about</loc></url></urlset>"""
+
+    class _Resp:
+        def __init__(self, status, content):
+            self.status_code = status
+            self.content = content
+
+    class _Client:
+        def get(self, url, follow_redirects=True):
+            pages = {
+                "https://example.com/sitemap_index.xml": index,
+                "https://example.com/post-sitemap.xml": child,
+            }
+            body = pages.get(url)
+            return _Resp(200 if body else 404, body or b"")
+
+    got = ac._check_sitemap(_Client(), ["https://example.com/robots.txt", "https://example.com/sitemap_index.xml"], "example.com")
+    assert got["url"] == "https://example.com/sitemap_index.xml"
+    assert got["index"] is True
+    assert got["urlCount"] == 1
 
 
 def test_inspection_does_not_repeat_canonical_mismatch():

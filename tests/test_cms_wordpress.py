@@ -76,6 +76,16 @@ def test_norm_wp_url_strips_www_and_trailing_slash():
     assert cms_connectors._norm_wp_url("https://example.com/") == "example.com/"
 
 
+def test_wp_meta_payload_writes_only_the_detected_plugin():
+    meta = cms_connectors._wp_meta_payload("Home meta title", "Home meta description", plugin="yoast")
+    assert meta == {
+        "_yoast_wpseo_title": "Home meta title",
+        "_yoast_wpseo_metadesc": "Home meta description",
+    }
+    assert cms_connectors.detect_seo_plugin("<html>Optimized with Yoast SEO</html>") == "yoast"
+    assert cms_connectors.detect_seo_plugin("<html>plain page</html>") == ""
+
+
 def test_wp_meta_payload_sets_seo_keys_not_page_title():
     meta = cms_connectors._wp_meta_payload("Home meta title", "Home meta description")
     assert meta["_yoast_wpseo_title"] == "Home meta title"

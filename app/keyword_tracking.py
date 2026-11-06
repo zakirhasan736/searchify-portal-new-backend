@@ -321,9 +321,10 @@ def tracked_payload(db: Session, user_id: int, host: str, metrics: list[dict] | 
 # ---------------------------------------------------------------- current keywords
 
 
-def _gsc_queries(db: Session, user_id: int, host: str) -> tuple[list[list], str]:
+def _gsc_queries(db: Session, user_id: int, host: str) -> tuple[list[list], str, dict, str]:
+    empty = ([], "", {}, "")
     if db is None:
-        return [], ""
+        return empty
     rows = (
         db.query(FeatureRecord)
         .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "organic-search")
@@ -333,9 +334,34 @@ def _gsc_queries(db: Session, user_id: int, host: str) -> tuple[list[list], str]
     )
     for rec in rows:
         payload = rec.payload or {}
-        if payload_host(payload) == host:
-            return [r for r in payload.get("rows") or [] if isinstance(r, (list, tuple)) and r and str(r[0]).strip()], str(payload.get("syncedAt") or "")
-    return [], ""
+        if payload_host(payload) != host:
+            continue
+        page_by_query: dict[str, dict] = {}
+        for pair in payload.get("pageQueries") or []:
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            page = str(pair[0] or "").strip()
+            term = clean_keyword(pair[1])
+            if not page or not term:
+                continue
+            impressions = _num(pair[3]) if len(pair) > 3 else None
+            current = page_by_query.get(term)
+            if current is not None and (impressions or 0) <= (current.get("impressions") or 0):
+                continue
+            page_by_query[term] = {
+                "page": page,
+                "clicks": _num(pair[2]) if len(pair) > 2 else None,
+                "impressions": impressions,
+                "ctr": str(pair[4]) if len(pair) > 4 else "",
+                "gscPosition": _num(pair[5]) if len(pair) > 5 else None,
+            }
+        return (
+            [r for r in payload.get("rows") or [] if isinstance(r, (list, tuple)) and r and str(r[0]).strip()],
+            str(payload.get("syncedAt") or ""),
+            page_by_query,
+            str(payload.get("dataThrough") or ""),
+        )
+    return empty
 
 
 def _num(value):
@@ -349,7 +375,7 @@ def _num(value):
 def current_keywords(db: Session, user_id: int, host: str, ranked: list[dict]) -> dict:
     """Searches this website shows up for today. DataForSEO ranked keywords lead; Search Console
     adds real clicks and impressions, and its own queries fill in what DataForSEO has not seen."""
-    gsc_rows, synced = _gsc_queries(db, user_id, host)
+    gsc_rows, synced, pages, data_through = _gsc_queries(db, user_id, host)
     gsc = {}
     for row in gsc_rows:
         term = clean_keyword(row[0])
@@ -366,22 +392,27 @@ def current_keywords(db: Session, user_id: int, host: str, ranked: list[dict]) -
             continue
         seen.add(term)
         extra = gsc.get(term) or {}
-        out.append({**row, **extra, "keyword": term, "source": "DataForSEO", "alsoInSearchConsole": bool(extra)})
+        page_hit = pages.get(term) or {}
+        page = row.get("page") or row.get("url") or page_hit.get("page")
+        out.append({**row, **extra, "keyword": term, "page": page, "url": row.get("url") or page, "source": "DataForSEO", "alsoInSearchConsole": bool(extra)})
     for term, extra in gsc.items():
         if term in seen:
             continue
         seen.add(term)
-        pos = extra.get("gscPosition")
+        page_hit = pages.get(term) or {}
+        pos = page_hit.get("gscPosition") if page_hit.get("gscPosition") is not None else extra.get("gscPosition")
         out.append({
             "keyword": term,
             "position": round(pos) if isinstance(pos, float) else None,
             "volume": None,
             "difficulty": None,
+            "page": page_hit.get("page"),
+            "url": page_hit.get("page"),
             **extra,
             "source": "Search Console",
             "alsoInSearchConsole": True,
         })
-    return {"rows": out, "searchConsoleSyncedAt": synced, "searchConsoleConnected": bool(gsc_rows)}
+    return {"rows": out, "searchConsoleSyncedAt": synced, "searchConsoleDataThrough": data_through, "searchConsoleConnected": bool(gsc_rows)}
 
 
 def _position(value) -> int | None:

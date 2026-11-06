@@ -1774,7 +1774,7 @@ def _fetch_checked_pages(task_id: str, key: str, limit: int = 25) -> list[dict]:
     return list(((result or [{}])[0] or {}).get("items") or [])
 
 
-AUDIT_REPORT_VERSION = 3
+AUDIT_REPORT_VERSION = 4
 
 
 def _optional_items(path: str, body: dict, timeout: float = 60) -> list[dict]:
@@ -1883,15 +1883,34 @@ def _audit_report(task_id: str, summary: dict) -> dict:
 
     domain = summary.get("domain_info") or {}
     checks = domain.get("checks") or {}
+    robots_read = {}
+    seo_plugin = ""
+    if site_host:
+        try:
+            robots_read = audit_checks.read_robots(f"https://{site_host}/")
+        except Exception:  # noqa: BLE001 - a robots read must not drop the rest of the crawl report
+            robots_read = {}
+        robots_read.pop("text", None)
+        issues.extend(audit_checks.site_issues({"robots": robots_read}))
+        try:
+            import httpx
+            from app.cms_connectors import detect_seo_plugin
+            with httpx.Client(timeout=3.0, follow_redirects=True) as client:
+                home = client.get(f"https://{site_host}/", headers={"User-Agent": "Mozilla/5.0"})
+            seo_plugin = detect_seo_plugin(home.text if home.status_code < 400 else "")
+        except Exception:  # noqa: BLE001
+            seo_plugin = ""
     site_checks = [
-        ("ssl", "The site has no valid SSL certificate", "Critical", "Install or renew the certificate so every page loads on https."),
-        ("sitemap", "No XML sitemap was found", "Warning", "Publish a sitemap and submit it in Search Console."),
-        ("robots_txt", "No robots.txt file was found", "Notice", "Add a robots.txt that points to the sitemap."),
-        ("test_https_redirect", "http does not redirect to https", "Warning", "Redirect every http address to its https version."),
+        ("ssl", "The site has no valid SSL certificate", "Critical", "Install or renew the certificate so every page loads on https.", "Technical"),
+        ("sitemap", "No XML sitemap was found", "Warning", "Publish a sitemap and submit it in Search Console.", "Sitemap"),
+        ("robots_txt", "No robots.txt file was found", "Notice", "Add a robots.txt that points to the sitemap.", "Robots"),
+        ("test_https_redirect", "http does not redirect to https", "Warning", "Redirect every http address to its https version.", "Technical"),
     ]
-    for key, name, severity, fix in site_checks:
+    for key, name, severity, fix, area in site_checks:
+        if key == "robots_txt" and robots_read.get("status") is not None:
+            continue
         if key in checks and checks.get(key) is False:
-            issues.append({"key": key, "name": name, "severity": severity, "fix": fix, "meta": False, "area": "Technical",
+            issues.append({"key": key, "name": name, "severity": severity, "fix": fix, "meta": False, "area": area,
                            "steps": [fix, "This is a site setting. Crawl again after it is in place."], "count": 1,
                            "pages": [{"url": f"https://{domain.get('name') or ''}/", "status": None, "title": "", "description": ""}]})
 
@@ -1920,6 +1939,14 @@ def _audit_report(task_id: str, summary: dict) -> dict:
         "duplicateTitles": metrics.get("duplicate_title"),
         "nonIndexable": metrics.get("non_indexable"),
         "issues": issues,
+        "seoPlugin": seo_plugin,
+        "seoPluginName": {"yoast": "Yoast", "rankmath": "Rank Math", "aioseo": "All in One SEO", "seopress": "SEOPress"}.get(seo_plugin, ""),
+        "robots": {
+            "status": robots_read.get("status"),
+            "sitemaps": robots_read.get("sitemaps") or [],
+            "preview": robots_read.get("preview") or [],
+            "bytes": robots_read.get("bytes") or 0,
+        },
     }
 
 

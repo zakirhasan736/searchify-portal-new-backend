@@ -2413,9 +2413,20 @@ def execute_change(change_id: int, body: ExecuteBody, db: Session = Depends(get_
         )
     if conn is None:
         raise HTTPException(status_code=400, detail="Connect WordPress, Shopify, Webflow, or a custom webhook first")
+    flags = site_profiles.site_flags(db, user.id, conn.site_url or "")
+    if flags["readOnly"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "read_only", "message": "This site is read-only. Searchify can read Search Console, the audit and keywords, and will not publish changes."},
+        )
 
     proposed = dict(row.proposed or {})
     is_meta = (row.change_type or proposed.get("changeType") or "meta") == "meta"
+    if is_meta and not flags["manageTitles"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "titles_off", "message": "Let Searchify manage titles and descriptions is off for this site. Turn it on in Settings when you want a title published. Your SEO plugin stays installed."},
+        )
     target_url = _page_url(row.target_url, _homepage_url(conn.site_url, (conn.credentials or {}).get("siteUrl") or ""))
     if not target_url:
         target_url = _homepage_url(conn.site_url) or (row.target_url or "").strip()
@@ -2925,6 +2936,11 @@ def undo_change(change_id: int, db: Session = Depends(get_db), user: User = Depe
         )
     if conn is None:
         raise HTTPException(status_code=400, detail="Connect WordPress to undo live changes")
+    if site_profiles.site_flags(db, user.id, conn.site_url or "")["readOnly"]:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "read_only", "message": "This site is read-only. Searchify will not change it, including undo."},
+        )
 
     proposed = dict(row.proposed or {})
     previous = {

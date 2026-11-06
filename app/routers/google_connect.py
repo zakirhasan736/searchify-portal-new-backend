@@ -1079,12 +1079,21 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
         site_label = row.gsc_site_url or row.ga4_property_name or "Connected site"
 
         if row.gsc_site_url:
-            queries = goauth.fetch_gsc_top_queries(token, row.gsc_site_url, row_limit=200)
-            pages = goauth.fetch_gsc_top_pages(token, row.gsc_site_url, row_limit=30)
-            countries = goauth.fetch_gsc_by_country(token, row.gsc_site_url, row_limit=15)
-            devices = goauth.fetch_gsc_by_device(token, row.gsc_site_url, row_limit=10)
-            daily = goauth.fetch_gsc_daily(token, row.gsc_site_url, days=28)
-            weekly = goauth.gsc_weekly_clicks(daily, weeks=4)
+            history_days = 480
+            queries = goauth.fetch_gsc_top_queries(token, row.gsc_site_url, days=history_days, row_limit=250)
+            pages = goauth.fetch_gsc_top_pages(token, row.gsc_site_url, days=history_days, row_limit=100)
+            countries = goauth.fetch_gsc_by_country(token, row.gsc_site_url, days=history_days, row_limit=15)
+            devices = goauth.fetch_gsc_by_device(token, row.gsc_site_url, days=history_days, row_limit=10)
+            daily = goauth.fetch_gsc_daily(token, row.gsc_site_url, days=history_days)
+            weekly = goauth.gsc_weekly_clicks(daily, weeks=max(4, len(daily) // 7))
+            try:
+                page_queries = goauth.fetch_gsc_page_query_pairs(token, row.gsc_site_url, days=history_days, row_limit=500)
+            except Exception:  # noqa: BLE001
+                page_queries = []
+            try:
+                gsc_sitemaps = goauth.list_gsc_sitemaps(token, row.gsc_site_url)
+            except Exception:  # noqa: BLE001
+                gsc_sitemaps = []
             total_clicks = sum(int(float(r[1] or 0)) for r in daily) if daily else sum(int(float(r[1] or 0)) for r in queries)
             total_impr = sum(int(float(r[2] or 0)) for r in daily) if daily else sum(int(float(r[2] or 0)) for r in queries)
             avg_ctr = f"{(total_clicks / total_impr * 100):.2f}%" if total_impr else "—"
@@ -1108,7 +1117,11 @@ def sync_user_google(db: Session, user_id: int, cms_connection_id: int | None = 
                 "organic-search",
                 "Organic Search (GSC)",
                 {
-                    "summary": f"Live Search Console queries for {row.gsc_site_url} (last 28 days).",
+                    "summary": f"Search Console for {row.gsc_site_url}. Data up to {last_day or 'the last complete day'}. Search Console is about 2–3 days behind.",
+                    "rangeDays": history_days,
+                    "dataThrough": last_day,
+                    "pageQueries": page_queries,
+                    "sitemaps": gsc_sitemaps,
                     "columns": ["Query", "Clicks", "Impressions", "CTR", "Position"],
                     "rows": queries,
                     "kpis": gsc_kpis,

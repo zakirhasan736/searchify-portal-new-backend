@@ -33,6 +33,8 @@ from app.page_scrape import is_video_src, summarize_json_ld
 
 log = logging.getLogger("searchify.site_scan")
 AGENT = "SearchifyBot/1.0 (+https://searchify.nextcreavo.com)"
+# Some hosts refuse the crawler name and still serve robots.txt to a normal browser.
+BROWSER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 SKIP_TAGS = {"script", "style", "noscript", "svg", "path", "template"}
 CHROME_TAGS = {"nav", "footer", "header", "aside", "form"}
 SKIP_EXT = re.compile(r"\.(pdf|jpe?g|png|gif|webp|svg|ico|css|js|json|xml|zip|rar|mp4|mp3|mov|avi|docx?|xlsx?|pptx?|woff2?|ttf)$", re.I)
@@ -70,6 +72,37 @@ def public_host(url: str) -> bool:
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False
     return True
+
+
+def fetch_robots(home: str, timeout: float = 8.0) -> tuple[int | None, str, int]:
+    """GET /robots.txt. Returns (status, body, byte size). Status is None only when both attempts fail.
+
+    A 401/403 on the crawler user-agent is retried once as a browser. The body is kept only for a
+    response under 400, so a refusal is not parsed as rules.
+    """
+    parts = urlparse(home if "://" in home else f"https://{home}")
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None, "", 0
+    url = f"https://{host}/robots.txt"
+    last: tuple[int | None, str, int] = (None, "", 0)
+    for agent in (AGENT, BROWSER_AGENT):
+        try:
+            response = httpx.get(
+                url,
+                headers={"User-Agent": agent, "Accept": "text/plain,text/html,*/*"},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+        except httpx.HTTPError:
+            continue
+        size = len(response.content or b"")
+        if response.status_code < 400:
+            return response.status_code, (response.text or "")[:600_000], size
+        last = (response.status_code, "", size)
+        if response.status_code not in (401, 403, 429):
+            return last
+    return last
 
 
 def _get(client: httpx.Client, url: str, timeout: float = 10.0) -> httpx.Response | None:
@@ -330,9 +363,23 @@ def _sitemap_urls(client: httpx.Client, url: str, depth: int = 0, cap: int = 400
         return []
     response = _get(client, url, timeout=timeout)
     if response is None:
-        return []
+        # Yoast and some hosts refuse the crawler name. Retry once as a browser.
+        try:
+            response = httpx.get(
+                url,
+                headers={"User-Agent": BROWSER_AGENT, "Accept": "application/xml,text/xml,*/*"},
+                timeout=timeout,
+                follow_redirects=True,
+            )
+        except httpx.HTTPError:
+            return []
+        if response.status_code >= 400:
+            return []
+    raw = response.content[:3_000_000]
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
     try:
-        root = ET.fromstring(response.content[:3_000_000])
+        root = ET.fromstring(raw)
     except ET.ParseError:
         return []
     out: list[str] = []
@@ -367,16 +414,21 @@ def discover(home: str, limit: int, *, quick: bool = False) -> tuple[list[str], 
     found: list[str] = []
     sitemap_timeout = 4.0 if quick else 10.0
     with httpx.Client(headers={"User-Agent": AGENT}) as client:
-        robots_txt = _get(client, urljoin(home, "/robots.txt"), timeout=4.0 if quick else 6.0)
-        if robots_txt is not None:
-            lines = robots_txt.text.splitlines()
+        status, text, _size = fetch_robots(home, timeout=4.0 if quick else 8.0)
+        if status is not None and status < 400 and text.strip():
+            lines = text.splitlines()
             robots.parse(lines)
             sitemaps = [line.split(":", 1)[1].strip() for line in lines if line.lower().startswith("sitemap:")]
         else:
             robots = None
-        candidates = [*sitemaps, urljoin(home, "/sitemap.xml"), urljoin(home, "/sitemap_index.xml"), urljoin(home, "/wp-sitemap.xml")]
-        if quick:
-            candidates = candidates[:2]
+        common = [
+            urljoin(home, "/sitemap_index.xml"),
+            urljoin(home, "/sitemap.xml"),
+            urljoin(home, "/wp-sitemap.xml"),
+        ]
+        # Robots Sitemap: lines first, then Yoast, a plain sitemap, and the WordPress default.
+        # A quick scan still tries all three common addresses.
+        candidates = list(dict.fromkeys([*(sitemaps[:1] if quick else sitemaps), *common]))
         for candidate in candidates:
             urls = _sitemap_urls(
                 client,

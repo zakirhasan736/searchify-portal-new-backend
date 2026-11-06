@@ -1034,6 +1034,10 @@ def check_robots(text: str, status: int | None, size: int = 0) -> dict:
     if status is None:
         problems.append({"key": "robots_unreachable", "severity": "Warning", "detail": "robots.txt could not be loaded (network error or timeout)."})
         return {"status": None, "sitemaps": [], "problems": problems}
+    if status in (401, 403, 429):
+        problems.append({"key": "robots_unreachable", "severity": "Warning",
+                         "detail": f"robots.txt returns HTTP {status}. A firewall or bot rule refused the read, so the rules could not be checked."})
+        return {"status": status, "sitemaps": [], "problems": problems}
     if status >= 500:
         problems.append({"key": "robots_5xx", "severity": "Critical",
                          "detail": f"robots.txt returns HTTP {status}. Google treats a server error on robots.txt as 'do not crawl' and may stop crawling the whole site."})
@@ -1079,6 +1083,19 @@ def check_robots(text: str, status: int | None, size: int = 0) -> dict:
     return {"status": status, "sitemaps": sitemaps[:10], "problems": problems}
 
 
+def read_robots(home: str, timeout: float = 8.0) -> dict:
+    """Fetch robots.txt and parse the rules. Never raises."""
+    from app.site_scan import fetch_robots
+
+    try:
+        status, text, size = fetch_robots(home, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        status, text, size = None, "", 0
+    parsed = check_robots(text if status is not None and status < 400 else "", status, size)
+    preview = [line.strip() for line in (text or "").splitlines() if line.strip() and not line.strip().startswith("#")][:24]
+    return {**parsed, "bytes": size, "preview": preview, "text": text if status is not None and status < 400 else ""}
+
+
 def run_site_checks(home: str, sample_urls: list[str] | None = None, timeout: float = 6.0) -> dict:
     """Network checks for robots.txt, sitemap and redirects. Never raises."""
     import httpx
@@ -1094,22 +1111,21 @@ def run_site_checks(home: str, sample_urls: list[str] | None = None, timeout: fl
             return result
         base = f"https://{host}"
         with httpx.Client(headers={"User-Agent": AGENT}, timeout=timeout) as client:
-            # robots.txt
-            try:
-                r = client.get(f"{base}/robots.txt", follow_redirects=True)
-                robots = check_robots(r.text[:600_000] if r.status_code < 400 else "", r.status_code, len(r.content))
-                if r.status_code < 400:
-                    parser = RobotFileParser()
-                    parser.parse(r.text.splitlines())
-                    blocked = [u for u in [f"{base}/", *(sample_urls or [])[:15]] if not parser.can_fetch("Googlebot", u)]
-                    if blocked:
-                        robots["problems"].append({"key": "robots_blocks_pages", "severity": "Critical",
-                                                   "detail": "Googlebot is blocked from: " + ", ".join(blocked[:5])})
-            except httpx.HTTPError:
-                robots = check_robots("", None)
+            # robots.txt — own fetch, with a browser retry when the crawler name is refused.
+            robots = read_robots(base, timeout=timeout)
+            body = robots.pop("text", "")
+            if robots.get("status") is not None and robots["status"] < 400 and body:
+                parser = RobotFileParser()
+                parser.parse(body.splitlines())
+                blocked = [u for u in [f"{base}/", *(sample_urls or [])[:15]] if not parser.can_fetch("Googlebot", u)]
+                if blocked:
+                    robots["problems"].append({"key": "robots_blocks_pages", "severity": "Critical",
+                                               "detail": "Googlebot is blocked from: " + ", ".join(blocked[:5])})
             result["robots"] = robots
             # sitemap
-            result["sitemap"] = _check_sitemap(client, robots.get("sitemaps") or [f"{base}/sitemap.xml", f"{base}/sitemap_index.xml", f"{base}/wp-sitemap.xml"], host)
+            common = [f"{base}/sitemap_index.xml", f"{base}/sitemap.xml", f"{base}/wp-sitemap.xml"]
+            listed = [u for u in (robots.get("sitemaps") or []) if u]
+            result["sitemap"] = _check_sitemap(client, list(dict.fromkeys([*listed, *common])), host)
             # http -> https and www consistency
             result["redirects"] = _check_redirects(client, host)
     except Exception as exc:  # noqa: BLE001 - site checks are best-effort
@@ -1170,7 +1186,8 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
     bare = host.removeprefix("www.")
     found = ""
     urls: list[str] = []
-    for url in candidates[:4]:
+    index = False
+    for url in candidates[:8]:
         if _host(url) != bare:
             problems.append({"key": "sitemap_other_host", "severity": "Warning", "detail": f"Sitemap {url} is on another domain. Google only accepts sitemaps for the same site unless verified."})
             continue
@@ -1178,24 +1195,39 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
             r = client.get(url, follow_redirects=True)
         except httpx.HTTPError:
             continue
+        if r.status_code in (401, 403, 429):
+            try:
+                r = httpx.get(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/xml,text/xml,*/*"}, follow_redirects=True, timeout=8.0)
+            except httpx.HTTPError:
+                continue
         if r.status_code >= 400:
-            if url in candidates[:1] and len(candidates) <= 3 and "robots" not in url:
-                problems.append({"key": "sitemap_error", "severity": "Warning", "detail": f"Sitemap {url} returns HTTP {r.status_code}."})
             continue
+        raw = r.content[:5_000_000]
+        if raw.startswith(b"\xef\xbb\xbf"):
+            raw = raw[3:]
         try:
-            root = ET.fromstring(r.content[:5_000_000])
+            root = ET.fromstring(raw)
         except ET.ParseError as exc:
             problems.append({"key": "sitemap_invalid", "severity": "Warning", "detail": f"Sitemap {url} is not valid XML ({str(exc)[:60]})."})
             continue
         found = url
         locs = [n.text.strip() for n in root.iter() if n.tag.lower().endswith("loc") and n.text]
-        if root.tag.lower().endswith("sitemapindex") and locs:
-            try:
-                child = ET.fromstring(client.get(locs[0], follow_redirects=True).content[:5_000_000])
-                locs = [n.text.strip() for n in child.iter() if n.tag.lower().endswith("loc") and n.text]
-            except Exception:  # noqa: BLE001
-                locs = []
-        urls = locs
+        if root.tag.lower().endswith("sitemapindex"):
+            index = True
+            child_pages: list[str] = []
+            for child_url in locs[:6]:
+                try:
+                    child_res = client.get(child_url, follow_redirects=True)
+                    child_raw = child_res.content[:5_000_000]
+                    if child_raw.startswith(b"\xef\xbb\xbf"):
+                        child_raw = child_raw[3:]
+                    child = ET.fromstring(child_raw)
+                except Exception:  # noqa: BLE001
+                    continue
+                child_pages.extend(n.text.strip() for n in child.iter() if n.tag.lower().endswith("loc") and n.text)
+            urls = child_pages or locs
+        else:
+            urls = locs
         break
     if not found and not any(p["key"] == "sitemap_error" for p in problems):
         problems.append({"key": "sitemap_missing", "severity": "Warning", "detail": "No XML sitemap was found (robots.txt, /sitemap.xml, /sitemap_index.xml, /wp-sitemap.xml)."})
@@ -1216,13 +1248,14 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
             return (loc, "noindex")
         return None
 
+    page_urls = [u for u in urls if not u.lower().split("?", 1)[0].endswith(".xml")]
     with ThreadPoolExecutor(max_workers=5) as pool:
-        bad = [hit for hit in pool.map(probe, urls[:15]) if hit]
+        bad = [hit for hit in pool.map(probe, page_urls[:15]) if hit]
     if bad:
         problems.append({"key": "sitemap_bad_urls", "severity": "Warning",
                          "detail": "The sitemap lists URLs Google should not index: " + "; ".join(f"{u} ({why})" for u, why in bad[:6]),
                          "urls": [{"url": u, "why": why} for u, why in bad[:15]]})
-    return {"url": found, "urlCount": len(urls), "problems": problems}
+    return {"url": found, "urlCount": len(urls), "index": index, "problems": problems}
 
 
 SITE_PROBLEM_TEXT = {
