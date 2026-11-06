@@ -1133,6 +1133,13 @@ def run_site_checks(home: str, sample_urls: list[str] | None = None, timeout: fl
     return result
 
 
+def polite_get(client, url: str, **kwargs):
+    """site_scan.polite_get: retry as a browser when a firewall refuses the crawler name (lazy import, no cycle)."""
+    from app.site_scan import polite_get as fetch
+
+    return fetch(client, url, **kwargs)
+
+
 def _hops(client, url: str, limit: int = 6) -> list[tuple[int | None, str]]:
     import httpx
 
@@ -1140,7 +1147,7 @@ def _hops(client, url: str, limit: int = 6) -> list[tuple[int | None, str]]:
     current = url
     for _ in range(limit):
         try:
-            r = client.get(current, follow_redirects=False)
+            r = polite_get(client, current, follow_redirects=False)
         except httpx.HTTPError:
             out.append((None, current))
             return out
@@ -1192,7 +1199,7 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
             problems.append({"key": "sitemap_other_host", "severity": "Warning", "detail": f"Sitemap {url} is on another domain. Google only accepts sitemaps for the same site unless verified."})
             continue
         try:
-            r = client.get(url, follow_redirects=True)
+            r = polite_get(client, url, accept="application/xml,text/xml,*/*")
         except httpx.HTTPError:
             continue
         if r.status_code in (401, 403, 429):

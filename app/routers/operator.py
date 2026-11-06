@@ -1760,7 +1760,19 @@ def _home_for(db: Session, user: User, site: str = "") -> str:
         .filter(CmsConnection.customer_id == user.id, CmsConnection.status == "connected")
         .all()
     )
-    return _homepage_url(site, *(c.site_url for c in cms_rows), google.gsc_site_url if google else "")
+    # No site in the request: the website the customer is working on (onboarding's active site) comes before
+    # WordPress or the Google property, which may belong to another site or not be chosen yet.
+    active = "" if site else _active_journey_site(db, user.id)
+    return _homepage_url(site, active, *(c.site_url for c in cms_rows), google.gsc_site_url if google else "")
+
+
+def _active_journey_site(db: Session, user_id: int) -> str:
+    state = (site_profiles.get_journey(db, user_id) or {}).get("state") or {}
+    sites = [s for s in state.get("sites") or [] if isinstance(s, dict) and (s.get("answers") or {}).get("site")]
+    active = next((s for s in sites if str(s.get("id")) == str(state.get("activeId"))), None)
+    if active is None and len(sites) == 1:
+        active = sites[0]
+    return str(((active or {}).get("answers") or {}).get("site") or "").strip()
 
 
 @router.post("/site-scan")
@@ -3224,3 +3236,95 @@ def keyword_page_change(db: Session, user: User, *, keyword: str, page_url: str,
 
         notify_waiting(db, user.id, change)
     return {"change": result.get("change") or _change_row(change), "note": note}
+
+
+# --- Data health: why a screen is empty, in words the owner can act on ------------------------------------
+
+def _check(key: str, state: str, label: str, detail: str = "", action: dict | None = None) -> dict:
+    """state: ok | warn (results are partial) | error (this blocks results)."""
+    return {"key": key, "state": state, "label": label, "detail": detail, "action": action or None}
+
+
+@router.get("/data-health")
+def data_health(site: str = "", db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Everything the SEO tools need for one website, checked in one place.
+
+    Screens used to show nothing when a dependency was missing (no scan, firewall, no market, Google property
+    not chosen, research service down). This lists each one with the fix.
+    """
+    from app import research, site_scan
+    from app.routers.google_connect import _has_kind_for_host, connection_for_site
+
+    checks: list[dict] = []
+    home = _home_for(db, user, site)
+    if not home:
+        checks.append(_check("site", "error", "No website yet", "Add your website address so Searchify can read it.",
+                             {"label": "Add website", "href": "/app/start"}))
+        return {"ok": True, "host": "", "checks": checks, "blocking": 1}
+    host = site_scan.host_of(home)
+
+    scan = _latest_scan(db, user.id, host)
+    if not scan:
+        checks.append(_check("scan", "error", "Website not scanned yet",
+                             "Keyword ideas, the audit and today's moves all start from a scan of your pages.",
+                             {"label": "Scan now", "do": "scan"}))
+    elif not scan.get("pages"):
+        checks.append(_check("scan", "error", "The last scan read no pages", scan.get("error") or "", {"label": "Scan again", "do": "scan"}))
+    else:
+        detail = f"{len(scan.get('pages') or [])} pages read"
+        if scan.get("readAsBrowser"):
+            checks.append(_check("firewall", "warn", "Your firewall blocks Searchify's reader",
+                                 "Pages were read as a normal browser instead. Allow \"SearchifyBot\" in Cloudflare, Wordfence or your host "
+                                 "so future scans and audits are never cut short."))
+        checks.append(_check("scan", "ok", "Website scanned", detail))
+        if scan.get("understandError"):
+            checks.append(_check("business", "error", "Searchify couldn't read what your business does",
+                                 "Keyword suggestions stay empty until it can. " + str(scan.get("understandError"))[:200],
+                                 {"label": "Scan again", "do": "scan"}))
+
+        robots = (scan.get("siteChecks") or {}).get("robots") or {}
+        status = robots.get("status")
+        if scan.get("siteChecks") and status is None:
+            checks.append(_check("robots", "warn", "robots.txt could not be loaded",
+                                 "The request timed out or was refused. Open yoursite/robots.txt to check it loads."))
+        elif isinstance(status, int) and status >= 400 and status != 404:
+            checks.append(_check("robots", "warn", f"robots.txt returns HTTP {status}",
+                                 "A firewall or the server refused it, so its rules and sitemap line could not be read."))
+        elif isinstance(status, int):
+            checks.append(_check("robots", "ok", "robots.txt read" if status < 400 else "No robots.txt (fine)"))
+
+    provider = research.status()
+    if not provider.get("ready"):
+        checks.append(_check("research", "error", "Keyword and audit data is unavailable",
+                             provider.get("message") or "The research service is not connected.", {"label": "Contact support", "do": "contact_support"}))
+
+    try:
+        market = markets.resolve_for_site(db, user, site=home)
+    except Exception:  # noqa: BLE001
+        market = {"needsChoice": True}
+    if market.get("needsChoice") or not market.get("countryIso"):
+        checks.append(_check("market", "error", "Choose the country you serve",
+                             "Keyword volumes and rankings are per country.", {"label": "Choose market", "do": "market"}))
+
+    google = db.query(GoogleConnection).filter(GoogleConnection.customer_id == user.id).first()
+    if google is None or not (google.access_token or google.refresh_token):
+        checks.append(_check("google", "warn", "Google not connected",
+                             "Connect Search Console for real clicks, queries and indexing.", {"label": "Connect Google", "href": "/app/connections"}))
+    else:
+        conn = connection_for_site(google, home)
+        if (conn.get("gsc") or {}).get("status") != "connected":
+            checks.append(_check("gsc", "warn", "Search Console property not chosen for this site",
+                                 "Google is connected, but no Search Console property is linked to " + host + ".",
+                                 {"label": "Choose property", "href": "/app/connections"}))
+        elif not _has_kind_for_host(db, user.id, "organic-search", host):
+            checks.append(_check("gsc_data", "warn", "Search Console data not loaded yet", "", {"label": "Load it now", "do": "sync"}))
+        else:
+            checks.append(_check("gsc", "ok", "Search Console linked", conn.get("gscSiteUrl") or ""))
+
+    usage = quotas.summary(db, user).get("features") or {}
+    empty = [f["label"] for f in usage.values() if f.get("limit") is not None and f.get("left") == 0]
+    if empty:
+        checks.append(_check("quota", "warn", "Monthly limit reached", ", ".join(empty[:4]) + ". Resets next month or upgrade your plan.",
+                             {"label": "See plans", "href": "/app/plans"}))
+
+    return {"ok": True, "host": host, "checks": checks, "blocking": sum(1 for c in checks if c["state"] == "error")}

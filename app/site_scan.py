@@ -17,6 +17,7 @@ import ipaddress
 import json
 import re
 import socket
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -74,6 +75,18 @@ def public_host(url: str) -> bool:
     return True
 
 
+def host_problem(url: str) -> str:
+    """Why public_host() said no, in words the owner can act on."""
+    host = urlparse(url).hostname or ""
+    if not host:
+        return "Enter the website address, for example https://example.com."
+    try:
+        socket.getaddrinfo(host, None)
+    except OSError:
+        return f"Searchify could not find {host} (the domain did not resolve). Check the address is spelled right and the site is live."
+    return "This address is not a public website."
+
+
 def fetch_robots(home: str, timeout: float = 8.0) -> tuple[int | None, str, int]:
     """GET /robots.txt. Returns (status, body, byte size). Status is None only when both attempts fail.
 
@@ -105,9 +118,56 @@ def fetch_robots(home: str, timeout: float = 8.0) -> tuple[int | None, str, int]
     return last
 
 
+# Statuses a firewall or bot filter (Cloudflare, Wordfence, host WAFs) returns to an unknown crawler name.
+BLOCKED_STATUS = {401, 403, 406, 429, 503}
+BROWSER_FOR_HOST_SECONDS = 3600
+_browser_hosts: dict[str, float] = {}
+
+
+def _browser_headers(accept: str = "") -> dict:
+    return {
+        "User-Agent": BROWSER_AGENT,
+        "Accept": accept or "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def reads_as_browser(url: str) -> bool:
+    """True when this host refused the crawler name recently, so pages are read as a browser."""
+    return _browser_hosts.get(host_of(url), 0) > time.time()
+
+
+def polite_get(client: httpx.Client, url: str, *, timeout: float | None = None, follow_redirects: bool = True, accept: str = "") -> httpx.Response:
+    """GET as SearchifyBot; if the site's firewall refuses that name, read it once more as a normal browser.
+
+    Many WordPress hosts block unknown bot names on pages while robots.txt still loads, which used to leave
+    a scan with zero pages and every report empty. A host that refused us is read as a browser for an hour.
+    Raises httpx.HTTPError like client.get.
+    """
+
+    def fetch(browser: bool) -> httpx.Response:
+        kwargs: dict = {"follow_redirects": follow_redirects}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        if browser:
+            kwargs["headers"] = _browser_headers(accept)
+        return client.get(url, **kwargs)
+
+    as_browser = reads_as_browser(url)
+    response = fetch(as_browser)
+    if as_browser or response.status_code not in BLOCKED_STATUS:
+        return response
+    retry = fetch(True)
+    if retry.status_code not in BLOCKED_STATUS:
+        _browser_hosts[host_of(url)] = time.time() + BROWSER_FOR_HOST_SECONDS
+        log.info("scan_read_as_browser", extra={"host": host_of(url), "status": response.status_code})
+        return retry
+    return response
+
+
 def _get(client: httpx.Client, url: str, timeout: float = 10.0) -> httpx.Response | None:
     try:
-        response = client.get(url, timeout=timeout, follow_redirects=True)
+        response = polite_get(client, url, timeout=timeout)
     except httpx.HTTPError:
         return None
     if response.status_code >= 400:
@@ -270,7 +330,7 @@ def page_key(url: str) -> str:
 def read_page(client: httpx.Client, url: str, timeout: float = 10.0) -> dict:
     fetched = datetime.utcnow().isoformat(timespec="seconds")
     try:
-        response = client.get(url, timeout=timeout, follow_redirects=True)
+        response = polite_get(client, url, timeout=timeout)
     except httpx.HTTPError as exc:
         return {"url": url, "requestedUrl": url, "error": f"could not load ({type(exc).__name__})", "status": None, "fetchedAt": fetched}
     final = str(response.url)
@@ -473,7 +533,7 @@ def crawl(home: str, limit: int = 40, *, quick: bool = False) -> dict:
     """
     home = normalize(home if home.startswith(("http://", "https://")) else f"https://{home}")
     if not public_host(home):
-        return {"home": home, "pages": [], "error": "This address is not a public website."}
+        return {"home": home, "pages": [], "error": host_problem(home)}
     home_host = host_of(home)
     page_limit = min(limit, 8) if quick else limit
     queue, robots = discover(home, page_limit, quick=quick)
@@ -518,7 +578,24 @@ def crawl(home: str, limit: int = 40, *, quick: bool = False) -> dict:
             queue = sorted(dict.fromkeys([*queue, *fresh_links]), key=_priority)
     for page in pages:
         page.pop("links", None)
-    return {"home": home, "host": home_host, "pages": pages, "failed": failed, "error": "" if pages else "No readable pages were found."}
+    blocked = [f for f in failed if f.get("status") in BLOCKED_STATUS]
+    error = ""
+    if not pages:
+        error = (
+            f"The website refused Searchify's reader (HTTP {blocked[0]['status']} on every page). A firewall or security "
+            "plugin (Cloudflare, Wordfence, your host) is blocking it. Allow \"SearchifyBot\" there, then scan again."
+            if blocked and len(blocked) == len(failed)
+            else "No readable pages were found."
+        )
+    return {
+        "home": home,
+        "host": home_host,
+        "pages": pages,
+        "failed": failed,
+        # The firewall refused the crawler name and pages were read as a browser instead.
+        "readAsBrowser": reads_as_browser(home),
+        "error": error,
+    }
 
 
 # 2: reads every offer + umbrella category, more copy per page, navigation.
@@ -771,6 +848,8 @@ def scan_site(
         "competitors": competitors,
         "brief": brief,
         "failed": crawled.get("failed") or [],
+        # The site's firewall refused the crawler name; pages were read as a browser (shown as a warning).
+        "readAsBrowser": bool(crawled.get("readAsBrowser")),
         # robots.txt, sitemap and http/https/www redirect checks for the site audit.
         "siteChecks": site_checks,
         # AI crawler access (robots.txt per bot, firewall probe), llms.txt, nosnippet (AI search topic).
