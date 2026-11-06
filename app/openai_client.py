@@ -2,9 +2,71 @@
 
 from __future__ import annotations
 
+import logging
+import re
+import threading
+import time
+
 import httpx
 
 from app import config
+
+log = logging.getLogger(__name__)
+
+# Which chat models this OpenAI project may use. Asked once, then cached, so a key without access
+# to the newest models still works with the best model it does have instead of failing every call.
+MODELS_TTL = 1800
+DENIED_TTL = 3600
+_lock = threading.Lock()
+_models: dict = {"at": 0.0, "ids": None}
+_denied: dict[str, float] = {}
+# Best first. Used only when none of the role's own models are available to the project.
+ANY_CHAT = [
+    r"^gpt-6-(astra|sol)", r"^gpt-6", r"^gpt-5\.\d+-(sol|terra)", r"^gpt-5\.\d+", r"^gpt-5(?!-nano)",
+    r"^gpt-4\.1$", r"^gpt-4o$", r"^gpt-4\.1-mini", r"^gpt-4o-mini", r"^gpt-5-nano", r"^gpt-4\.1-nano",
+]
+NOT_CHAT = re.compile(r"audio|realtime|transcribe|tts|image|search|embedding|moderation|instruct|codex|preview", re.I)
+
+
+def available_models(*, refresh: bool = False) -> set[str] | None:
+    """Model ids the key can use, or None when OpenAI could not be asked (then every model is tried)."""
+    if not config.OPENAI_API_KEY:
+        return None
+    with _lock:
+        if not refresh and _models["ids"] is not None and time.time() - _models["at"] < MODELS_TTL:
+            return _models["ids"]
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            response = client.get("https://api.openai.com/v1/models", headers={"Authorization": f"Bearer {config.OPENAI_API_KEY}"})
+        if response.status_code >= 400:
+            log.warning("openai_models_list_failed", extra={"status": response.status_code})
+            return None
+        ids = {str(row.get("id") or "") for row in response.json().get("data") or []} - {""}
+    except Exception as exc:  # noqa: BLE001 - listing is a hint; never block a call on it
+        log.warning("openai_models_list_failed", extra={"error": str(exc)[:160]})
+        return None
+    with _lock:
+        _models.update(at=time.time(), ids=ids)
+    return ids
+
+
+def _best_available(ids: set[str]) -> list[str]:
+    chat = sorted((m for m in ids if m.startswith(("gpt-", "o")) and not NOT_CHAT.search(m)), reverse=True)
+    out: list[str] = []
+    for pattern in ANY_CHAT:
+        out += [m for m in chat if re.search(pattern, m) and m not in out]
+    return out[:3]
+
+
+def _usable(chain: list[str]) -> list[str]:
+    """Drop models the project cannot use; add the best model it can use when none are left."""
+    now = time.time()
+    chain = [m for m in chain if _denied.get(m, 0) < now]
+    ids = available_models()
+    if ids is None:
+        return chain
+    kept = [m for m in chain if m in ids]
+    return kept or _best_available(ids)
 
 # First model is always tried first. Astra leads for serious roles.
 FALLBACKS = {
@@ -79,13 +141,21 @@ def chat_text(
         force_astra=force_astra,
     )
     last_error = "unknown"
-    for model in _candidates(
+    wanted = _candidates(
         kind,
         writing_type=writing_type,
         brief=brief,
         tokens=tokens,
         force_astra=force_astra,
-    ):
+    )
+    denied: list[str] = []
+    models = _usable(wanted)
+    if not models:
+        raise RuntimeError(
+            "OpenAI request failed (this OpenAI project has no chat model Searchify can use. "
+            "Allow a model such as gpt-4o or gpt-4.1 under Project → Limits on platform.openai.com, or set OPENAI_MODEL_DEFAULT)"
+        )
+    for model in models:
         try:
             payload: dict = {
                 "model": model,
@@ -105,8 +175,10 @@ def chat_text(
                     json=payload,
                 )
             if response.status_code >= 400:
-                denied = "does not have access to model" in response.text or "model_not_found" in response.text
-                if denied:
+                no_access = "does not have access to model" in response.text or "model_not_found" in response.text
+                if no_access:
+                    denied.append(model)
+                    _denied[model] = time.time() + DENIED_TTL
                     last_error = f"{model}: {response.status_code} {response.text[:240]}"
                     continue
                 alt = {
@@ -135,6 +207,11 @@ def chat_text(
         except Exception as exc:  # noqa: BLE001
             last_error = f"{model}: {exc}"
             continue
+    if denied and len(denied) == len(models):
+        raise RuntimeError(
+            f"OpenAI request failed (this OpenAI project has no access to {', '.join(denied)}. "
+            "Allow one of them under Project → Limits on platform.openai.com, or set OPENAI_MODEL_DEFAULT to a model the project has)"
+        )
     raise RuntimeError(f"OpenAI request failed ({last_error})")
 
 
