@@ -85,3 +85,38 @@ def test_scan_without_a_site_uses_the_active_site_and_health_reports_it(web):
     finally:
         app.dependency_overrides.pop(get_current_user, None)
         drop_user(user.id)
+
+
+def test_scan_finds_onpage_issues_without_paid_audit():
+    from app import audit_checks
+
+    html = '<html><head><title>Hi</title></head><body><p>short</p><img src="/x.jpg"><img src="/deco.jpg" alt=""></body></html>'
+    audit = audit_checks.analyze_html(html, "https://a.test/")
+    scan = {"pages": [
+        {"url": "https://a.test/", "title": "Hi", "description": "", "words": 40, "audit": audit},
+        {"url": "https://a.test/b", "title": "Hi", "description": "A page about b.", "words": 400, "noindex": True,
+         "audit": {"outline": [[1, "B"]]}},
+    ]}
+    keys = {row["key"]: row for row in audit_checks.scan_issues(scan)}
+    assert keys["duplicate_title"]["count"] == 2
+    assert keys["no_description"]["count"] == 1
+    assert keys["no_h1_tag"]["count"] == 1
+    assert keys["no_image_alt"]["count"] == 1  # alt="" decorative image is not flagged
+    assert keys["scan_noindex"]["count"] == 1
+    assert keys["low_content_rate"]["count"] == 1
+    assert all(row["source"] in {"scan", "ai"} for row in keys.values())
+
+
+def test_journey_keeps_baseline_done():
+    from app.site_profiles import _clean_state
+
+    state = {"planId": "starter", "activeId": "s1", "sites": [{
+        "id": "s1", "status": "ready", "baselineDone": True,
+        "answers": {"site": "https://a.test", "baseline": {"leads": "5", "goal": "calls", "searches": ["roof repair", ""],
+                                                        "savedAt": "2026-11-07T10:00:00Z", "snapshot": {"level": "Level 2"}}},
+    }]}
+    site = _clean_state(state)["sites"][0]
+    assert site["baselineDone"] is True
+    assert site["answers"]["baseline"]["savedAt"] == "2026-11-07T10:00:00Z"
+    assert site["answers"]["baseline"]["searches"] == ["roof repair"]
+    assert site["answers"]["site"] == "https://a.test"

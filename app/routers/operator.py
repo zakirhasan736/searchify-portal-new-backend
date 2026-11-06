@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from urllib.parse import urlparse
 from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -1590,6 +1591,12 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
         "host": scan.get("host") or "",
         "scannedAt": scan.get("scannedAt") or "",
         "pagesRead": len(pages),
+        # The real title and description of each page, so "In Google now" shows what the page says today.
+        "listings": [
+            {"url": p.get("url") or "", "path": urlparse(p.get("url") or "").path or "/",
+             "title": (p.get("title") or "")[:200], "description": (p.get("description") or "")[:400]}
+            for p in pages[:80]
+        ],
         "draftable": len(draftable),
         "covered": covered,
         "business": business.get("business") or "",
@@ -3320,6 +3327,16 @@ def data_health(site: str = "", db: Session = Depends(get_db), user: User = Depe
             checks.append(_check("gsc_data", "warn", "Search Console data not loaded yet", "", {"label": "Load it now", "do": "sync"}))
         else:
             checks.append(_check("gsc", "ok", "Search Console linked", conn.get("gscSiteUrl") or ""))
+
+    flags = site_profiles.site_flags(db, user.id, host)
+    if flags["readOnly"]:
+        checks.append(_check("publishing", "warn", "This site is read-only",
+                             "Searchify reads and suggests changes but will not publish them. Turn read-only off in Settings to publish.",
+                             {"label": "Open settings", "href": "/app/settings"}))
+    elif not flags["manageTitles"]:
+        checks.append(_check("publishing", "warn", "Title and description publishing is off",
+                             "Searchify drafts titles and descriptions, but only publishes them when “Let Searchify manage titles and descriptions” is on.",
+                             {"label": "Open settings", "href": "/app/settings"}))
 
     usage = quotas.summary(db, user).get("features") or {}
     empty = [f["label"] for f in usage.values() if f.get("limit") is not None and f.get("left") == 0]

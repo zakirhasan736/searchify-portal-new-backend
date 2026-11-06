@@ -48,6 +48,28 @@ def clean_answers(raw: dict | None) -> dict:
     return out
 
 
+def _clean_baseline(raw) -> dict | None:
+    """The starting-point snapshot (leads, goal, 3 searches). Kept so the app does not ask for it again."""
+    if not isinstance(raw, dict):
+        return None
+    out: dict = {}
+    for key in ("leads", "goal", "savedAt"):
+        if isinstance(raw.get(key), (str, int, float)) and not isinstance(raw.get(key), bool):
+            out[key] = " ".join(str(raw[key]).split())[:200]
+    if isinstance(raw.get("searches"), list):
+        out["searches"] = [" ".join(str(q).split())[:120] for q in raw["searches"][:3] if str(q).strip()]
+    if raw.get("skippedLast") is True:
+        out["skippedLast"] = True
+    snap = raw.get("snapshot")
+    if isinstance(snap, dict):
+        try:
+            small = len(json.dumps(snap)) <= 4000
+        except (TypeError, ValueError):
+            small = False
+        out["snapshot"] = snap if small else {k: snap[k] for k in ("level", "host") if isinstance(snap.get(k), str)}
+    return out or None
+
+
 def answers_hash(answers: dict) -> str:
     data = {k: (answers.get(k) or "") for k in WRITING_KEYS}
     return hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()[:24]
@@ -96,13 +118,18 @@ def _clean_state(state: dict) -> dict:
         sites.append({
             "id": site["id"],
             "status": status,
-            "answers": clean_answers(site.get("answers")),
+            "answers": {
+                **clean_answers(site.get("answers")),
+                **({"baseline": b} if (b := _clean_baseline((site.get("answers") or {}).get("baseline"))) else {}),
+            },
             "createdAt": site.get("createdAt") or site["id"],
             # Read-only sites can be connected for Search Console and the audit, and never published to.
             "readOnly": bool(site.get("readOnly")),
             # Off until the owner asks Searchify to write titles. Yoast / Rank Math / AIOSEO stay in place.
             "manageTitles": bool(site.get("manageTitles")),
             **({"step": int(site["step"])} if isinstance(site.get("step"), int) else {}),
+            # Starting point done: without this the app sends the owner back to the snapshot on every reload.
+            **({"baselineDone": True} if site.get("baselineDone") is True else {}),
         })
     if len(sites) > MAX_SITES:
         raise ProfileError(f"A workspace can hold up to {MAX_SITES} websites.")
