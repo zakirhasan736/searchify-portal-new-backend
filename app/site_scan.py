@@ -681,7 +681,7 @@ def understand(pages: list[dict], brief: dict, profile: dict) -> dict:
         )
     except RuntimeError as exc:
         log.warning("site_understanding_failed", extra={"error": str(exc)[:200]})
-        return {"_error": f"The AI read of the website failed: {str(exc)[:160]}"}
+        return {"_error": f"The AI read of the website failed: {str(exc)[:400]}"}
     data = _json_block(text)
     if not data:
         return {"_error": "The AI read of the website returned no usable answer."}
