@@ -546,6 +546,8 @@ def analyze_html(html: str, url: str, page_text: str = "") -> dict:
     imgs = [i for i in reader.images if i["src"] and not i["src"].startswith("data:")]
     no_dims = [i["src"] for i in imgs if not (i["w"] and i["h"])]
     bad_names = [i["src"] for i in imgs if re.search(r"/(img|image|dsc|photo|screenshot|untitled|wp-image)[-_ ]?\d+|/\d{6,}\.", i["src"], re.I)]
+    # alt="" is a valid decorative image; only a missing alt attribute is a problem.
+    no_alt = [i["src"] for i in imgs if i.get("alt") is None]
     return {
         "outline": reader.outline,
         "emptyHeadings": reader.empty_headings,
@@ -557,6 +559,8 @@ def analyze_html(html: str, url: str, page_text: str = "") -> dict:
         "imagesNoSizeCount": len(no_dims),
         "imageBadNames": bad_names[:10],
         "imageCount": len(imgs),
+        "imagesNoAlt": no_alt[:10],
+        "imagesNoAltCount": len(no_alt),
     }
 
 
@@ -987,6 +991,7 @@ def scan_issues(scan: dict | None) -> list[dict]:
         fix, steps = STATUS_FIX.get(status) or STATUS_FIX[404 if status < 500 else 500]
         out.append(issue(f"scan_broken_{status}", f"Internal links lead to {status} {STATUS_TEXT.get(status, 'errors')}",
                          "Critical", "Links", fix, steps, rows, help_url=DOC["status"], source="scan"))
+    out.extend(onpage_issues(scan))
     out.extend(site_issues(scan.get("siteChecks") or {}))
     try:
         from app.ai_readiness import ai_audit_issues
@@ -995,6 +1000,97 @@ def scan_issues(scan: dict | None) -> list[dict]:
     except Exception:  # noqa: BLE001 - AI findings are extra; never break the audit
         pass
     out.sort(key=lambda row: (SEVERITY_ORDER.get(row["severity"], 3), -row["count"]))
+    return out
+
+
+# Same keys as the DataForSEO on-page checks, so a board can drop the duplicate when
+# both reports are present. These run on every Searchify scan, so the colour boards
+# have findings even when the paid audit is unavailable.
+def _onpage(key: str, area: str, steps: list[str], rows: list[dict], help_url: str = "") -> dict:
+    from app.research import PAGE_CHECKS  # lazy: research imports this module
+
+    name, severity, fix, meta = PAGE_CHECKS[key]
+    return issue(key, name, severity, area, fix, steps, rows, help_url=help_url, source="scan", meta=meta)
+
+
+def onpage_issues(scan: dict | None) -> list[dict]:
+    """Title, description, H1, indexing, thin content and image alt checks from the scan pages."""
+    scan = scan or {}
+    pages = [p for p in (scan.get("pages") or []) if p.get("url") and not p.get("error")]
+    rows: dict[str, list[dict]] = {}
+
+    def add(key: str, page: dict, detail: str):
+        rows.setdefault(key, []).append(page_row(page["url"], status=page.get("status"), title=page.get("title") or "", detail=detail))
+
+    titles: dict[str, list[dict]] = {}
+    descriptions: dict[str, list[dict]] = {}
+    for page in pages:
+        title = " ".join((page.get("title") or "").split())
+        desc = " ".join((page.get("description") or "").split())
+        if page.get("noindex"):
+            add("scan_noindex", page, "The page has a noindex tag, so Google will not show it.")
+        if not title:
+            add("no_title", page, "No <title> tag found.")
+        else:
+            titles.setdefault(title.lower(), []).append(page)
+            if len(title) > 65:
+                add("title_too_long", page, f"{len(title)} characters: “{title[:90]}”")
+            elif len(title) < 20:
+                add("title_too_short", page, f"{len(title)} characters: “{title}”")
+        if not desc:
+            add("no_description", page, "No meta description found.")
+        else:
+            descriptions.setdefault(desc.lower(), []).append(page)
+            if len(desc) > 165:
+                add("description_too_long", page, f"{len(desc)} characters.")
+            elif len(desc) < 70:
+                add("description_too_short", page, f"{len(desc)} characters: “{desc}”")
+        audit = page.get("audit") if isinstance(page.get("audit"), dict) else None
+        if audit is not None:
+            h1s = [t for lvl, t in (audit.get("outline") or []) if lvl == 1]
+            if not h1s:
+                add("no_h1_tag", page, "No H1 heading on the page.")
+            if audit.get("imagesNoAltCount"):
+                names = ", ".join(s.rsplit("/", 1)[-1][:60] for s in (audit.get("imagesNoAlt") or [])[:3])
+                add("no_image_alt", page, f"{audit['imagesNoAltCount']} image(s) without alt text, e.g. {names}")
+        words = page.get("words")
+        if isinstance(words, int) and words < 150 and not page.get("noindex"):
+            add("low_content_rate", page, f"About {words} words of text.")
+        if page.get("canonicalElsewhere"):
+            add("scan_canonical_elsewhere", page, f"Canonical points to {page.get('canonical') or 'another URL'}.")
+    for group in titles.values():
+        if len(group) > 1:
+            for page in group:
+                add("duplicate_title", page, f"Same title as {len(group) - 1} other page(s).")
+    for group in descriptions.values():
+        if len(group) > 1:
+            for page in group:
+                add("duplicate_description", page, f"Same description as {len(group) - 1} other page(s).")
+
+    out: list[dict] = []
+    meta_steps = ["Open the page in Edit and publish.", "Let Searchify draft it from the page, or type your own.", "Approve it before it is published."]
+    for key in ("no_title", "duplicate_title", "title_too_long", "title_too_short"):
+        if rows.get(key):
+            out.append(_onpage(key, "Meta", meta_steps, rows[key]))
+    for key in ("no_description", "duplicate_description", "description_too_long", "description_too_short"):
+        if rows.get(key):
+            out.append(_onpage(key, "Meta", meta_steps, rows[key]))
+    if rows.get("no_h1_tag"):
+        out.append(_onpage("no_h1_tag", "Headings", ["Open the page in the site editor.", "Set the main heading at the top of the page to H1.", "Use one H1 that names the page subject."], rows["no_h1_tag"]))
+    if rows.get("no_image_alt"):
+        out.append(_onpage("no_image_alt", "Images", ["Open the page in the site editor.", "Select each image named and fill in the alt text with what it shows.", "Update the page, then scan again."], rows["no_image_alt"], DOC["images"]))
+    if rows.get("low_content_rate"):
+        out.append(_onpage("low_content_rate", "Paragraphs", ["Add a paragraph about what this page offers, who it is for, and the next step.", "Update the page, then scan again."], rows["low_content_rate"]))
+    if rows.get("scan_noindex"):
+        out.append(issue("scan_noindex", "Pages are hidden from Google (noindex)", "Warning", "Indexing",
+                         "Remove the noindex tag from pages that should appear in Google. Keep it on thank-you or login pages.",
+                         ["Open the page settings in your SEO plugin or site builder.", "Turn off “hide from search engines” / noindex.", "Update the page and request indexing in Search Console."],
+                         rows["scan_noindex"], help_url=DOC["page_indexing"], source="scan"))
+    if rows.get("scan_canonical_elsewhere"):
+        out.append(issue("scan_canonical_elsewhere", "Canonical tags point to another page", "Notice", "Indexing",
+                         "If the page should rank by itself, point its canonical tag to its own URL.",
+                         ["Open the page settings in your SEO plugin.", "Set the canonical URL to this page, or leave it blank.", "Update and scan again."],
+                         rows["scan_canonical_elsewhere"], source="scan"))
     return out
 
 
@@ -1133,6 +1229,13 @@ def run_site_checks(home: str, sample_urls: list[str] | None = None, timeout: fl
     return result
 
 
+def polite_get(client, url: str, **kwargs):
+    """site_scan.polite_get: retry as a browser when a firewall refuses the crawler name (lazy import, no cycle)."""
+    from app.site_scan import polite_get as fetch
+
+    return fetch(client, url, **kwargs)
+
+
 def _hops(client, url: str, limit: int = 6) -> list[tuple[int | None, str]]:
     import httpx
 
@@ -1140,7 +1243,7 @@ def _hops(client, url: str, limit: int = 6) -> list[tuple[int | None, str]]:
     current = url
     for _ in range(limit):
         try:
-            r = client.get(current, follow_redirects=False)
+            r = polite_get(client, current, follow_redirects=False)
         except httpx.HTTPError:
             out.append((None, current))
             return out
@@ -1192,7 +1295,7 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
             problems.append({"key": "sitemap_other_host", "severity": "Warning", "detail": f"Sitemap {url} is on another domain. Google only accepts sitemaps for the same site unless verified."})
             continue
         try:
-            r = client.get(url, follow_redirects=True)
+            r = polite_get(client, url, accept="application/xml,text/xml,*/*")
         except httpx.HTTPError:
             continue
         if r.status_code in (401, 403, 429):
