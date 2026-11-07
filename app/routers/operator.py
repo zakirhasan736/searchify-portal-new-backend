@@ -1600,7 +1600,11 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
         "draftable": len(draftable),
         "covered": covered,
         "business": business.get("business") or "",
+        "category": business.get("category") or "",
+        "topics": (business.get("topics") or [])[:8],
         "brand": business.get("brand") or "",
+        # robots.txt, sitemap and redirects as read during this scan, for the step-by-step scan view.
+        "siteRead": _site_read_summary(scan),
         "offers": (business.get("offers") or [])[:8],
         "places": (business.get("places") or [])[:6],
         "proof": (business.get("proof") or [])[:6],
@@ -1615,6 +1619,31 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
         # Headings by section, schema validation, robots.txt, sitemap, redirects (audit page).
         "auditIssues": _scan_audit_issues(scan),
         "siteChecksAt": (scan.get("siteChecks") or {}).get("checkedAt") or "",
+    }
+
+
+def _site_read_summary(scan: dict) -> dict:
+    checks = scan.get("siteChecks") or {}
+    robots = checks.get("robots") or {}
+    sitemap = checks.get("sitemap") or {}
+    redirects = checks.get("redirects") or {}
+    return {
+        "robots": {
+            "status": robots.get("status"),
+            "sitemaps": (robots.get("sitemaps") or [])[:5],
+            "problems": [p.get("detail") or "" for p in (robots.get("problems") or [])][:4],
+            "rules": len(robots.get("preview") or []),
+            "preview": (robots.get("preview") or [])[:6],
+        },
+        "sitemap": {
+            "url": sitemap.get("url") or "",
+            "urlCount": sitemap.get("urlCount"),
+            "index": bool(sitemap.get("index")),
+            "problems": [p.get("detail") or "" for p in (sitemap.get("problems") or [])][:4],
+        },
+        "redirects": {"problems": [p.get("detail") or "" for p in (redirects.get("problems") or [])][:4]},
+        "pagesFailed": len(scan.get("failed") or []),
+        "readAsBrowser": bool(scan.get("readAsBrowser")),
     }
 
 
