@@ -295,7 +295,28 @@ def _scan_health_counts(scan: dict, audit: dict | None = None) -> dict:
     green = _num0(counts.get("green"))
     if red or yellow or green:
         return {"red": red, "yellow": yellow, "green": green}
-    # Fall back to audit issue rows when the scan has no heatmap counts yet.
+    # Grade each scanned page by its worst finding: an error makes it urgent, a warning means it needs work.
+    pages = [p.get("url") for p in scan.get("pages") or [] if isinstance(p, dict) and p.get("url") and not p.get("error")]
+    if pages:
+        try:
+            from app.audit_checks import scan_issues
+
+            worst: dict[str, int] = {}
+            for item in scan_issues(scan):
+                sev = str(item.get("severity") or "").lower()
+                level = 2 if sev in {"critical", "error", "high"} else 1 if sev in {"warning", "medium"} else 0
+                if not level:
+                    continue
+                for row in item.get("pages") or []:
+                    url = row.get("url") if isinstance(row, dict) else None
+                    if url:
+                        worst[url] = max(worst.get(url, 0), level)
+            red = sum(1 for url in pages if worst.get(url) == 2)
+            yellow = sum(1 for url in pages if worst.get(url) == 1)
+            return {"red": red, "yellow": yellow, "green": len(pages) - red - yellow}
+        except Exception:  # noqa: BLE001 - health is a summary; never break the report
+            pass
+    # Fall back to audit issue rows when the scan has no pages.
     for row in (audit or {}).get("rows") or []:
         if not isinstance(row, (list, tuple)) or len(row) < 2:
             continue
@@ -313,7 +334,8 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
     """TrialReport.html — The numbers, honestly. Always six rows; missing values are 0."""
     stored = _feature(db, user.id, "trial-report-metrics") or _feature(db, user.id, "results-snapshot")
     organic = _feature(db, user.id, "organic-search")
-    ga4 = _feature(db, user.id, "ga4-overview") or _feature(db, user.id, "analytics-overview") or _feature(db, user.id, "ga4")
+    ga4 = (_feature(db, user.id, "traffic-analytics") or _feature(db, user.id, "ga4-overview")
+           or _feature(db, user.id, "analytics-overview") or _feature(db, user.id, "ga4"))
     path_board = _feature(db, user.id, "path-board") or _feature(db, user.id, "page-progress")
     audit = _feature(db, user.id, "site-audit")
     scan = _feature(db, user.id, "site-scan") or {}
@@ -384,19 +406,21 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
     # Weekly series → day-1 vs now when history exists
     weekly = panels.get("weeklyClicks") or organic.get("weeklyClicks")
     weekly_imp = panels.get("weeklyImpressions") or organic.get("weeklyImpressions")
-    clicks_from_s, clicks_to_s = _series_ends(weekly, 1)
-    imp_from_s, imp_to_s = _series_ends(weekly_imp if weekly_imp else weekly, 2 if not weekly_imp else 1)
+    del weekly, weekly_imp  # weekly averages are a different unit from the 28-day totals shown here
+
+    # Baselines saved before version 2 stored clicks and impressions as a single week (from the weekly
+    # chart) while "now" is a 28-day total. Re-take those two from today, once, so the comparison is fair.
+    if stored.get("trialBaselineSaved") and stored.get("baselineVersion") != 2:
+        stored = {**stored, "clicksFrom": clicks_now, "impressionsFrom": impressions_now, "baselineVersion": 2}
+        try:
+            _save_feature(db, user.id, "trial-report-metrics", "Trial report metrics", stored)
+        except Exception:  # noqa: BLE001
+            pass
 
     searches_from = _num0(stored.get("searchesFrom"))
     impressions_from = _num0(stored.get("impressionsFrom"))
     page_one_from = _num0(stored.get("pageOneFrom"))
     clicks_from = _num0(stored.get("clicksFrom"))
-    if clicks_from_s is not None:
-        clicks_from = _num0(clicks_from_s)
-        clicks_now = _num0(clicks_to_s if clicks_to_s is not None else clicks_now)
-    if imp_from_s is not None:
-        impressions_from = _num0(imp_from_s)
-        impressions_now = _num0(imp_to_s if imp_to_s is not None else impressions_now)
 
     # Prefer explicit stored baselines when present
     if stored.get("searchesFrom") is not None:
@@ -415,26 +439,7 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
     )
     leads_from = _num0(stored.get("leadsFrom"))
 
-    # If stored snapshot has a full trialMetrics list, prefer normalized numbers from it.
-    if isinstance(stored.get("trialMetrics"), list) and stored.get("trialMetrics"):
-        by_label = {
-            str(item.get("label") or "").strip().lower(): item
-            for item in stored["trialMetrics"]
-            if isinstance(item, dict)
-        }
-
-        def snap(label: str, fallback_from: int, fallback_to: int) -> tuple[int, int]:
-            row = by_label.get(label.lower()) or {}
-            return _num0(row.get("from") if row.get("from") is not None else fallback_from), _num0(
-                row.get("to") if row.get("to") is not None else fallback_to
-            )
-
-        healthy_from, healthy_now = snap("Healthy pages", healthy_from, healthy_now)
-        searches_from, searches_now = snap("Searches you show up for", searches_from, searches_now)
-        impressions_from, impressions_now = snap("Times Google showed your site", impressions_from, impressions_now)
-        page_one_from, page_one_now = snap("Searches on page one", page_one_from, page_one_now)
-        clicks_from, clicks_now = snap("Clicks from Google", clicks_from, clicks_now)
-        leads_from, leads_now = snap("Calls and form leads", leads_from, leads_now)
+    # Day-1 values come from the stored baseline above; "now" is always read live.
 
     rows = [
         {
@@ -480,6 +485,7 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
     if needs_baseline and (any(r["to"] > 0 for r in rows) or any(health_now.values())):
         baseline = {
             "trialBaselineSaved": True,
+            "baselineVersion": 2,
             "healthyFrom": healthy_now,  # first sighting becomes day-1 floor for future diffs
             "searchesFrom": searches_now,
             "impressionsFrom": impressions_now,
@@ -496,7 +502,7 @@ def _build_trial_report_metrics(db: Session, user: User, *, joined: datetime, mo
         # Day-1 display for this first report: use current as both ends (honest start).
         for r in rows:
             r["from"] = r["to"]
-            r["change"] = "Too early to call" if r["to"] == 0 else "Early sign"
+            r["change"] = "Too early to call"
         try:
             _save_feature(
                 db,

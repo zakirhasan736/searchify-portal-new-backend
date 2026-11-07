@@ -1594,7 +1594,10 @@ def _scan_summary(scan: dict, open_urls: set[str] | None = None) -> dict:
         # The real title and description of each page, so "In Google now" shows what the page says today.
         "listings": [
             {"url": p.get("url") or "", "path": urlparse(p.get("url") or "").path or "/",
-             "title": (p.get("title") or "")[:200], "description": (p.get("description") or "")[:400]}
+             "title": (p.get("title") or "")[:200], "description": (p.get("description") or "")[:400],
+             "h1": (p.get("h1") or "")[:200], "words": p.get("words"),
+             "role": (page_map.get(p.get("url") or "") or {}).get("role") or "",
+             "target": (page_map.get(p.get("url") or "") or {}).get("target") or ""}
             for p in pages[:80]
         ],
         "draftable": len(draftable),
@@ -1639,6 +1642,7 @@ def _site_read_summary(scan: dict) -> dict:
             "url": sitemap.get("url") or "",
             "urlCount": sitemap.get("urlCount"),
             "index": bool(sitemap.get("index")),
+            "files": (sitemap.get("files") or [])[:8],
             "problems": [p.get("detail") or "" for p in (sitemap.get("problems") or [])][:4],
         },
         "redirects": {"problems": [p.get("detail") or "" for p in (redirects.get("problems") or [])][:4]},

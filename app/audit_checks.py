@@ -1219,7 +1219,9 @@ def run_site_checks(home: str, sample_urls: list[str] | None = None, timeout: fl
                                                "detail": "Googlebot is blocked from: " + ", ".join(blocked[:5])})
             result["robots"] = robots
             # sitemap
-            common = [f"{base}/sitemap_index.xml", f"{base}/sitemap.xml", f"{base}/wp-sitemap.xml"]
+            from app.site_scan import SITEMAP_PATHS
+
+            common = [f"{base}{path}" for path in SITEMAP_PATHS if path.endswith(".xml")]
             listed = [u for u in (robots.get("sitemaps") or []) if u]
             result["sitemap"] = _check_sitemap(client, list(dict.fromkeys([*listed, *common])), host)
             # http -> https and www consistency
@@ -1289,6 +1291,7 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
     bare = host.removeprefix("www.")
     found = ""
     urls: list[str] = []
+    files: list[dict] = []  # each sitemap file read, with how many URLs it lists
     index = False
     for url in candidates[:8]:
         if _host(url) != bare:
@@ -1327,13 +1330,15 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
                     child = ET.fromstring(child_raw)
                 except Exception:  # noqa: BLE001
                     continue
-                child_pages.extend(n.text.strip() for n in child.iter() if n.tag.lower().endswith("loc") and n.text)
+                child_locs = [n.text.strip() for n in child.iter() if n.tag.lower().endswith("loc") and n.text]
+                files.append({"url": child_url, "urls": len(child_locs)})
+                child_pages.extend(child_locs)
             urls = child_pages or locs
         else:
             urls = locs
         break
     if not found and not any(p["key"] == "sitemap_error" for p in problems):
-        problems.append({"key": "sitemap_missing", "severity": "Warning", "detail": "No XML sitemap was found (robots.txt, /sitemap.xml, /sitemap_index.xml, /wp-sitemap.xml)."})
+        problems.append({"key": "sitemap_missing", "severity": "Warning", "detail": "No XML sitemap was found (robots.txt, /sitemap.xml, /sitemap_index.xml, /wp-sitemap.xml and other usual addresses)."})
     from concurrent.futures import ThreadPoolExecutor
 
     def probe(loc: str):
@@ -1358,7 +1363,7 @@ def _check_sitemap(client, candidates: list[str], host: str) -> dict:
         problems.append({"key": "sitemap_bad_urls", "severity": "Warning",
                          "detail": "The sitemap lists URLs Google should not index: " + "; ".join(f"{u} ({why})" for u, why in bad[:6]),
                          "urls": [{"url": u, "why": why} for u, why in bad[:15]]})
-    return {"url": found, "urlCount": len(urls), "index": index, "problems": problems}
+    return {"url": found, "urlCount": len(urls), "index": index, "files": files[:8], "problems": problems}
 
 
 SITE_PROBLEM_TEXT = {
