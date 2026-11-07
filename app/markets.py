@@ -37,6 +37,11 @@ TARGET_COUNTRIES: list[dict] = [
     {"iso": "PK", "name": "Pakistan", "language": "en", "flag": "🇵🇰"},
 ]
 BY_ISO = {row["iso"]: row for row in TARGET_COUNTRIES}
+# Search Console reports countries as ISO 3166-1 alpha-3, lower case.
+ALPHA3 = {
+    "can": "CA", "usa": "US", "gbr": "GB", "aus": "AU", "nzl": "NZ", "ind": "IN", "are": "AE", "deu": "DE", "fra": "FR",
+    "esp": "ES", "ita": "IT", "nld": "NL", "irl": "IE", "sgp": "SG", "zaf": "ZA", "bra": "BR", "mex": "MX", "bgd": "BD", "pak": "PK",
+}
 
 # Country-code and multi-label TLDs only. Generic TLDs never imply a country.
 TLD_SUGGESTIONS: dict[str, str] = {
@@ -70,7 +75,7 @@ TLD_SUGGESTIONS: dict[str, str] = {
 GENERIC_TLDS = {"com", "org", "net", "io", "co", "app", "dev", "ai", "xyz", "info", "biz", "online", "site", "tech"}
 
 KIND = "site-market"
-SOURCES = ("user", "onboarding", "profile", "domain", "unset")
+SOURCES = ("user", "onboarding", "profile", "domain", "search_console", "unset")
 
 # Which tools treat results as market-dependent for cache/refresh labelling.
 MARKET_DEPENDENT = {
@@ -336,10 +341,50 @@ def resolve_for_site(db: Session, user: User, *, site: str = "", site_id=None) -
         place = locations.resolve(country_by_iso(suggested)["name"])
         return _from_location(place, source="domain", host=host, site_id=sid, explicit=False)
 
+    # Where the site's Google searchers already are. Keeps research running for a .com site whose owner
+    # skipped the market question; the owner can still change it in the header.
+    gsc_iso = gsc_main_country(db, user.id, host) if host else None
+    if gsc_iso:
+        place = locations.resolve(country_by_iso(gsc_iso)["name"])
+        return _from_location(place, source="search_console", host=host, site_id=sid, explicit=False)
+
     out = _empty(host, sid)
     out["domainSuggestion"] = suggested
     out["needsChoice"] = True
     return out
+
+
+def gsc_main_country(db: Session, user_id: int, host: str) -> str | None:
+    """The country with most of this site's Search Console impressions (at least half), if Searchify supports it."""
+    rows = (
+        db.query(FeatureRecord)
+        .filter(FeatureRecord.customer_id == user_id, FeatureRecord.kind == "gsc-countries")
+        .order_by(FeatureRecord.id.desc())
+        .limit(12)
+        .all()
+    )
+    for row in rows:
+        payload = row.payload or {}
+        if _normalize_host(str(payload.get("siteHost") or "")) != _normalize_host(host):
+            continue
+        counts: dict[str, float] = {}
+        for item in payload.get("rows") or []:
+            if not isinstance(item, (list, tuple)) or len(item) < 3:
+                continue
+            try:
+                impressions = float(str(item[2]).replace(",", ""))
+            except (TypeError, ValueError):
+                continue
+            counts[str(item[0]).strip().lower()] = counts.get(str(item[0]).strip().lower(), 0) + impressions
+        total = sum(counts.values())
+        if not total:
+            return None
+        code, top = max(counts.items(), key=lambda kv: kv[1])
+        iso = ALPHA3.get(code) or (code.upper() if len(code) == 2 else None)
+        if top / total >= 0.5 and iso and country_by_iso(iso):
+            return iso
+        return None
+    return None
 
 
 def save_market(

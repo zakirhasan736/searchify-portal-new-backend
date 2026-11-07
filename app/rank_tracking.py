@@ -200,7 +200,7 @@ def check_site(db: Session, user: User, host: str, *, keyword: str = "", schedul
         last = last_check_at(db, user.id, host)
         if last and datetime.utcnow() - last < MANUAL_COOLDOWN:
             wait = int((MANUAL_COOLDOWN - (datetime.utcnow() - last)).total_seconds() // 60) + 1
-            raise research.ResearchError(f"Ranks were checked a moment ago. Check again in {wait} minutes.", code="daily_limit")
+            raise research.ResearchError(f"Ranks were checked a moment ago. Check again in {wait} minutes.", code="rank_cooldown")
     return check_keywords(db, user, host, rows, scheduled=scheduled)
 
 

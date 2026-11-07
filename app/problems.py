@@ -64,6 +64,11 @@ _CATALOG: dict[str, dict[str, Any]] = {
         "steps": ["The daily lookup limit for this plan resets tomorrow (UTC).", "Saved results stay visible until then.", "Upgrade for a higher daily limit."],
         "action": {"label": "See plans", "do": "open_plans"},
     },
+    "rank_cooldown": {
+        "title": "Ranks were just checked",
+        "steps": ["Google positions don't change minute to minute, so Searchify waits a little between checks.", "The ranks shown are from the last check."],
+        "action": None,
+    },
     # --- research provider (DataForSEO, shown as "Searchify SEO") -------------------------
     "provider_not_configured": {
         "title": "Research service is not connected",
@@ -269,6 +274,7 @@ _CATALOG: dict[str, dict[str, Any]] = {
 }
 
 _DEFAULT_SEVERITY = {
+    "rank_cooldown": "info",
     "provider_no_results": "warning",
     "gsc_no_data": "warning",
     "ga4_no_data": "warning",
