@@ -1045,6 +1045,15 @@ def act_cancellation(
     return {"ok": True, "message": msg, "done": done, "product": product, "replied": replied}
 
 
+@router.get("/system-check")
+def system_check(deep: bool = False, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """DataForSEO, OpenAI and Google setup, checked live. deep=true spends a few cents probing each DataForSEO API."""
+    _require_admin(user)
+    from app import system_check as checker
+
+    return checker.run(db, deep=deep)
+
+
 @router.get("/problems")
 def get_problems(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     _require_admin(user)
